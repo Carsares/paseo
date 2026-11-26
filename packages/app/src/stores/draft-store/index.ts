@@ -1,4 +1,7 @@
 import { useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import { TopicReplyRouteModeSchema } from "@getpaseo/protocol/messages";
+import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import { z } from "zod";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -42,6 +45,7 @@ interface DraftStoreActions {
   getDraftInput: (draftKey: string) => DraftInput | undefined;
   hydrateDraftInput: (input: { draftKey: string }) => Promise<DraftInput | undefined>;
   saveDraftInput: (input: { draftKey: string; draft: DraftInput }) => void;
+  saveDraftInputIfAbsent: (input: { draftKey: string; draft: DraftInput }) => void;
   /** Applies a pure update, which may be replayed once after restoring disk state. An emptied input abandons the draft. */
   updateDraftInput: (input: {
     draftKey: string;
@@ -377,6 +381,15 @@ export const useDraftStore = create<DraftStore>()(
         scheduleAttachmentGc();
       },
 
+      saveDraftInputIfAbsent: ({ draftKey, draft }) => {
+        applyDraftIntent(
+          set,
+          draftKey,
+          (existing) => existing ?? createDraftRecord({ draft, lifecycle: "active" }),
+        );
+        scheduleAttachmentGc();
+      },
+
       updateDraftInput: ({ draftKey, update }) => {
         applyDraftIntent(set, draftKey, (existing) => {
           const next = update(toDraftInputIfReady(existing) ?? { text: "", attachments: [] });
@@ -550,3 +563,63 @@ export const useDraftStore = create<DraftStore>()(
     },
   ),
 );
+
+const recoveryTargetSchema = z.strictObject({
+  recoveryId: z.string(),
+  topicKey: z.string(),
+  taskId: z.string().optional(),
+  rootMessageId: z.string().optional(),
+  promptPreview: z.string(),
+  routeMode: TopicReplyRouteModeSchema,
+  decisionContext: z.strictObject({
+    kind: z.literal("task_blocking_question"),
+    taskId: z.string().optional(),
+    question: z.string(),
+    blockingQuestionGeneration: z.string().optional(),
+    staleNotice: z.string().optional(),
+  }),
+});
+
+export type RecoveredTopicReplyTarget = z.infer<typeof recoveryTargetSchema>;
+const recoveryStateSchema = z.strictObject({
+  byScope: z.record(z.string(), z.array(recoveryTargetSchema)),
+});
+
+export function buildDecisionRecoveryScope(serverId: string, workspaceId: string, agentId: string) {
+  return JSON.stringify([serverId, workspaceId, agentId]);
+}
+
+export const useDecisionRecoveryStore = create<
+  z.infer<typeof recoveryStateSchema> & {
+    add: (scope: string, target: RecoveredTopicReplyTarget) => void;
+    remove: (scope: string, recoveryId: string) => void;
+  }
+>()(
+  persist(
+    (set) => ({
+      byScope: {},
+      add: (scope, target) =>
+        set((state) => {
+          const targets = state.byScope[scope] ?? [];
+          if (targets.some((entry) => entry.recoveryId === target.recoveryId)) return state;
+          return { byScope: { ...state.byScope, [scope]: [...targets, target] } };
+        }),
+      remove: (scope, recoveryId) =>
+        set((state) => {
+          const byScope = { ...state.byScope };
+          const remaining = byScope[scope]?.filter((entry) => entry.recoveryId !== recoveryId);
+          if (remaining?.length) byScope[scope] = remaining;
+          else delete byScope[scope];
+          return { byScope };
+        }),
+    }),
+    {
+      name: "paseo-topic-decision-recovery",
+      skipHydration: true,
+      storage: createValidatedPersistStorage(AsyncStorage, recoveryStateSchema),
+      partialize: ({ byScope }) => ({ byScope }),
+    },
+  ),
+);
+
+export const decisionRecoveryHydrated = useDecisionRecoveryStore.persist.rehydrate();

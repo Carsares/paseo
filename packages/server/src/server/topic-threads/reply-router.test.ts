@@ -74,7 +74,7 @@ function setup(
     store,
     taskLedger: ledger,
     readAgent: async (agentId) => {
-      if (agentId === "main")
+      if (agentId === "main" || agentId === "other-main")
         return {
           workspaceId: "workspace",
           labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
@@ -950,4 +950,280 @@ test("reopens an uncertain handoff without offering a new execution", async () =
   const olderClient = await router.reply({ ...request, clientMessageId: `retry:${originalId}` });
   expect(olderClient.payload.error).toBeTruthy();
   expect(restarted).not.toHaveBeenCalled();
+});
+
+test.each([
+  "unsubmitted",
+  "bound-after-restart",
+  "received",
+  "late-receipt",
+  "pending",
+  "legacy",
+] as const)(
+  "only resumes an acknowledged retry after restart when it is known to be unsubmitted (%s)",
+  async (state) => {
+    const { dispatch } = setup();
+    const bindsAfterRestart = state === "bound-after-restart";
+    const canResume = state === "unsubmitted" || bindsAfterRestart;
+    const initial = bindsAfterRestart
+      ? { ...request, topicKey: "msg:root", taskId: undefined }
+      : request;
+    const attachment = {
+      type: "uploaded_file",
+      id: "upload",
+      path: "/uploads/retained.png",
+      fileName: "retained.png",
+      size: 5,
+      mimeType: "image/png",
+    } as const;
+    dispatch.mockRejectedValueOnce(new Error("Provider declined before handoff"));
+    const original = (await router.reply({ ...initial, attachments: [attachment] })).payload.entry!;
+    await vi.waitFor(async () => expect((await store.list(request))[0]?.retryable).toBe(true));
+    const paused = Promise.withResolvers<void>();
+    dispatch.mockImplementationOnce(async ({ onHandoff, signal }) => {
+      if (state === "pending") await onHandoff(true);
+      paused.resolve();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      throw new Error("Daemon stopped");
+    });
+    const retryRequest = {
+      ...initial,
+      retryOfEntryId: original.entryId,
+      clientMessageId: "persisted-retry",
+    };
+    const queued = (await router.reply(retryRequest)).payload.entry!;
+    expect(queued).toMatchObject({ status: "queued", sourceMessageId: "persisted-retry" });
+    await paused.promise;
+    const listRequest = {
+      workspaceId: request.workspaceId,
+      mainAgentId: request.mainAgentId,
+      requestId: "list",
+      type: "workspace.topic.list_entries.request",
+    } as const;
+    expect((await router.list(listRequest)).payload.entries[1]?.retryable).not.toBe(true);
+    await router.close();
+
+    if (state === "legacy") {
+      const file = join(home, "topic-threads", "workspace.json");
+      const data = JSON.parse(await readFile(file, "utf8"));
+      delete data.entries[1].handoffPending;
+      await writeFile(file, JSON.stringify(data));
+    }
+    store = new TopicThreadStore(home);
+    ledger = new WorkspaceTaskLedgerStore(home);
+    if (bindsAfterRestart)
+      await ledger.upsert(request.workspaceId, {
+        taskId: "task",
+        title: "Bound task",
+        rootMessageId: "root",
+      });
+    const { dispatch: restarted } = setup();
+    const wasAccepted = vi.fn(async () => state === "received" || state === "late-receipt");
+    if (state === "late-receipt") wasAccepted.mockResolvedValueOnce(false);
+    Object.assign(restarted, { wasAccepted });
+    const listed = (await router.list(listRequest)).payload.entries;
+    expect(listed[0]?.retryable).toBe(false);
+    expect(listed[1]?.retryable === true).toBe(canResume || state === "late-receipt");
+    const resume = {
+      ...retryRequest,
+      topicKey: bindsAfterRestart ? "task:task" : request.topicKey,
+      retryOfEntryId: queued.entryId,
+      text: "Discard this text",
+    };
+
+    if (canResume) {
+      const results = await Promise.all(
+        ["new-click", "repeat-click"].map((clientMessageId) =>
+          router.reply({ ...resume, clientMessageId }),
+        ),
+      );
+      for (const { payload } of results) {
+        expect(payload.error).toBeNull();
+        expect(payload.entry?.entryId).toBe(queued.entryId);
+      }
+      await vi.waitFor(async () =>
+        expect((await store.list(request))[1]?.status).toBe("completed"),
+      );
+      expect(restarted).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ messageId: "persisted-retry" }),
+      );
+      const [send] = restarted.mock.calls[0];
+      expect(send.scope.taskId).toBe(bindsAfterRestart ? "task" : undefined);
+      expect(send.prompt).toContainEqual(attachment);
+      expect(JSON.stringify(send.prompt)).toContain(request.text);
+      expect(JSON.stringify(send.prompt)).not.toContain(resume.text);
+    } else {
+      await router.reply({ ...resume, clientMessageId: "new-click" });
+      await router.reply(retryRequest);
+      expect(restarted).not.toHaveBeenCalled();
+    }
+    expect(
+      (await store.list(request)).filter((entry) => entry.role === "user_followup"),
+    ).toHaveLength(2);
+  },
+);
+
+test.each([
+  "unique",
+  "already-promoted",
+  "recreated-after-promotion",
+  "ambiguous",
+  "wrong-main",
+  "wrong-root",
+  "delivered",
+] as const)(
+  "validates the live task binding when retrying a message reply from a task card (%s)",
+  async (state) => {
+    const { dispatch } = setup();
+    if (state !== "delivered")
+      dispatch.mockRejectedValueOnce(new Error("Provider declined before handoff"));
+    const beforeBinding = { ...request, topicKey: "msg:root", taskId: undefined };
+    const original = (await router.reply(beforeBinding)).payload.entry!;
+    await vi.waitFor(async () => {
+      const [entry] = await store.list(request, "msg:root");
+      expect(entry?.status).toBe(state === "delivered" ? "completed" : "error");
+    });
+    await router.close();
+    const bound = await ledger.upsert(request.workspaceId, {
+      taskId: "task",
+      title: "Bound task",
+      rootMessageId: state === "wrong-root" ? "other-root" : "root",
+      leadAgentId: "lead",
+      ...(state === "recreated-after-promotion" ? { status: "completed" } : {}),
+    });
+    if (state === "ambiguous")
+      await ledger.upsert(request.workspaceId, {
+        taskId: "second",
+        title: "Conflicting task",
+        rootMessageId: "root",
+      });
+    if (state === "already-promoted" || state === "recreated-after-promotion")
+      await store.upsertAnchor(
+        {
+          ...request,
+          topicKey: "task:task",
+          rootPromptText: "First question",
+        },
+        undefined,
+        await ledger.list(request.workspaceId),
+      );
+    if (state === "recreated-after-promotion") {
+      expect(await store.list(request, "task:task")).toMatchObject([
+        { entryId: original.entryId, retryable: true },
+      ]);
+      for (let i = 0; i < 50; i++) {
+        await ledger.upsert(request.workspaceId, {
+          taskId: `closed-${i}`,
+          title: `Closed ${i}`,
+          status: "completed",
+        });
+      }
+      expect((await ledger.list(request.workspaceId)).some(({ taskId }) => taskId === "task")).toBe(
+        false,
+      );
+      const replacement = await ledger.upsert(request.workspaceId, {
+        taskId: "task",
+        title: "Replacement task",
+        rootMessageId: "root",
+        leadAgentId: "lead",
+      });
+      expect(replacement.createdAt).not.toBe(bound.createdAt);
+    }
+    const { dispatch: afterBinding } = setup();
+    const retry = {
+      ...request,
+      mainAgentId: state === "wrong-main" ? "other-main" : request.mainAgentId,
+      topicKey: "task:task",
+      retryOfEntryId: original.entryId,
+      clientMessageId: "new-attempt",
+      taskId: "ignore-client-task",
+      rootMessageId: "ignore-client-root",
+    };
+    const [first, repeat] = await Promise.all([router.reply(retry), router.reply(retry)]);
+    if (state === "unique" || state === "already-promoted") {
+      expect(first.payload.error).toBeNull();
+      expect(repeat.payload.entry?.entryId).toBe(first.payload.entry?.entryId);
+      await vi.waitFor(async () =>
+        expect((await store.list(request, "task:task"))[1]?.status).toBe("completed"),
+      );
+      expect(await store.list(request, "msg:root")).toEqual([]);
+      expect(await store.list(request, "task:task")).toMatchObject([
+        { entryId: original.entryId, status: "error", retryable: false, taskId: "task" },
+        { sourceMessageId: "new-attempt", status: "completed", taskId: "task" },
+        { role: "agent_reply", taskId: "task" },
+      ]);
+      expect(afterBinding).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          agentId: "lead",
+          scope: expect.objectContaining({ taskId: "task" }),
+        }),
+      );
+    } else {
+      for (const { payload } of [first, repeat]) {
+        expect(payload.entry).toBeNull();
+        expect(payload.error).toBe("Could not queue topic reply.");
+      }
+      expect(afterBinding).not.toHaveBeenCalled();
+      const entries = await store.list(request);
+      if (state === "delivered") {
+        expect(entries.filter((entry) => entry.role === "user_followup")).toMatchObject([
+          { entryId: original.entryId, status: "completed" },
+        ]);
+      } else {
+        const sourceKey = state === "recreated-after-promotion" ? "task:task" : "msg:root";
+        expect(entries.filter((entry) => entry.topicKey === sourceKey)).toMatchObject([
+          { entryId: original.entryId, retryable: true },
+        ]);
+      }
+    }
+  },
+);
+
+test("refuses a retry if a second task binds the root between validation and handoff", async () => {
+  const { dispatch } = setup();
+  dispatch.mockRejectedValueOnce(new Error("Provider declined before handoff"));
+  const original = (
+    await router.reply({
+      ...request,
+      topicKey: "msg:root",
+      taskId: undefined,
+    })
+  ).payload.entry!;
+  await vi.waitFor(async () => expect((await store.list(request))[0]?.retryable).toBe(true));
+  await ledger.upsert(request.workspaceId, {
+    taskId: "task",
+    title: "Bound task",
+    rootMessageId: "root",
+  });
+  const handedOff = vi.fn();
+  dispatch.mockImplementationOnce(async ({ validate, onHandoff }) => {
+    await validate();
+    await ledger.upsert(request.workspaceId, {
+      taskId: "second",
+      title: "Conflicting task",
+      rootMessageId: "root",
+    });
+    await onHandoff(true);
+    handedOff();
+  });
+  const retry = {
+    ...request,
+    topicKey: "task:task",
+    retryOfEntryId: original.entryId,
+    clientMessageId: "retry-before-conflict",
+  };
+  expect((await router.reply(retry)).payload.error).toBeNull();
+  await vi.waitFor(async () =>
+    expect(await store.list(request, "task:task")).toMatchObject([
+      { entryId: original.entryId, retryable: true },
+      { sourceMessageId: "retry-before-conflict", status: "error" },
+    ]),
+  );
+  expect(handedOff).not.toHaveBeenCalled();
+  expect(
+    (await router.reply({ ...retry, clientMessageId: "retry-after-conflict" })).payload.error,
+  ).toBe("Could not queue topic reply.");
+  expect(dispatch).toHaveBeenCalledTimes(2);
 });

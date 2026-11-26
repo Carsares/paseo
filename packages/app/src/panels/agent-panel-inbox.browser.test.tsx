@@ -1,8 +1,13 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  SIDE_CHAT_LABEL,
+  SIDE_OF_AGENT_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { PendingSubagentInbox } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { within } from "@testing-library/dom";
+import { fireEvent, within } from "@testing-library/dom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { View } from "react-native";
@@ -36,13 +41,20 @@ import {
 } from "@/panels/pane-context";
 import { getHostRuntimeStore, type HostRuntimeSnapshot } from "@/runtime/host-runtime";
 import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane/host";
-import { useDraftStore } from "@/stores/draft-store";
+import {
+  buildDecisionRecoveryScope,
+  useDecisionRecoveryStore,
+  useDraftStore,
+} from "@/stores/draft-store";
+import { buildDraftStoreKey } from "@/stores/draft-keys";
+import { resolveReplyComposerDraftKey } from "@/agent-stream/topic-card/submit-topic-reply";
 import {
   buildTopicAgentKey,
   buildTopicReplyDraftKey,
   useTopicStreamViewStore,
 } from "@/stores/topic-stream-view-store";
 import { useSessionStore } from "@/stores/session-store";
+import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { DEFAULT_CONTENT_MAX_WIDTH } from "@/styles/theme";
 import {
   createTeamMessageJumpStore,
@@ -53,6 +65,8 @@ import type { StreamItem } from "@/types/stream";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { AgentConversationPanel } from "./agent-panel";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
+
+vi.mock("@/stores/navigation-active-workspace-store", { spy: true });
 
 let compactTestLayout: boolean | undefined;
 vi.mock("@/constants/layout", async (importOriginal) => {
@@ -90,6 +104,7 @@ const pane: PaneContextValue = {
   openFileInWorkspace: noop,
   openImportSheet: noop,
 };
+const sheetPane: PaneContextValue = { ...pane, host: "sheet" };
 const insets = { top: 0, right: 0, bottom: 0, left: 0 };
 const paneFocus = createPaneFocusContextValue({ isWorkspaceFocused: true, isPaneFocused: true });
 const sheetHost: SheetPaneHost = {
@@ -201,9 +216,15 @@ function ConversationShell({ children }: { children: ReactNode }) {
   );
 }
 
-function ConversationPane({ children }: { children: ReactNode }) {
+function ConversationPane({
+  children,
+  paneHost = pane.host,
+}: {
+  children: ReactNode;
+  paneHost?: PaneContextValue["host"];
+}) {
   return (
-    <PaneProvider value={pane}>
+    <PaneProvider value={paneHost === "sheet" ? sheetPane : pane}>
       <PaneFocusProvider value={paneFocus}>
         <DiffDocumentWorkspaceCacheProvider>
           <SheetPaneHostProvider value={sheetHost}>
@@ -224,6 +245,7 @@ async function mountTopicConversation(
   queueWhenRunning = false,
   additionalTopicItems: StreamItem[] = [],
   modeInHeader = false,
+  options?: { paneHost?: PaneContextValue["host"]; sideChatSourceId?: string },
 ) {
   compactTestLayout = width < 600;
   await page.viewport(width, 760);
@@ -260,7 +282,31 @@ async function mountTopicConversation(
     },
   });
   publishAgent(true, undefined, false, pane.workspaceId, queueWhenRunning ? "running" : "idle");
-  useTopicStreamViewStore.getState().setViewMode(buildTopicAgentKey(serverId, agentId), "topics");
+  if (options?.sideChatSourceId) {
+    const main = useSessionStore.getState().sessions[serverId]!.agents.get(agentId)!;
+    store.setAgents(
+      serverId,
+      new Map([
+        [options.sideChatSourceId, { ...main, id: options.sideChatSourceId }],
+        [
+          agentId,
+          {
+            ...main,
+            labels: {
+              [SIDE_CHAT_LABEL]: "true",
+              [SIDE_OF_AGENT_ID_LABEL]: options.sideChatSourceId,
+            },
+          },
+        ],
+      ]),
+    );
+  }
+  useTopicStreamViewStore
+    .getState()
+    .setViewMode(
+      buildTopicAgentKey(serverId, agentId),
+      options?.sideChatSourceId ? "timeline" : "topics",
+    );
   store.applyAgentTimelineResponseState(serverId, agentId, {
     items: [
       ...(hasTopics
@@ -302,7 +348,7 @@ async function mountTopicConversation(
       <QueryClientProvider client={settings}>
         <ConversationShell>
           <TeamMessageJumpProvider store={createTeamMessageJumpStore()}>
-            <ConversationPane>
+            <ConversationPane paneHost={options?.paneHost}>
               <TopicStreamModeHeaderProvider
                 serverId={serverId}
                 agentId={modeInHeader ? agentId : null}
@@ -323,7 +369,11 @@ async function mountTopicConversation(
       </QueryClientProvider>,
     ),
   );
-  await vi.waitFor(() => expect(view.getByTestId("topic-stream-list")).toBeTruthy());
+  await vi.waitFor(() => {
+    expect(
+      view.getByTestId(options?.sideChatSourceId ? "assistant-message" : "topic-stream-list"),
+    ).toBeTruthy();
+  });
 }
 
 it.each([
@@ -540,7 +590,7 @@ it.each(["accepted", "rejected"] as const)(
         },
       });
     }
-    await mountTopicConversation(client, true, 390);
+    await mountTopicConversation(client, true, 390, false, [quoteAnswer]);
     await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:a"));
     await vi.waitFor(() =>
       expect(view.getByTestId("composer-file-attachment-pill").textContent).toContain("a.txt"),
@@ -555,6 +605,22 @@ it.each(["accepted", "rejected"] as const)(
         }),
       ),
     );
+    if (result === "accepted") {
+      const agentKey = buildTopicAgentKey(serverId, agentId);
+      act(() => {
+        useTopicStreamViewStore.getState().setViewMode(agentKey, "timeline");
+      });
+      await quoteTimelinePassage();
+      expect(drafts.getDraftInput(draftKey("msg:a"))?.attachments.map(({ kind }) => kind)).toEqual([
+        "file",
+      ]);
+      await expect
+        .element(page.getByText("Wait for the current reply to finish before quoting."))
+        .toBeVisible();
+      act(() => {
+        useTopicStreamViewStore.getState().setViewMode(agentKey, "topics");
+      });
+    }
     await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:b"));
     await act(async () => {
       response.resolve({
@@ -586,6 +652,292 @@ it.each(["accepted", "rejected"] as const)(
       .setActiveReplyTopic(buildTopicAgentKey(serverId, agentId), null);
   },
 );
+
+const quoteAnswer = {
+  kind: "assistant_message" as const,
+  id: "quote-answer",
+  messageId: "quote-answer",
+  text: "Quote this passage and leave the rest.",
+  timestamp: new Date("2026-04-20T00:01:00.000Z"),
+  timelineCursor: { epoch: "browser-epoch", seq: 2 },
+};
+
+async function openSelectionMenu() {
+  const row = page.getByText(quoteAnswer.text, { exact: true });
+  await expect.element(row).toBeVisible();
+  const element = row.element();
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  const text = walker.nextNode()!;
+  const range = document.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, "Quote this passage".length);
+  const selection = window.getSelection()!;
+  selection.removeAllRanges();
+  selection.addRange(range);
+  act(() => fireEvent.contextMenu(element, { clientX: 50, clientY: 70 }));
+}
+
+async function quoteTimelinePassage() {
+  await openSelectionMenu();
+  const quote = page.getByTestId("assistant-selection-context-menu-quote");
+  await expect.element(quote).toBeVisible();
+  act(() => fireEvent.click(quote.element()));
+}
+
+it.each(["ordinary", "reply", "decision"] as const)(
+  "quotes a Timeline selection into the visible %s composer",
+  async (kind) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    const agentKey = buildTopicAgentKey(serverId, agentId);
+    const target =
+      kind === "ordinary"
+        ? null
+        : {
+            topicKey: "msg:a",
+            rootMessageId: "a",
+            promptPreview: "Topic A",
+            routeMode: "main" as const,
+            ...(kind === "decision"
+              ? {
+                  decisionContext: {
+                    kind: "task_blocking_question" as const,
+                    question: "Proceed?",
+                  },
+                }
+              : {}),
+          };
+    const draftKey = resolveReplyComposerDraftKey({
+      serverId,
+      workspaceId: pane.workspaceId,
+      agentId,
+      target,
+    });
+    const ordinaryKey = buildDraftStoreKey({ serverId, agentId });
+    const drafts = useDraftStore.getState();
+    drafts.saveDraftInput({
+      draftKey: ordinaryKey,
+      draft: { text: "Ordinary draft", attachments: [] },
+    });
+    try {
+      await mountTopicConversation(client, true, 390, false, [quoteAnswer]);
+      if (kind === "reply") {
+        await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:a"));
+      } else if (target) {
+        act(() => {
+          useTopicStreamViewStore.getState().setActiveReplyTopic(agentKey, target);
+        });
+      }
+      // Mode selection is exercised separately; this test starts from the resulting Timeline.
+      act(() => {
+        useTopicStreamViewStore.getState().setViewMode(agentKey, "timeline");
+      });
+      await quoteTimelinePassage();
+      await expect.element(page.getByTestId("composer-quote-card")).toBeVisible();
+      expect(drafts.getDraftInput(draftKey)?.attachments).toEqual([
+        expect.objectContaining({ kind: "quote", text: "Quote this passage" }),
+      ]);
+      if (kind !== "ordinary") {
+        expect(drafts.getDraftInput(ordinaryKey)).toEqual({
+          text: "Ordinary draft",
+          attachments: [],
+        });
+      }
+    } finally {
+      window.getSelection()?.removeAllRanges();
+      for (const key of new Set([draftKey, ordinaryKey])) {
+        drafts.clearDraftInput({ draftKey: key, lifecycle: "abandoned" });
+      }
+    }
+  },
+);
+
+it("keeps the side chat quote on the Main composer reached through the asTab fallback", async () => {
+  const sourceAgentId = "main-source";
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  const navigate = vi.mocked(navigateToWorkspace).mockReturnValue("/workspace");
+  const target = {
+    topicKey: "msg:source",
+    routeMode: "main" as const,
+    promptPreview: "Source topic",
+  };
+  const sourceKey = buildTopicAgentKey(serverId, sourceAgentId);
+  const draftKey = resolveReplyComposerDraftKey({
+    serverId,
+    workspaceId: pane.workspaceId,
+    agentId: sourceAgentId,
+    target,
+  });
+  try {
+    await mountTopicConversation(client, true, 390, false, [quoteAnswer], false, {
+      sideChatSourceId: sourceAgentId,
+    });
+    useTopicStreamViewStore.getState().setActiveReplyTopic(sourceKey, target);
+    await quoteTimelinePassage();
+    await vi.waitFor(() =>
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({
+        serverId,
+        workspaceId: pane.workspaceId,
+        target: { kind: "agent", agentId: sourceAgentId },
+        asTab: true,
+      }),
+    );
+    expect(useDraftStore.getState().getDraftInput(draftKey)?.attachments).toEqual([
+      expect.objectContaining({ kind: "quote", text: "Quote this passage" }),
+    ]);
+    expect(
+      useDraftStore.getState().getDraftInput(buildDraftStoreKey({ serverId, agentId })),
+    ).toBeUndefined();
+  } finally {
+    navigate.mockRestore();
+    window.getSelection()?.removeAllRanges();
+    useTopicStreamViewStore.getState().setActiveReplyTopic(sourceKey, null);
+    useDraftStore.getState().clearDraftInput({ draftKey, lifecycle: "abandoned" });
+  }
+});
+
+it("does not offer Quote in a read-only sheet without a composer", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  try {
+    await mountTopicConversation(client, true, 390, false, [quoteAnswer], false, {
+      paneHost: "sheet",
+    });
+    act(() => {
+      useTopicStreamViewStore
+        .getState()
+        .setViewMode(buildTopicAgentKey(serverId, agentId), "timeline");
+    });
+    await openSelectionMenu();
+    expect(view.queryByRole("textbox")).toBeNull();
+    await expect
+      .element(page.getByTestId("assistant-selection-context-menu-quote"))
+      .not.toBeInTheDocument();
+    await expect.element(page.getByTestId("assistant-selection-quote")).not.toBeInTheDocument();
+  } finally {
+    window.getSelection()?.removeAllRanges();
+  }
+});
+
+it("moves a manually rejected queued decision to an editable draft without replacing a newer one", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  const newGeneration = "151eb610-81ef-4fb7-bacf-335f205fb173";
+  const decide = vi.spyOn(client, "decideWorkspaceTopic").mockResolvedValue({
+    requestId: "stale",
+    workspaceId: pane.workspaceId,
+    topicKey: "msg:a",
+    accepted: false,
+    durableItem: null,
+    task: {
+      taskId: "task-a",
+      title: "Topic A",
+      status: "awaiting_decision",
+      tier: "T1",
+      participants: [],
+      createdAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:02:00.000Z",
+      blockingQuestion: "Should we change the rollout?",
+      blockingQuestionGeneration: newGeneration,
+    },
+    routedTo: "none",
+    targetAgentId: null,
+    entry: null,
+    error: "The blocking question changed.",
+    errorCode: "stale_blocking_question",
+  });
+  const target = {
+    topicKey: "msg:a",
+    taskId: "task-a",
+    rootMessageId: "a",
+    routeMode: "main" as const,
+    promptPreview: "Topic A",
+    decisionContext: {
+      kind: "task_blocking_question" as const,
+      question: "Proceed?",
+      blockingQuestionGeneration: "old",
+    },
+  };
+  const draftKey = resolveReplyComposerDraftKey({
+    serverId,
+    workspaceId: pane.workspaceId,
+    agentId,
+    target,
+  });
+  const recoveryKey = resolveReplyComposerDraftKey({
+    serverId,
+    workspaceId: pane.workspaceId,
+    agentId,
+    target: Object.assign({}, target, { recoveryId: "old-submission" }),
+  });
+  const drafts = useDraftStore.getState();
+  drafts.saveDraftInput({ draftKey, draft: { text: "Newer decision draft", attachments: [] } });
+  try {
+    await mountTopicConversation(client, true, 390, true);
+    act(() => {
+      store.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: null,
+        features: { workspaceTopicThreads: true, workspaceButlerV1: true },
+      });
+      store.setQueuedMessages(
+        serverId,
+        new Map([
+          [
+            agentId,
+            [
+              {
+                id: "old-decision",
+                text: "Old reply",
+                attachments: [{ kind: "quote", id: "preserved", text: "Original context" }],
+                topicReply: {
+                  workspaceId: pane.workspaceId,
+                  target,
+                  clientMessageId: "old-submission",
+                },
+              },
+            ],
+          ],
+        ]),
+      );
+      useTopicStreamViewStore
+        .getState()
+        .setActiveReplyTopic(buildTopicAgentKey(serverId, agentId), target);
+    });
+    await userEvent.click(page.getByRole("button", { name: "Send queued message now" }));
+    await expect
+      .element(page.getByRole("button", { name: "Review unsent decision" }))
+      .toBeVisible();
+    await expect.element(page.getByRole("textbox")).toHaveValue("Newer decision draft");
+    expect(useSessionStore.getState().sessions[serverId]?.queuedMessages.get(agentId)).toEqual([]);
+    await userEvent.click(page.getByRole("button", { name: "Review unsent decision" }));
+    await expect.element(page.getByRole("textbox")).toHaveValue("Old reply");
+    await expect
+      .element(page.getByTestId("composer-quote-card"))
+      .toHaveTextContent("Original context");
+    await expect
+      .element(page.getByTestId("compact-topic-reply-context"))
+      .toHaveTextContent("Should we change the rollout?");
+    await page.getByRole("textbox").fill("Edited recovery");
+    await vi.waitFor(() => expect(drafts.getDraftInput(recoveryKey)?.text).toBe("Edited recovery"));
+    expect(drafts.getDraftInput(draftKey)?.text).toBe("Newer decision draft");
+    expect(
+      useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[
+        buildTopicAgentKey(serverId, agentId)
+      ]?.decisionContext?.blockingQuestionGeneration,
+    ).toBe(newGeneration);
+    expect(decide).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        clientMessageId: "old-submission",
+        expectedBlockingQuestionGeneration: "old",
+      }),
+    );
+  } finally {
+    drafts.clearDraftInput({ draftKey, lifecycle: "abandoned" });
+    drafts.clearDraftInput({ draftKey: recoveryKey, lifecycle: "abandoned" });
+    useDecisionRecoveryStore
+      .getState()
+      .remove(buildDecisionRecoveryScope(serverId, pane.workspaceId, agentId), "old-submission");
+  }
+});
 
 it("sends queued topic A and an ordinary message to their own targets while B is selected", async () => {
   const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });

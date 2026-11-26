@@ -334,13 +334,13 @@ export interface SendQueuedComposerMessageNowInput {
   agentId: string;
   messageId: string;
   queue: QueueWriter;
-  submitMessage: (input: Omit<QueuedComposerMessage, "id">) => Promise<void>;
+  submitMessage: (input: Omit<QueuedComposerMessage, "id">) => Promise<void | "recovered">;
   failedToSendMessage?: string;
 }
 
 export type SendQueuedComposerMessageNowResult =
   | { status: "missing" }
-  | { status: "submitted" }
+  | { status: "submitted" | "recovered" }
   | { status: "failed"; errorMessage: string };
 
 export async function sendQueuedComposerMessageNow(
@@ -362,12 +362,12 @@ export async function sendQueuedComposerMessageNow(
     return next;
   });
   try {
-    await input.submitMessage({
+    const result = await input.submitMessage({
       text: item.text,
       attachments: item.attachments,
       ...(item.topicReply ? { topicReply: item.topicReply } : {}),
     });
-    return { status: "submitted" };
+    return { status: result === "recovered" ? "recovered" : "submitted" };
   } catch (error) {
     input.queue.write((prev) => {
       const next = new Map(prev);

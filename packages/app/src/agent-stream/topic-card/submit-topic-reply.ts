@@ -10,7 +10,19 @@ import {
 import type { MessagePayload } from "@/composer/types";
 import { i18n } from "@/i18n/i18next";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
-import type { ActiveTopicReplyTarget } from "@/stores/topic-stream-view-store";
+import {
+  buildDecisionRecoveryScope,
+  decisionRecoveryHydrated,
+  useDecisionRecoveryStore,
+  useDraftStore,
+  type RecoveredTopicReplyTarget,
+} from "@/stores/draft-store";
+import { buildDraftStoreKey } from "@/stores/draft-keys";
+import { userAttachmentsOnly } from "@/attachments/workspace-attachment-utils";
+import {
+  buildTopicReplyDraftKey,
+  type ActiveTopicReplyTarget,
+} from "@/stores/topic-stream-view-store";
 import { decideWorkspaceTopicOnHost, replyToWorkspaceTopic } from "@/topic-threads/queries";
 import { generateMessageId } from "@/types/stream";
 import { encodeImages } from "@/utils/encode-images";
@@ -160,6 +172,18 @@ interface TopicSubmissionIntent {
 }
 
 const draftIntents = new Map<string, TopicSubmissionIntent>();
+const submittingTopicDrafts = new Set<string>();
+
+export function beginTopicComposerDraftSubmit(draftKey: string): () => void {
+  submittingTopicDrafts.add(draftKey);
+  return () => {
+    submittingTopicDrafts.delete(draftKey);
+  };
+}
+
+export function isTopicComposerDraftSubmitting(draftKey: string): boolean {
+  return submittingTopicDrafts.has(draftKey);
+}
 
 function describeTopicSubmission(target: ActiveTopicReplyTarget, payload: MessagePayload) {
   const trimmed = payload.text.trim();
@@ -243,7 +267,8 @@ export async function submitActiveTopicReply(input: {
     input.clientMessageId ?? getTopicSubmissionId(activeReplyTopic, signature);
   onPersistSubmissionIntent?.(signature, clientMessageId);
 
-  if (activeReplyTopic.decisionContext && supportsButlerV1) {
+  if (activeReplyTopic.decisionContext) {
+    if (!supportsButlerV1) throw new Error(i18n.t("composer.errors.failedToSend"));
     return submitBlockingDecisionReply({
       queryClient,
       serverId,
@@ -294,6 +319,27 @@ export async function submitActiveTopicReply(input: {
   return true;
 }
 
+export function getTopicReplyRecoveryId(target: ActiveTopicReplyTarget): string | undefined {
+  if ("recoveryId" in target && typeof target.recoveryId === "string") return target.recoveryId;
+}
+
+export function resolveReplyComposerDraftKey(input: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  target: ActiveTopicReplyTarget | null;
+}): string {
+  const { target, ...scope } = input;
+  if (!target) return buildDraftStoreKey(scope);
+  const key = buildTopicReplyDraftKey({
+    ...scope,
+    topicKey: target.topicKey,
+    decision: Boolean(target.decisionContext),
+  });
+  const recoveryId = getTopicReplyRecoveryId(target);
+  return recoveryId ? `${key}:recovery:${recoveryId}` : key;
+}
+
 export async function deliverQueuedTopicReply(input: {
   queryClient: QueryClient;
   serverId: string;
@@ -305,12 +351,50 @@ export async function deliverQueuedTopicReply(input: {
   supportsForgeAttachments: boolean;
 }) {
   const { topicReply, ...scope } = input;
-  const sent = await submitActiveTopicReply({
-    ...scope,
-    workspaceId: topicReply.workspaceId,
-    activeReplyTopic: topicReply.target,
-    clientMessageId: topicReply.clientMessageId,
-    disconnectedMessage: i18n.t("workspace.terminal.hostDisconnected"),
-  });
-  if (!sent) throw new Error(i18n.t("composer.errors.failedToSend"));
+  const { serverId, agentId, payload } = scope;
+  const { target, workspaceId, clientMessageId } = topicReply;
+  try {
+    const sent = await submitActiveTopicReply({
+      ...scope,
+      workspaceId,
+      activeReplyTopic: target,
+      clientMessageId,
+      disconnectedMessage: i18n.t("workspace.terminal.hostDisconnected"),
+    });
+    if (!sent) throw new Error(i18n.t("composer.errors.failedToSend"));
+  } catch (error) {
+    if (!(error instanceof TopicDecisionStaleQuestionError) || !target.decisionContext) throw error;
+
+    const recovered: RecoveredTopicReplyTarget = {
+      topicKey: target.topicKey,
+      taskId: target.taskId,
+      rootMessageId: target.rootMessageId,
+      promptPreview: target.promptPreview,
+      routeMode: target.routeMode,
+      recoveryId: clientMessageId,
+      decisionContext: {
+        ...target.decisionContext,
+        question: error.latestTask?.blockingQuestion ?? target.decisionContext.question,
+        blockingQuestionGeneration:
+          error.latestTask?.blockingQuestionGeneration?.trim() ||
+          target.decisionContext.blockingQuestionGeneration,
+        staleNotice: i18n.t("topicWorkbench.topicStream.decisionBlockingQuestionStale"),
+      },
+    };
+    const draftKey = resolveReplyComposerDraftKey({
+      serverId,
+      workspaceId,
+      agentId,
+      target: recovered,
+    });
+    await decisionRecoveryHydrated;
+    useDraftStore.getState().saveDraftInputIfAbsent({
+      draftKey,
+      draft: { text: payload.text, attachments: userAttachmentsOnly(payload.attachments) },
+    });
+    useDecisionRecoveryStore
+      .getState()
+      .add(buildDecisionRecoveryScope(serverId, workspaceId, agentId), recovered);
+    return "recovered" as const;
+  }
 }

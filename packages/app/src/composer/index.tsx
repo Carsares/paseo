@@ -1,5 +1,6 @@
 import {
   assertTopicDecisionAttachments,
+  beginTopicComposerDraftSubmit,
   rememberTopicSubmission,
 } from "@/agent-stream/topic-card/submit-topic-reply";
 import {
@@ -983,7 +984,10 @@ interface ComposerProps {
     onQueued: (clientMessageId: string) => void;
     onEditOrdinary: (text: string, attachments: UserComposerAttachment[]) => void;
   };
-  onDeliverQueuedTopic?: (reply: QueuedTopicReply, payload: MessagePayload) => Promise<void>;
+  onDeliverQueuedTopic?: (
+    reply: QueuedTopicReply,
+    payload: MessagePayload,
+  ) => Promise<void | "recovered">;
   onClientSlashCommand?: (command: ClientSlashCommand) => Promise<void>;
   allowSideChat?: boolean;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
@@ -1969,6 +1973,7 @@ function ComposerContentImpl({
     ) => {
       const finish = beginComposerWork(serverId, agentId, "submit");
       if (!finish) return;
+      const unlockTopicDraft = topicQueue && beginTopicComposerDraftSubmit(topicQueue.draftKey);
       try {
         const result = await submitAgentInput({
           message: outgoingMessage,
@@ -2006,6 +2011,7 @@ function ComposerContentImpl({
         });
         completeSubmit({ result, outgoingAttachments });
       } finally {
+        unlockTopicDraft?.();
         finish();
       }
     },
@@ -2299,6 +2305,7 @@ function ComposerContentImpl({
       const finish = beginComposerWork(serverId, agentId, "submit");
       if (!finish) return;
       // Reuse the regular send path; server-side send atomically interrupts any active run.
+      let recovered = false;
       try {
         const result = await sendQueuedComposerMessageNow({
           agentId,
@@ -2320,8 +2327,10 @@ function ComposerContentImpl({
         if (result.status === "failed") {
           setSendError(result.errorMessage);
         }
+        recovered = result.status === "recovered";
       } finally {
         finish();
+        if (recovered) getHostRuntimeStore().resumeQueueAfterTopicRecovery(serverId, agentId);
       }
     },
     [agentId, cwd, onDeliverQueuedTopic, queueWriter, serverId, submitMessage, t, topicQueue],

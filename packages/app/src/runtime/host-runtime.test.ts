@@ -21,6 +21,12 @@ import { useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queueComposerMessage } from "@/composer/actions";
+import { resolveReplyComposerDraftKey } from "@/agent-stream/topic-card/submit-topic-reply";
+import {
+  buildDecisionRecoveryScope,
+  useDecisionRecoveryStore,
+  useDraftStore,
+} from "@/stores/draft-store";
 import { queryClient } from "@/data/query-client";
 import { checkoutStatusQueryKey } from "@/git/query-keys";
 import {
@@ -4726,6 +4732,126 @@ describe("HostRuntimeStore", () => {
     sessionStore.clearSession(serverId);
     hostSnapshot.mockRestore();
   });
+
+  it.each(["stale", "disconnected"])(
+    "only advances the idle queue after a definitive decision rejection (%s)",
+    async (outcome) => {
+      const serverId = `srv_queue_recovery_${outcome}`;
+      const agentId = "main";
+      const workspaceId = "workspace";
+      const fakeClient = new FakeDaemonClient();
+      const decideWorkspaceTopic = vi.fn().mockImplementation(async () => {
+        if (outcome === "disconnected") throw new Error("Socket closed");
+        return {
+          requestId: "stale",
+          workspaceId,
+          topicKey: "task:one",
+          accepted: false,
+          task: null,
+          durableItem: null,
+          entry: null,
+          error: "The blocking question changed.",
+          errorCode: "stale_blocking_question",
+        };
+      });
+      const client = Object.assign(fakeClient, { decideWorkspaceTopic }) as unknown as DaemonClient;
+      const runtime = getHostRuntimeStore();
+      const snapshot = vi.spyOn(runtime, "getSnapshot").mockReturnValue({
+        connectionStatus: "online",
+        client,
+      } as never);
+      const store = useSessionStore.getState();
+      const target = {
+        topicKey: "task:one",
+        taskId: "one",
+        promptPreview: "First task",
+        routeMode: "main" as const,
+        decisionContext: {
+          kind: "task_blocking_question" as const,
+          blockingQuestionGeneration: "old",
+          question: "Proceed?",
+        },
+      };
+      const item = {
+        id: "head",
+        text: "Answer to the old question",
+        attachments: [{ kind: "quote" as const, id: "quote-1", text: "Keep this context" }],
+        topicReply: { workspaceId, clientMessageId: "decision-original-id", target },
+      };
+      const following = { id: "following", text: "Next ordinary message", attachments: [] };
+      const draftKey = resolveReplyComposerDraftKey({
+        serverId,
+        workspaceId,
+        agentId,
+        target: Object.assign({}, target, { recoveryId: item.topicReply.clientMessageId }),
+      });
+      store.initializeSession(serverId, client, 1);
+      store.setAgents(
+        serverId,
+        new Map([
+          [
+            agentId,
+            replicaAgent(
+              makeFetchAgentsEntry({
+                id: agentId,
+                cwd: "/repo",
+                updatedAt: "2026-10-01T01:00:00.000Z",
+              }).agent,
+              serverId,
+            ),
+          ],
+        ]),
+      );
+      store.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: null,
+        features: { workspaceButlerV1: true },
+      });
+      store.setQueuedMessages(serverId, new Map([[agentId, [item, following]]]));
+      try {
+        runtime.drainQueuedAgentMessage(serverId, agentId);
+        if (outcome === "stale") await fakeClient.waitForSentMessages(1);
+        await vi.waitFor(() =>
+          expect(runtime.isDrainingQueuedAgentMessage(serverId, agentId)).toBe(false),
+        );
+        expect(decideWorkspaceTopic).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            clientMessageId: "decision-original-id",
+            expectedBlockingQuestionGeneration: "old",
+          }),
+        );
+        const session = useSessionStore.getState().sessions[serverId];
+        const recoveries =
+          useDecisionRecoveryStore.getState().byScope[
+            buildDecisionRecoveryScope(serverId, workspaceId, agentId)
+          ];
+        if (outcome === "stale") {
+          expect(session?.queuedMessages.get(agentId)).toEqual([]);
+          expect(recoveries).toHaveLength(1);
+          expect(fakeClient.sentAgentMessages[0]?.slice(0, 2)).toEqual([agentId, following.text]);
+          expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+            text: item.text,
+            attachments: item.attachments,
+          });
+        } else {
+          expect(session?.queuedMessages.get(agentId)).toEqual([item, following]);
+          expect(recoveries).toBeUndefined();
+          expect(fakeClient.sentAgentMessages).toEqual([]);
+        }
+      } finally {
+        snapshot.mockRestore();
+        useDecisionRecoveryStore
+          .getState()
+          .remove(
+            buildDecisionRecoveryScope(serverId, workspaceId, agentId),
+            item.topicReply.clientMessageId,
+          );
+        store.clearSession(serverId);
+        useDraftStore.getState().clearDraftInput({ draftKey, lifecycle: "abandoned" });
+      }
+    },
+  );
 
   it("drains a queued message as a steer so a turn the agent just started is not interrupted", async () => {
     const host = makeHost({ serverId: "srv_steer_queue_drain" });

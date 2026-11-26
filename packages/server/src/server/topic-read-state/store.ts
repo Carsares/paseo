@@ -33,6 +33,11 @@ export interface TopicReadCoordinates {
   /** Current authoritative epoch, or null when the timeline has no sequence coordinates. */
   epoch: string | null;
   headSeq?: number;
+  /** Resolve a legacy sequence only after the current timeline verifies its sequence and time. */
+  resolveLegacySeq?: (input: {
+    seq: number | undefined;
+    timestampMs: number | undefined;
+  }) => Promise<number | undefined>;
 }
 
 export type TopicReadScope = TopicReadKey &
@@ -103,6 +108,22 @@ function boundObservedSeq(
   return Math.max(NO_SEQ, Math.min(seq, scope.headSeq));
 }
 
+async function resolveObservedSeq(
+  scope: TopicReadCoordinates,
+  input: MarkInput,
+): Promise<number | undefined> {
+  const observedSeq = boundObservedSeq(scope, input.epoch, input.seq);
+  if (
+    observedSeq !== undefined ||
+    scope.epoch === null ||
+    input.epoch !== undefined ||
+    !scope.resolveLegacySeq
+  ) {
+    return observedSeq;
+  }
+  return scope.resolveLegacySeq({ seq: input.seq, timestampMs: input.timestampMs });
+}
+
 function advanceTimestamp(previous: number | undefined, observed: number | undefined) {
   return observed === undefined ? previous : Math.max(previous ?? 0, observed);
 }
@@ -154,10 +175,10 @@ export class TopicReadStateStore {
   }
 
   mark(scope: TopicReadScope, input: MarkInput): Promise<TopicReadMutation> {
-    return this.mutate(scope, (current, coordinates) => {
+    return this.mutate(scope, async (current, coordinates) => {
       if (typeof input.epoch === "string" && !matchesObservedEpoch(coordinates, input.epoch))
         return null;
-      const observedSeq = boundObservedSeq(coordinates, input.epoch, input.seq);
+      const observedSeq = await resolveObservedSeq(coordinates, input);
       // An old sender can still mark by time. A sequence alone cannot identify its generation.
       if (observedSeq === undefined && input.timestampMs === undefined) return null;
       const aligned = coordinates.epoch === null ? current : alignEpoch(current, coordinates.epoch);
@@ -271,7 +292,7 @@ export class TopicReadStateStore {
     update: (
       current: WorkspaceTopicReadSnapshot,
       coordinates: TopicReadCoordinates,
-    ) => WorkspaceTopicReadSnapshot | null,
+    ) => Promise<WorkspaceTopicReadSnapshot | null> | WorkspaceTopicReadSnapshot | null,
   ): Promise<TopicReadMutation> {
     const filePath = this.filePath(key.workspaceId);
     return this.serialize(key.workspaceId, async () => {
@@ -279,7 +300,7 @@ export class TopicReadStateStore {
       const index = snapshots.findIndex((snapshot) => snapshot.mainAgentId === key.mainAgentId);
       const current = snapshots[index] ?? emptySnapshot(key);
       const coordinates = "readCoordinates" in key ? await key.readCoordinates() : key;
-      const next = update(current, coordinates);
+      const next = await update(current, coordinates);
       if (next === null) return { snapshot: current, changed: false, applied: false };
       if (next === current) return { snapshot: current, changed: false, applied: true };
 

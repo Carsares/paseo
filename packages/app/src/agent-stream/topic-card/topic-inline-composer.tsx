@@ -110,6 +110,8 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [isPicking, setIsPicking] = useState(false);
   const submitting = useRef(false);
+  const [isSending, setIsSending] = useState(false);
+  const isEditorLocked = isSubmitting || isSending;
   const { pickFiles } = useFilePicker();
   const client = useHostRuntimeClient(serverId ?? "");
   const hasContent = text.trim().length > 0 || attachments.length > 0;
@@ -123,20 +125,22 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
 
   const handleChangeText = useCallback(
     (next: string) => {
+      if (isSubmitting || submitting.current) return;
       updateDraft(draftKey, (current) => ({ ...current, text: next }));
     },
-    [draftKey, updateDraft],
+    [draftKey, isSubmitting, updateDraft],
   );
 
   const toggleRouteMode = useCallback(() => {
+    if (isSubmitting || submitting.current) return;
     updateDraft(draftKey, (current) => ({
       ...current,
       routeMode: current.routeMode === "main" ? "auto" : "main",
     }));
-  }, [draftKey, updateDraft]);
+  }, [draftKey, isSubmitting, updateDraft]);
 
   const addAttachments = useCallback(async () => {
-    if (isSubmitting || isPicking) return;
+    if (isSubmitting || isPicking || submitting.current) return;
     setIsPicking(true);
     setAttachmentError(null);
     try {
@@ -196,6 +200,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
       { text: trimmed, attachments, cwd: "" },
     );
     submitting.current = true;
+    setIsSending(true);
     try {
       const succeeded = await onSubmitDesktopReply(
         trimmed,
@@ -214,6 +219,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
       // The submit owner reports the failure. Keep the original draft and submission ID.
     } finally {
       submitting.current = false;
+      setIsSending(false);
     }
   }, [
     attachments,
@@ -231,13 +237,14 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
 
   const removeAttachment = useCallback(
     (attachment: InlineReplyAttachment) => {
+      if (isSubmitting || submitting.current) return;
       const keepAttachment = (item: UserComposerAttachment) => item !== attachment;
       updateDraft(draftKey, (current) => ({
         ...current,
         attachments: current.attachments.filter(keepAttachment),
       }));
     },
-    [draftKey, updateDraft],
+    [draftKey, isSubmitting, updateDraft],
   );
 
   const handleTriggerSend = useCallback(() => {
@@ -291,6 +298,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
         {hasLeadAgent ? (
           <PressHighlight
             accessibilityRole="button"
+            disabled={isEditorLocked}
             onPress={toggleRouteMode}
             style={styles.routeToggle}
             testID={`topic-inline-route-toggle-${topicKey}`}
@@ -310,7 +318,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           <InlineAttachmentRow
             key={id}
             attachment={attachment}
-            disabled={isSubmitting || isPicking}
+            disabled={isEditorLocked || isPicking}
             onRemove={removeAttachment}
           />
         );
@@ -329,14 +337,14 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           style={styles.textInput}
           onSubmitEditing={handleTriggerSend}
           returnKeyType="send"
-          editable={!isSubmitting}
+          editable={!isEditorLocked}
           testID={`topic-inline-reply-input-${topicKey}`}
         />
         <Button
           size="sm"
           variant="ghost"
           accessibilityLabel={t("composer.attachments.addFile")}
-          disabled={isSubmitting || isPicking}
+          disabled={isEditorLocked || isPicking}
           onPress={addAttachments}
           testID={`topic-inline-reply-attach-${topicKey}`}
         >
@@ -345,7 +353,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
         <Button
           size="sm"
           variant="default"
-          disabled={isSubmitting || isPicking || !hasContent}
+          disabled={isEditorLocked || isPicking || !hasContent}
           onPress={handleTriggerSend}
           testID={`topic-inline-reply-send-${topicKey}`}
         >

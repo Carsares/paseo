@@ -308,6 +308,8 @@ const en = {
     decisionDeliveryUnconfirmed:
       "The host has not confirmed this approval. Retry the original request.",
     decisionEvidenceStale: "Related files have changed. Refresh and review before approving.",
+    reviewRecoveredDecision: "Review unsent decision",
+    quoteAfterSending: "Wait for the current reply to finish before quoting.",
     decisionBlockingQuestionStale:
       "The blocking question has updated. Review the new question before submitting.",
     decisionStandaloneRequiredHint:
@@ -668,6 +670,8 @@ const zhCN = {
     decisionResumeRequired: "审批已保存，可续接以完成这次请求。",
     decisionDeliveryUnconfirmed: "宿主尚未确认这次审批，可重试原请求。",
     decisionEvidenceStale: "关联代码已变更，请刷新核对后再拍板。",
+    reviewRecoveredDecision: "查看未发送的决定",
+    quoteAfterSending: "请等当前回复发送完成后再引用。",
     decisionBlockingQuestionStale: "阻塞问题已更新，请核对新问题后再提交。",
     decisionStandaloneRequiredHint: "此待处理项未绑定具体任务，请前往独立审批入口核对处理。",
     decisionAuthorizationStandaloneHint: "权限授权项请在独立审批入口核对处理。",

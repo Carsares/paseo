@@ -123,6 +123,7 @@ const deliverySchema = z.object({
   attachments: z.array(AgentAttachmentSchema).optional(),
   decisionPrompt: z.string().optional(),
   taskCreatedAt: z.iso.datetime().optional(),
+  requiresUniqueTask: z.literal(true).optional(),
 });
 export type TopicDelivery = z.infer<typeof deliverySchema>;
 const storedEntrySchema = TopicThreadEntrySchema.extend({
@@ -140,11 +141,13 @@ const topicFileSchema = z.object({
   decisions: z.array(storedDecisionSchema).optional(),
 });
 type TopicFile = z.infer<typeof topicFileSchema>;
-export type TopicTaskBinding = Pick<TopicAnchorInput, "taskId" | "rootMessageId">;
+export type TopicTaskBinding = Pick<TopicAnchorInput, "taskId" | "rootMessageId"> & {
+  createdAt?: string;
+};
 
 function migrateLegacyReplies(
   data: TopicFile,
-  anchor: TopicAnchorSummary,
+  anchor: ThreadScope & TopicTaskBinding & { topicKey: string },
   messageKey: string,
   knownTasks: readonly TopicTaskBinding[],
 ): StoredEntry[] {
@@ -162,12 +165,78 @@ function migrateLegacyReplies(
   for (const entry of data.entries) {
     if (matchesRoot(entry) && entry.taskId) owners.add(entry.taskId);
   }
+  const taskCreatedAt = knownTasks.find(
+    (task) => task.taskId === taskId && task.rootMessageId === rootMessageId,
+  )?.createdAt;
 
   return data.entries.map((entry) => {
     if (entry.topicKey !== messageKey || !matchesRoot(entry)) return entry;
     if (entry.taskId ? entry.taskId !== taskId : owners.size !== 1) return entry;
-    return { ...entry, topicKey: anchor.topicKey, taskId, rootMessageId };
+    const migrated = { ...entry, topicKey: anchor.topicKey, taskId, rootMessageId };
+    if (
+      taskCreatedAt &&
+      entry.role === "user_followup" &&
+      (entry.origin ?? "topic_reply") === "topic_reply" &&
+      entry.delivery &&
+      !entry.delivery.taskCreatedAt
+    ) {
+      // Bind the delivery now so a retry cannot follow a later reuse of the task ID.
+      migrated.delivery = { ...entry.delivery, taskCreatedAt, requiresUniqueTask: true };
+    }
+    return migrated;
   });
+}
+
+function entriesForRetry(
+  data: TopicFile,
+  address: Parameters<typeof migrateLegacyReplies>[1],
+  tasks: readonly TopicTaskBinding[] | undefined,
+) {
+  const { taskId, rootMessageId } = address;
+  if (!tasks || !rootMessageId || !taskId || address.topicKey !== `task:${taskId}`)
+    return data.entries;
+  const owners = tasks.filter((task) => task.rootMessageId === rootMessageId);
+  if (owners.length !== 1 || owners[0]?.taskId !== taskId) return data.entries;
+  requireMatchingAnchor(
+    data.anchors.find(
+      (anchor) => sameThreadScope(anchor, address) && anchor.topicKey === address.topicKey,
+    ),
+    address,
+  );
+  return migrateLegacyReplies(data, address, `msg:${rootMessageId}`, tasks);
+}
+
+function findRetrySource(
+  data: TopicFile,
+  followup: Followup,
+  entryId: string,
+  tasks?: readonly TopicTaskBinding[],
+) {
+  const entries = entriesForRetry(data, followup, tasks);
+  const findAttempt = (id: string) =>
+    entries.find(
+      (entry) =>
+        entry.entryId === id &&
+        entry.role === "user_followup" &&
+        entry.topicKey === followup.topicKey &&
+        entry.taskId === followup.taskId &&
+        entry.rootMessageId === followup.rootMessageId &&
+        sameThreadScope(entry, followup),
+    );
+  const selected = findAttempt(entryId);
+  const source = selected?.retryOfEntryId ? findAttempt(selected.retryOfEntryId) : selected;
+  if (!source?.delivery || source.retryOfEntryId)
+    throw new Error("The original topic follow-up is unavailable.");
+  data.entries = entries;
+  return { selected, source };
+}
+
+function recordRetryTask(source: StoredEntry | undefined, taskCreatedAt: string | undefined) {
+  if (!source?.delivery || !taskCreatedAt) return;
+  if (source.delivery.taskCreatedAt && source.delivery.taskCreatedAt !== taskCreatedAt)
+    throw new Error("The original reply no longer belongs to this task.");
+  source.delivery.taskCreatedAt = taskCreatedAt;
+  source.delivery.requiresUniqueTask = true;
 }
 
 function requireDecisionClaim(
@@ -255,12 +324,32 @@ export class TopicThreadStore {
     return (await this.listWithAnchors(scope, topicKey)).entries;
   }
 
-  listWithAnchors(scope: ThreadScope, topicKey?: string): Promise<TopicThreadSnapshot> {
-    return this.run(scope.workspaceId, (data) => {
+  listWithAnchors(
+    scope: ThreadScope,
+    topicKey?: string,
+    wasAccepted?: (entry: TopicThreadEntry) => Promise<boolean>,
+  ): Promise<TopicThreadSnapshot> {
+    return this.run(scope.workspaceId, async (data, file) => {
       const matches = (item: TopicThreadEntry | TopicAnchorSummary) =>
         sameThreadScope(item, scope) && (topicKey === undefined || item.topicKey === topicKey);
       return {
-        entries: data.entries.filter(matches).map(publicEntry),
+        entries: await Promise.all(
+          data.entries.filter(matches).map(async (stored) => {
+            const entry = publicEntry(stored);
+            if (
+              stored.role === "user_followup" &&
+              stored.retryOfEntryId &&
+              stored.status === "queued" &&
+              stored.handoffPending === false &&
+              !activeEntries.has(`${file}:${stored.entryId}`) &&
+              (await wasAccepted?.(entry).catch(() => undefined)) === false
+            ) {
+              // The client can recover this attempt by its entry ID after losing its request ID.
+              entry.retryable = true;
+            }
+            return entry;
+          }),
+        ),
         anchors: data.anchors.filter(matches),
       };
     });
@@ -440,29 +529,32 @@ export class TopicThreadStore {
   }
 
   getDelivery(
-    scope: ThreadScope & { topicKey: string },
+    scope: ThreadScope & TopicTaskBinding & { topicKey: string },
     id: { entryId: string } | { sourceMessageId: string },
+    retryTasks?: readonly TopicTaskBinding[],
   ) {
-    return this.run(scope.workspaceId, ({ entries, decisions }) => {
-      const found = entries.find(
-        (entry) =>
-          entry.role === "user_followup" &&
-          sameThreadScope(entry, scope) &&
-          entry.topicKey === scope.topicKey &&
-          ("entryId" in id
-            ? entry.entryId === id.entryId
-            : entry.sourceMessageId === id.sourceMessageId),
-      );
+    return this.run(scope.workspaceId, (data) => {
+      const matches = (entry: StoredEntry) =>
+        entry.role === "user_followup" &&
+        sameThreadScope(entry, scope) &&
+        entry.topicKey === scope.topicKey &&
+        ("entryId" in id
+          ? entry.entryId === id.entryId
+          : entry.sourceMessageId === id.sourceMessageId);
+      const exact = data.entries.find(matches);
+      if (!exact && !retryTasks) return;
+      const entries = exact ? data.entries : entriesForRetry(data, scope, retryTasks);
+      const found = exact ?? entries.find(matches);
       if (!found) return;
       const root = found.retryOfEntryId
         ? entries.find((entry) => entry.entryId === found.retryOfEntryId)
         : found;
       if (!root?.delivery) return;
-      const decision = decisions?.find(
+      const decision = data.decisions?.find(
         ({ input }) =>
           sameThreadScope(input, scope) && input.clientMessageId === root.sourceMessageId,
       );
-      return { entry: publicEntry(found), delivery: root.delivery, decision };
+      return { entry: publicEntry(found), delivery: root.delivery, decision, promoted: !exact };
     });
   }
 
@@ -472,6 +564,7 @@ export class TopicThreadStore {
     assertCurrent?: () => void,
     delivery?: TopicDelivery,
     retryOfEntryId?: string,
+    retryTasks?: readonly TopicTaskBinding[],
   ): Promise<{
     entry: TopicThreadEntry;
     changed: boolean;
@@ -479,19 +572,25 @@ export class TopicThreadStore {
     sourceUpdate?: TopicThreadEntry;
   }> {
     return this.run(followup.workspaceId, async (data, file) => {
-      const { entries } = data;
-      const source = retryOfEntryId
-        ? entries.find(
-            (entry) =>
-              entry.entryId === retryOfEntryId &&
-              entry.role === "user_followup" &&
-              entry.topicKey === followup.topicKey &&
-              sameThreadScope(entry, followup),
-          )
+      const retry = retryOfEntryId
+        ? findRetrySource(data, followup, retryOfEntryId, retryTasks)
         : undefined;
-      if (retryOfEntryId && (!source?.delivery || source.retryOfEntryId))
-        throw new Error("The original topic follow-up is unavailable.");
+      const { entries } = data;
+      const selected = retry?.selected;
+      const source = retry?.source;
       requireDecisionClaim(data, followup, source?.sourceMessageId);
+      if (retryTasks) recordRetryTask(source, delivery?.taskCreatedAt);
+      if (selected?.retryOfEntryId) {
+        return this.recoverFollowup(
+          data,
+          file,
+          entries.indexOf(selected),
+          followup,
+          wasAccepted,
+          assertCurrent,
+          selected.retryOfEntryId,
+        );
+      }
       const index = entries.findIndex(
         (entry) =>
           entry.role !== "agent_reply" &&
@@ -553,13 +652,16 @@ export class TopicThreadStore {
     if (previous.status === "completed" || previous.status === "error" || activeEntries.has(key))
       return { entry: publicEntry(previous), changed: false };
 
-    // A restarted router has no live claim. Recover when the client resends the request
-    // so attachments are available. A past provider handoff may already have executed.
-    // Before the handoff marker existed, running was only written after the turn started.
-    const handedOff =
-      previous.handoffPending === true ||
-      (previous.handoffPending === undefined && previous.status === "running") ||
-      (await wasAccepted?.(publicEntry(previous))) === true;
+    // A retry attempt is recoverable only with a durable marker that rules out a prior handoff.
+    // For older first attempts, running was only written after the turn started.
+    const couldHaveHandedOff = previous.retryOfEntryId
+      ? previous.status !== "queued" || previous.handoffPending !== false
+      : previous.handoffPending === true ||
+        (previous.handoffPending === undefined && previous.status === "running");
+    const receipt = couldHaveHandedOff ? undefined : await wasAccepted?.(publicEntry(previous));
+    if (previous.retryOfEntryId && !couldHaveHandedOff && receipt === undefined)
+      throw new Error("The original delivery cannot be retried safely.");
+    const handedOff = couldHaveHandedOff || receipt === true;
     const entry = publicEntry({
       ...previous,
       ...(handedOff

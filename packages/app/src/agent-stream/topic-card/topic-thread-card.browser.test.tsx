@@ -3,6 +3,7 @@ import { within } from "@testing-library/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { page } from "vitest/browser";
 import { DisclosureRow } from "@/agent-stream/disclosure";
 import type { StreamViewportHandle } from "@/agent-stream/strategy";
 import { type HostRuntimeSnapshot, getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -267,7 +268,8 @@ it("renders conflict banner and blocking decision slot in browser layout", () =>
   expect(onJumpToPeerTopic).toHaveBeenCalledWith("T-200");
 });
 
-it("attaches a local image and file in the wide reply editor and preserves an attachment-only draft on failure", async () => {
+it("locks the wide reply recipient during send and retains attachments only on failure", async () => {
+  await page.viewport(1000, 760);
   const uploadFile = vi.fn(
     async ({
       fileName,
@@ -298,7 +300,11 @@ it("attaches a local image and file in the wide reply editor and preserves an at
   vi.spyOn(runtime, "getSnapshot").mockImplementation((id) =>
     id === "inline-host" ? snapshot : getSnapshot(id),
   );
-  const onSubmitDesktopReply = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  const accepted = Promise.withResolvers<boolean>();
+  const onSubmitDesktopReply = vi
+    .fn()
+    .mockResolvedValueOnce(false)
+    .mockReturnValueOnce(accepted.promise);
   const topic = makeTopic();
   await act(async () =>
     root.render(
@@ -366,10 +372,17 @@ it("attaches a local image and file in the wide reply editor and preserves an at
   ]);
   expect(view.getByText("trace.png")).toBeTruthy();
   expect(view.getByText("trace.txt")).toBeTruthy();
-  await act(async () => {
+  const routeToggle = page.getByTestId("topic-inline-route-toggle-task:T-100");
+  await expect.element(routeToggle).toBeEnabled();
+  act(() => {
     send.click();
+    // A click in the same React batch still reaches the old enabled button.
+    (routeToggle.element() as HTMLElement).click();
   });
+  await expect.element(routeToggle).toBeDisabled();
   expect(onSubmitDesktopReply.mock.calls[1]).toEqual(first);
+  await act(async () => accepted.resolve(true));
+  await expect.element(routeToggle).toBeEnabled();
   expect(view.queryByText("trace.png")).toBeNull();
   expect(view.queryByText("trace.txt")).toBeNull();
 });

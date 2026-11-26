@@ -17,13 +17,15 @@ import {
 import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
 import {
   buildTopicAgentKey,
-  buildTopicReplyDraftKey,
   type ActiveTopicReplyTarget,
   useTopicStreamViewStore,
 } from "@/stores/topic-stream-view-store";
 import {
   deliverQueuedTopicReply,
   finishTopicSubmission,
+  getTopicReplyRecoveryId,
+  isTopicComposerDraftSubmitting,
+  resolveReplyComposerDraftKey,
   rememberTopicSubmission,
   submitActiveTopicReply,
   TopicDecisionStaleQuestionError,
@@ -90,6 +92,12 @@ import {
   type ToastState,
 } from "@/components/toast-host";
 import { createQuoteAttachment } from "@/attachments/quote";
+import {
+  buildDecisionRecoveryScope,
+  useDecisionRecoveryStore,
+  useDraftStore,
+  type RecoveredTopicReplyTarget,
+} from "@/stores/draft-store";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import { useWorkspaceAttachmentScopeKey } from "@/attachments/workspace-attachments-store";
 import { COMPACT_CONTENT_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
@@ -1414,7 +1422,9 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
   const quoteSideChatReply = useStableEvent(async (quoteText: string) => {
     if (!sideChatSourceId || !workspaceId || !quoteText.trim()) return;
-    const draftKey = buildDraftStoreKey({ serverId, agentId: sideChatSourceId });
+    const resolveSourceDraftKey = () =>
+      resolveVisibleReplyDraftKey(serverId, workspaceId, sideChatSourceId);
+    const draftKey = resolveSourceDraftKey();
     const appended = await appendSideChatReplyToDraft({
       draftKey,
       text: quoteText,
@@ -1423,12 +1433,18 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         const source = resolveChatAgentFromSession(state, serverId, sideChatSourceId);
         return (
           isSideChatMainAgent(source, workspaceId, serverId) &&
-          !isHandoffInputLocked(serverId, sideChatSourceId)
+          !isHandoffInputLocked(serverId, sideChatSourceId) &&
+          !isTopicComposerDraftSubmitting(draftKey) &&
+          draftKey === resolveSourceDraftKey()
         );
       },
     });
     if (!appended) {
-      toastApi.error(t("message.actions.forkUnavailable"));
+      toastApi.error(
+        isTopicComposerDraftSubmitting(draftKey)
+          ? t("topicWorkbench.topicStream.quoteAfterSending")
+          : t("message.actions.forkUnavailable"),
+      );
       return;
     }
     navigateToWorkspace({
@@ -1451,14 +1467,26 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
               }
               if (isHandoffInputLocked(serverId, agentId)) return;
               const quote = createQuoteAttachment({ text: quoteText, label });
-              if (quote.text) setAttachments((prev) => [...prev, quote]);
+              if (!quote.text) return;
+              const draftKey = resolveVisibleReplyDraftKey(serverId, workspaceId, agentId);
+              if (isTopicComposerDraftSubmitting(draftKey)) {
+                toastApi.error(t("topicWorkbench.topicStream.quoteAfterSending"));
+                return;
+              }
+              useDraftStore.getState().updateDraftInput({
+                draftKey,
+                update: (current) => ({
+                  ...current,
+                  attachments: [...current.attachments, quote],
+                }),
+              });
             },
           }
         : null,
     [
       agentId,
       serverId,
-      setAttachments,
+      workspaceId,
       draft,
       hasActiveComposer,
       showsComposer,
@@ -2171,6 +2199,8 @@ function ActiveAgentComposer({
     topicDraftKey,
     submittingTopicDraftKey,
     topicQueue,
+    recoveredTopicDecisions,
+    handleOpenRecoveredDecision,
     handleToggleReplyRouteMode,
     handleCancelReplyTopic,
     handleSubmitTopicReply,
@@ -2200,6 +2230,18 @@ function ActiveAgentComposer({
           onCancel={handleCancelReplyTopic}
         />
       ) : null}
+      {!isComposerFullscreen
+        ? recoveredTopicDecisions?.map((recovery) =>
+            recovery.recoveryId !==
+            (activeReplyTopic && getTopicReplyRecoveryId(activeReplyTopic)) ? (
+              <RecoveredDecisionDraft
+                key={recovery.recoveryId}
+                recovery={recovery}
+                onOpen={handleOpenRecoveredDecision}
+              />
+            ) : null,
+          )
+        : null}
       <DraftComposer
         key={topicDraftKey ?? agentId}
         topicDraftKey={topicDraftKey}
@@ -2300,6 +2342,43 @@ function CompactTopicReplyContext({
   );
 }
 
+function resolveVisibleReplyDraftKey(serverId: string, workspaceId: string, agentId: string) {
+  const target =
+    useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[
+      buildTopicAgentKey(serverId, agentId)
+    ] ?? null;
+  return resolveReplyComposerDraftKey({ serverId, workspaceId, agentId, target });
+}
+
+function RecoveredDecisionDraft({
+  recovery,
+  onOpen,
+}: {
+  recovery: RecoveredTopicReplyTarget;
+  onOpen: (recovery: RecoveredTopicReplyTarget) => void;
+}) {
+  const { t } = useTranslation();
+  const open = useCallback(() => onOpen(recovery), [onOpen, recovery]);
+  return (
+    <View style={styles.topicReplyContextRail}>
+      <View style={styles.topicReplyContextBar}>
+        <Text style={styles.topicReplyContextText} numberOfLines={1}>
+          {recovery.promptPreview || recovery.topicKey}
+        </Text>
+        <PressHighlight
+          accessibilityRole="button"
+          onPress={open}
+          style={styles.topicReplyRoutePill}
+        >
+          <Text style={styles.topicReplyRouteText}>
+            {t("topicWorkbench.topicStream.reviewRecoveredDecision")}
+          </Text>
+        </PressHighlight>
+      </View>
+    </View>
+  );
+}
+
 function useActiveTopicComposer({
   serverId,
   workspaceId,
@@ -2331,14 +2410,16 @@ function useActiveTopicComposer({
   );
   const setActiveReplyRouteMode = useTopicStreamViewStore((state) => state.setActiveReplyRouteMode);
   const topicDraftKey = activeReplyTopic
-    ? buildTopicReplyDraftKey({
-        serverId,
-        workspaceId,
-        agentId,
-        topicKey: activeReplyTopic.topicKey,
-        decision: Boolean(activeReplyTopic.decisionContext),
-      })
+    ? resolveReplyComposerDraftKey({ serverId, workspaceId, agentId, target: activeReplyTopic })
     : undefined;
+  const recoveryScope = buildDecisionRecoveryScope(serverId, workspaceId, agentId);
+  const recoveredTopicDecisions = useDecisionRecoveryStore((state) => state.byScope[recoveryScope]);
+  const handleOpenRecoveredDecision = useCallback(
+    (recovery: RecoveredTopicReplyTarget) => {
+      if (!isHandoffInputLocked(serverId, agentId)) setActiveReplyTopic(topicAgentKey, recovery);
+    },
+    [agentId, serverId, setActiveReplyTopic, topicAgentKey],
+  );
   const [submittingTopicDraftKey, setSubmittingTopicDraftKey] = useState<string>();
   const refreshActiveDecisionContext = useTopicStreamViewStore(
     (state) => state.refreshActiveDecisionContext,
@@ -2354,6 +2435,8 @@ function useActiveTopicComposer({
     (clientMessageId: string) => {
       if (!activeReplyTopic || !topicDraftKey) return;
       finishTopicSubmission(topicDraftKey, clientMessageId);
+      const recoveryId = getTopicReplyRecoveryId(activeReplyTopic);
+      if (recoveryId) useDecisionRecoveryStore.getState().remove(recoveryScope, recoveryId);
       clearActiveReplyTopicIfMatches(topicAgentKey, {
         topicKey: activeReplyTopic.topicKey,
         taskId: activeReplyTopic.taskId,
@@ -2363,12 +2446,12 @@ function useActiveTopicComposer({
         selection: activeReplyTopic,
       });
     },
-    [activeReplyTopic, clearActiveReplyTopicIfMatches, topicAgentKey, topicDraftKey],
+    [activeReplyTopic, clearActiveReplyTopicIfMatches, recoveryScope, topicAgentKey, topicDraftKey],
   );
 
   const sendQueuedTopicReply = useCallback(
     async (topicReply: QueuedTopicReply, payload: MessagePayload) => {
-      await deliverQueuedTopicReply({
+      const result = await deliverQueuedTopicReply({
         queryClient,
         serverId,
         agentId,
@@ -2378,6 +2461,7 @@ function useActiveTopicComposer({
         supportsButlerV1,
         supportsForgeAttachments,
       });
+      if (result === "recovered") return result;
       onMessageSent();
     },
     [
@@ -2484,6 +2568,8 @@ function useActiveTopicComposer({
     topicDraftKey,
     submittingTopicDraftKey,
     topicQueue,
+    recoveredTopicDecisions,
+    handleOpenRecoveredDecision,
     handleToggleReplyRouteMode,
     handleCancelReplyTopic,
     handleSubmitTopicReply,

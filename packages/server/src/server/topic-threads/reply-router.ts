@@ -212,6 +212,14 @@ function sameTopicTask(a: WorkspaceTask | undefined, b: WorkspaceTask | undefine
   );
 }
 
+function requireUniqueReplyTask(tasks: readonly WorkspaceTask[], expected: WorkspaceTask) {
+  const owners = tasks.filter((task) => task.rootMessageId === expected.rootMessageId);
+  const current = owners[0];
+  if (owners.length !== 1 || !current || !sameTopicTask(current, expected))
+    throw new Error("The original reply has no unique task for this topic.");
+  return current;
+}
+
 function topicContext(entry: TopicThreadEntry, fallbackReason: Route["fallbackReason"]): string {
   const attr = (name: string, value: string | undefined) =>
     value ? ` ${name}="${value.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}"` : "";
@@ -261,6 +269,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     humanInitiated: boolean,
     decision?: TopicDecisionDispatch,
     originalTaskCreatedAt?: string,
+    boundRetryTask?: WorkspaceTask,
   ) {
     const { workspaceId, entryId, taskId, rootMessageId } = entry;
     let failedLeadId: string | undefined;
@@ -272,6 +281,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     const readTask = async () => {
       if (!taskId && !rootMessageId) return;
       const tasks = await taskLedger.list(workspaceId);
+      if (boundRetryTask) return requireUniqueReplyTask(tasks, boundRetryTask);
       decision?.guard?.validateTask(tasks);
       const task = taskId
         ? tasks.find((item) => item.taskId === taskId)
@@ -326,6 +336,13 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           if (!sameTopicTask(task, await readTask())) throw new TopicRouteChangedError(target);
         },
         onHandoff: async (pending) => {
+          if (pending && boundRetryTask && taskLedger.withTaskSnapshot) {
+            await taskLedger.withTaskSnapshot(workspaceId, async (tasks) => {
+              submittedTask = requireUniqueReplyTask(tasks, boundRetryTask);
+              await store.setHandoffPending(workspaceId, entryId, true);
+            });
+            return;
+          }
           submittedTask = pending ? await readTask() : undefined;
           if (pending && decision?.durableItemRequestId && taskLedger.withTaskSnapshot) {
             // Keep the last version check and the handoff marker ordered with task writes.
@@ -490,21 +507,53 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
   }
 
   type ReplyAddress = Awaited<ReturnType<typeof resolveReplyAddress>>["address"];
-  type SavedDelivery = Awaited<ReturnType<TopicThreadStore["getDelivery"]>>;
+  type SavedDelivery = NonNullable<Awaited<ReturnType<TopicThreadStore["getDelivery"]>>>;
 
-  async function readRetryDelivery(
-    source: SavedDelivery,
-    retryOfEntryId: string,
-    topicKey: string,
+  async function retryAddress(request: WorkspaceTopicReplyRequest, entryId: string) {
+    const source = await store.getDelivery(request, { entryId });
+    // Only the requested thread address and the attempt ID come from the retry request.
+    return {
+      type: request.type,
+      requestId: request.requestId,
+      workspaceId: request.workspaceId,
+      topicKey: request.topicKey,
+      mainAgentId: request.mainAgentId,
+      clientMessageId: request.clientMessageId,
+      text: "",
+      taskId: source?.entry.taskId,
+      rootMessageId: source?.entry.rootMessageId,
+    };
+  }
+
+  function retryTaskBinding(
+    { entry, delivery, promoted }: SavedDelivery,
     address: ReplyAddress,
+    task: WorkspaceTask | undefined,
     tasks: readonly WorkspaceTask[],
   ) {
-    if (source) return source;
+    const ordinary = (entry.origin ?? "topic_reply") === "topic_reply";
+    if (promoted && !ordinary) throw new Error("The original topic decision cannot be rebound.");
     if (
-      topicKey.startsWith("msg:") &&
-      tasks.filter((item) => item.rootMessageId === address.rootMessageId).length === 1
+      !ordinary ||
+      !task?.rootMessageId ||
+      address.topicKey !== `task:${task.taskId}` ||
+      (!promoted && delivery.taskCreatedAt && !delivery.requiresUniqueTask)
     )
-      return store.getDelivery(address, { entryId: retryOfEntryId });
+      return;
+    if (!taskLedger.withTaskSnapshot)
+      throw new Error("The original reply cannot be safely bound to this task.");
+    return requireUniqueReplyTask(tasks, task);
+  }
+
+  async function requireRetryDelivery(
+    topicKey: string,
+    entryId: string,
+    { address, task, tasks }: Awaited<ReturnType<typeof resolveReplyAddress>>,
+  ) {
+    if (topicKey.startsWith("msg:") && task) requireUniqueReplyTask(tasks, task);
+    const delivery = await store.getDelivery(address, { entryId }, tasks);
+    if (!delivery) throw new Error("The original topic follow-up is unavailable.");
+    return delivery;
   }
 
   function verifyDelivery(
@@ -531,36 +580,25 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     request: WorkspaceTopicReplyRequest,
     decision?: TopicDecisionDispatch,
   ) {
-    const { requestId, workspaceId, topicKey } = request;
+    const { workspaceId, topicKey } = request;
     // COMPAT(topicReplyLegacyRetry): v0.18.0 clients used a deterministic retry:<entryId> ID.
     // Remove after the client floor sends retryOfEntryId.
     const legacyRetry = /^retry:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i;
     const retryOfEntryId = request.retryOfEntryId ?? legacyRetry.exec(request.clientMessageId)?.[1];
-    let retrySource: Awaited<ReturnType<TopicThreadStore["getDelivery"]>>;
     if (retryOfEntryId) {
       if (decision) throw new Error("A repeat delivery requires an existing topic follow-up.");
-      retrySource = await store.getDelivery(request, { entryId: retryOfEntryId });
-      // Only the requested thread address and the attempt ID come from the retry request.
-      request = {
-        type: request.type,
-        requestId,
-        workspaceId,
-        topicKey,
-        mainAgentId: request.mainAgentId,
-        clientMessageId: request.clientMessageId,
-        text: "",
-        taskId: retrySource?.entry.taskId,
-        rootMessageId: retrySource?.entry.rootMessageId,
-      };
+      request = await retryAddress(request, retryOfEntryId);
     }
-    const { address, task, tasks } = await resolveReplyAddress(request, decision);
+    const resolved = await resolveReplyAddress(request, decision);
+    const { address, task, tasks } = resolved;
     const replay = retryOfEntryId
-      ? await readRetryDelivery(retrySource, retryOfEntryId, topicKey, address, tasks)
+      ? await requireRetryDelivery(topicKey, retryOfEntryId, resolved)
       : await store.getDelivery(address, { sourceMessageId: request.clientMessageId });
-    if (retryOfEntryId && !replay) throw new Error("The original topic follow-up is unavailable.");
+    let boundRetryTask: WorkspaceTask | undefined;
     if (replay) {
       const { entry: previous, delivery: stored, decision: record } = replay;
       verifyDelivery(request, decision, retryOfEntryId, previous, stored, task, address);
+      if (retryOfEntryId) boundRetryTask = retryTaskBinding(replay, address, task, tasks);
       request = {
         ...request,
         text: previous.text,
@@ -571,13 +609,18 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         decision = resumeDecision(workspaceId, record, previous, stored);
     }
     if (!request.text.trim()) throw new Error("Topic follow-up text is required.");
-    const delivery = replay?.delivery ?? {
-      routeMode: request.routeMode,
-      attachments: request.attachments,
-      decisionPrompt: decision?.promptText,
-      taskCreatedAt: task?.createdAt,
-    };
-    return { request, decision, delivery, address, task, tasks, retryOfEntryId };
+    const delivery = replay
+      ? {
+          ...replay.delivery,
+          taskCreatedAt: boundRetryTask?.createdAt ?? replay.delivery.taskCreatedAt,
+        }
+      : {
+          routeMode: request.routeMode,
+          attachments: request.attachments,
+          decisionPrompt: decision?.promptText,
+          taskCreatedAt: task?.createdAt,
+        };
+    return { request, decision, delivery, address, task, tasks, retryOfEntryId, boundRetryTask };
   }
 
   return {
@@ -595,7 +638,10 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       });
       try {
         await requireMain(request);
-        return reply(await store.listWithAnchors(request, topicKey), null);
+        return reply(
+          await store.listWithAnchors(request, topicKey, deps.dispatch.wasAccepted),
+          null,
+        );
       } catch (error) {
         logger.warn({ err: error, workspaceId }, "Could not list topic entries");
         return reply({ entries: [], anchors: [] }, "Could not list topic entries.");
@@ -625,15 +671,16 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           task,
           tasks,
           retryOfEntryId,
+          boundRetryTask,
         } = await prepareDelivery(request, decision);
         request = preparedRequest;
         decision = preparedDecision;
         const route = await selectRoute(request, task, deps);
-        const write = async () => {
+        const write = async (retryTasks?: readonly WorkspaceTask[]) => {
           const anchorWrite = await ensureReplyAnchor(
             address,
             task,
-            tasks,
+            retryTasks ?? tasks,
             request.rootPromptPreview,
             decision?.guard?.assertCurrent,
           );
@@ -652,12 +699,20 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
             decision?.guard?.assertCurrent,
             delivery,
             retryOfEntryId,
+            retryTasks,
           );
           return { ...result, anchorWrite };
         };
-        const { entry, changed, release, anchorWrite, sourceUpdate } = await (decision?.guard
-          ? decision.guard.commit(write)
-          : write());
+        const claim = async () => {
+          if (decision?.guard) return decision.guard.commit(write);
+          if (boundRetryTask && taskLedger.withTaskSnapshot)
+            return taskLedger.withTaskSnapshot(workspaceId, (currentTasks) => {
+              requireUniqueReplyTask(currentTasks, boundRetryTask);
+              return write(currentTasks);
+            });
+          return write();
+        };
+        const { entry, changed, release, anchorWrite, sourceUpdate } = await claim();
         if (sourceUpdate) publish(sourceUpdate);
         if (changed || anchorWrite.changed) publish(entry, anchorWrite.anchor);
         if (release) {
@@ -668,6 +723,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
             humanInitiated,
             decision,
             delivery.taskCreatedAt,
+            boundRetryTask,
           ).catch((error) => {
             logger.warn({ err: error, entryId: entry.entryId }, "Could not persist topic result");
           });

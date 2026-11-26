@@ -3512,20 +3512,57 @@ export class Session {
         workspaceId: workspace.workspaceId,
         mainAgentId,
         readCoordinates: async () => {
-          const head = this.agentManager.getLoadedTimelineHead(mainAgentId);
-          if (head) return { epoch: head.epoch, headSeq: head.seq };
+          const readCurrentTimeline = async () => {
+            const head = this.agentManager.getLoadedTimelineHead(mainAgentId);
+            if (head) return this.agentManager.fetchTimeline(mainAgentId, { limit: 0 });
+            const record = await this.agentStorage.get(mainAgentId);
+            if (
+              record?.workspaceId !== workspace.workspaceId ||
+              record.internal ||
+              record.archivedAt
+            )
+              return null;
+            // Use the same persisted projection as history fetch, without loading a provider.
+            return this.agentManager.readStoredTimeline(record, { direction: "tail", limit: 0 });
+          };
+          const loadedHead = this.agentManager.getLoadedTimelineHead(mainAgentId);
+          if (loadedHead) {
+            return {
+              epoch: loadedHead.epoch,
+              headSeq: loadedHead.seq,
+              resolveLegacySeq: (input) => resolveLegacySeq(loadedHead.epoch, input),
+            };
+          }
           const record = await this.agentStorage.get(mainAgentId);
           if (record?.workspaceId !== workspace.workspaceId || record.internal || record.archivedAt)
             return { epoch: null };
-          // Use the same persisted projection as history fetch, without loading a provider.
           const timeline = await this.agentManager.readStoredTimeline(record, {
             direction: "tail",
             limit: 1,
           });
-          const loaded = this.agentManager.getLoadedTimelineHead(mainAgentId);
-          return loaded
-            ? { epoch: loaded.epoch, headSeq: loaded.seq }
-            : { epoch: timeline.epoch, headSeq: timeline.window.maxSeq };
+          const currentLoadedHead = this.agentManager.getLoadedTimelineHead(mainAgentId);
+          const epoch = currentLoadedHead?.epoch ?? timeline.epoch;
+          const headSeq = currentLoadedHead?.seq ?? timeline.window.maxSeq;
+          return {
+            epoch,
+            headSeq,
+            resolveLegacySeq: (input) => resolveLegacySeq(epoch, input),
+          };
+
+          async function resolveLegacySeq(
+            observedEpoch: string,
+            input: { seq: number | undefined; timestampMs: number | undefined },
+          ) {
+            if (input.seq === undefined || input.timestampMs === undefined) return undefined;
+            const current = await readCurrentTimeline();
+            if (!current || current.epoch !== observedEpoch) return undefined;
+            if (input.seq < 0 || input.seq > current.window.maxSeq) return undefined;
+            const hasSequence = current.rows.some((row) => row.seq === input.seq);
+            const hasTimestamp = current.rows.some(
+              (row) => Date.parse(row.timestamp) === input.timestampMs,
+            );
+            return hasSequence && hasTimestamp ? input.seq : undefined;
+          }
         },
       });
     }

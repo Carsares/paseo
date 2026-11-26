@@ -2886,6 +2886,14 @@ export class HostRuntimeStore {
     return this.queuedAgentDrainInFlight.has(`${serverId}:${agentId}`);
   }
 
+  resumeQueueAfterTopicRecovery(serverId: string, agentId: string): void {
+    const session = useSessionStore.getState().sessions[serverId];
+    const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+    if (agent?.turn.phase === "idle" && this.getSnapshot(serverId)?.connectionStatus === "online") {
+      this.drainQueuedAgentMessage(serverId, agentId);
+    }
+  }
+
   drainQueuedAgentMessage(serverId: string, agentId: string): void {
     const drainKey = `${serverId}:${agentId}`;
     if (this.queuedAgentDrainInFlight.has(drainKey)) return;
@@ -2898,6 +2906,7 @@ export class HostRuntimeStore {
     }
     this.queuedAgentDrainInFlight.add(drainKey);
     const next = queue[0];
+    let recovered = false;
     void sendQueuedComposerMessageNow({
       agentId,
       messageId: next.id,
@@ -2910,7 +2919,7 @@ export class HostRuntimeStore {
         const supportsForgeAttachments =
           useSessionStore.getState().sessions[serverId]?.serverInfo?.features?.forgeSearch === true;
         if (topicReply) {
-          await deliverQueuedTopicReply({
+          return deliverQueuedTopicReply({
             queryClient,
             serverId,
             agentId,
@@ -2920,7 +2929,6 @@ export class HostRuntimeStore {
             supportsButlerV1: session.serverInfo?.features?.workspaceButlerV1 === true,
             supportsForgeAttachments,
           });
-          return;
         }
         const agent = useSessionStore.getState().sessions[serverId]?.agents.get(agentId);
         await dispatchComposerAgentMessage({
@@ -2953,10 +2961,12 @@ export class HostRuntimeStore {
             error: result.errorMessage,
           });
         }
+        recovered = result.status === "recovered";
         return result;
       })
       .finally(() => {
         this.queuedAgentDrainInFlight.delete(drainKey);
+        if (recovered) this.resumeQueueAfterTopicRecovery(serverId, agentId);
       });
   }
 

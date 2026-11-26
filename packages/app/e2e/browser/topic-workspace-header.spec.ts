@@ -428,7 +428,7 @@ test("compact topic leaves room for its title and keeps an open terminal reachab
   await expect(mainStream).toBeVisible();
   await expect(terminalSurface).toHaveCount(0);
 
-  const workspaceMenu = visible(page, "workspace-header-menu");
+  const workspaceMenu = visible(page, "workspace-header-menu-content");
   const workspaceTabs = visible(page, "workspace-header-tabs");
   const terminalOption = visible(page, `workspace-header-tab-${terminalKey}`);
   const terminalActions = visible(page, `workspace-header-tab-actions-${terminalKey}`);
@@ -482,6 +482,8 @@ test("compact topic leaves room for its title and keeps an open terminal reachab
     await expect(mainStream).toBeVisible();
     await expect(terminalSurface).toHaveCount(0);
 
+    // The confirmation resolves before the bottom sheet finishes dismissing.
+    await expect(page.getByTestId("workspace-header-menu-content")).toHaveCount(0);
     await visible(page, "workspace-header-menu-trigger").click();
     await expect(workspaceMenu).toBeVisible();
     // The terminal was the only tab outside the team directory.

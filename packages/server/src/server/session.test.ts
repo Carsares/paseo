@@ -10003,6 +10003,8 @@ test("marks topic history read through persisted coordinates without loading its
   const storage = new AgentStorage(join(home, "agents"), logger);
   const registry = new FileBackedWorkspaceRegistry(join(home, "workspaces.json"), logger);
   const timestamp = "2026-11-26T09:00:00.000Z";
+  const laterTimestamp = "2026-11-26T09:01:00.000Z";
+  const replacementTimestamp = "2026-11-26T10:00:00.000Z";
   const workspaceId = "topic-workspace";
   const mainAgentId = "topic-main";
   const messages: SessionOutboundMessage[] = [];
@@ -10045,7 +10047,7 @@ test("marks topic history read through persisted coordinates without loading its
           timestamp,
           item: { type: "user_message", messageId: "prompt", text: "Question" },
         },
-        { seq: 2, timestamp, item: { type: "assistant_message", text: "Reply" } },
+        { seq: 2, timestamp: laterTimestamp, item: { type: "assistant_message", text: "Reply" } },
       ],
     });
     await session.handleMessage({
@@ -10057,6 +10059,43 @@ test("marks topic history read through persisted coordinates without loading its
     expect(history).toMatchObject({ error: null, endCursor: { seq: 2 } });
     const epoch = history?.epoch;
     expect(epoch).toMatch(/^silent-topic:/);
+
+    await session.handleMessage({
+      type: "workspace.topic_read.mark.request",
+      requestId: "legacy-separate-rows",
+      workspaceId,
+      mainAgentId,
+      topicKey: "msg:prompt",
+      mode: "read",
+      seq: 1,
+      timestampMs: Date.parse(laterTimestamp),
+    });
+    expect(
+      filterByType(messages, "workspace.topic_read.mark.response").at(-1)?.payload,
+    ).toMatchObject({
+      error: null,
+      snapshot: {
+        watermarkEpoch: epoch,
+        topics: [{ readUpToSeq: 1, readUpToTimestampMs: Date.parse(laterTimestamp) }],
+      },
+    });
+
+    await session.handleMessage({
+      type: "workspace.topic_read.mark.request",
+      requestId: "legacy-manual-unread",
+      workspaceId,
+      mainAgentId,
+      topicKey: "msg:prompt",
+      mode: "unread",
+      seq: 1,
+      timestampMs: Date.parse(laterTimestamp),
+    });
+    expect(
+      filterByType(messages, "workspace.topic_read.mark.response").at(-1)?.payload,
+    ).toMatchObject({
+      error: null,
+      snapshot: { topics: [{ readUpToSeq: 0, markedUnreadAtMs: expect.any(Number) }] },
+    });
 
     await session.handleMessage({
       type: "workspace.topic_read.mark.request",
@@ -10074,6 +10113,7 @@ test("marks topic history read through persisted coordinates without loading its
       error: null,
       snapshot: { watermarkEpoch: epoch, topics: [{ readUpToSeq: 2 }] },
     });
+
     await session.handleMessage({
       type: "workspace.topic_read.mark_all.request",
       requestId: "all",
@@ -10085,6 +10125,37 @@ test("marks topic history read through persisted coordinates without loading its
     expect(
       filterByType(messages, "workspace.topic_read.mark_all.response").at(-1)?.payload,
     ).toMatchObject({ error: null, snapshots: [{ watermarkEpoch: epoch, watermarkSeq: 2 }] });
+
+    await storage.upsert({ ...record, timelinePrefixSwitchId: "replacement" });
+    await storage.timelinePrefixes.save(mainAgentId, {
+      version: 1,
+      rows: [
+        {
+          seq: 1,
+          timestamp: replacementTimestamp,
+          item: { type: "user_message", messageId: "replacement", text: "New question" },
+        },
+      ],
+    });
+    await session.handleMessage({
+      type: "workspace.topic_read.mark.request",
+      requestId: "legacy-old-generation",
+      workspaceId,
+      mainAgentId,
+      topicKey: "msg:prompt",
+      mode: "read",
+      seq: 2,
+      timestampMs: Date.parse(laterTimestamp),
+    });
+    expect(
+      filterByType(messages, "workspace.topic_read.mark.response").at(-1)?.payload,
+    ).toMatchObject({
+      error: null,
+      snapshot: {
+        watermarkEpoch: "silent-topic:topic-main:replacement",
+        topics: [{ readUpToSeq: -1, readUpToTimestampMs: Date.parse(laterTimestamp) }],
+      },
+    });
     expect(manager.getAgent(mainAgentId)).toBeNull();
   } finally {
     await session.cleanup();
