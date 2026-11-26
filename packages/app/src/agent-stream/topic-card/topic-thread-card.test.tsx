@@ -309,7 +309,7 @@ function makeTopicWithoutTask(): TopicUnit {
     taskId: undefined,
     pendingInboxItems: [{ agentId: "lead-ws", title: "Lead", event: "finished" }],
     lifecycleStatus: "interrupted",
-    retryCandidate: { text: "Retry original question", routeMode: "auto" },
+    retryCandidate: { entryId: "retry-entry", text: "Retry original reply" },
   };
 }
 
@@ -318,6 +318,7 @@ it("hides per-topic flush button when no concrete taskId exists and preserves dr
   expect(resolveFlushableTaskId(topicWithoutTask)).toBeNull();
 
   const onSubmitDesktopReply = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  const onRetryTopic = vi.fn();
   render(
     <TopicThreadCard
       agentKey="srv-1:mc-1"
@@ -328,6 +329,7 @@ it("hides per-topic flush button when no concrete taskId exists and preserves dr
       onFlushTopicInbox={vi.fn()}
       onOpenAgentBeside={vi.fn()}
       onSubmitDesktopReply={onSubmitDesktopReply}
+      onRetryTopic={onRetryTopic}
       onActivateCompactReply={vi.fn()}
       onConvertToTodo={vi.fn()}
       onToggleTodoStatus={vi.fn()}
@@ -338,18 +340,13 @@ it("hides per-topic flush button when no concrete taskId exists and preserves dr
   // Flush button must NOT be rendered when taskId is absent (prevents accidental global flush).
   expect(screen.queryByTestId("topic-flush-inbox-msg:m-no-task")).toBeNull();
 
-  // Interrupted status offers in-card retry with deterministic clientMessageId.
   fireEvent.click(screen.getByTestId("topic-card-retry-msg:m-no-task"));
-  expect(onSubmitDesktopReply).toHaveBeenCalledWith(
-    topicWithoutTask,
-    "Retry original question",
-    "auto",
-    undefined,
-  );
+  expect(onRetryTopic).toHaveBeenCalledExactlyOnceWith(topicWithoutTask, {
+    entryId: "retry-entry",
+    text: "Retry original reply",
+  });
+  expect(onSubmitDesktopReply).not.toHaveBeenCalled();
 
-  // Expand desktop inline composer and fail send -> draft & clientMessageId stay intact across retry!
-  onSubmitDesktopReply.mockReset();
-  onSubmitDesktopReply.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
   fireEvent.click(screen.getByTestId("topic-inline-reply-trigger-msg:m-no-task"));
   const input = screen.getByTestId("topic-inline-reply-input-msg:m-no-task");
   fireEvent.change(input, { target: { value: "Keep my draft on error" } });

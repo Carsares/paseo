@@ -899,6 +899,44 @@ describe("editQueuedComposerMessage", () => {
 });
 
 describe("sendQueuedComposerMessageNow", () => {
+  it("keeps the queued topic target, decision generation and transmission ID on manual resend", async () => {
+    const queue = createFakeQueue();
+    const topicReply = {
+      workspaceId: "workspace-a",
+      target: {
+        topicKey: "task:A",
+        taskId: "A",
+        rootMessageId: "root-a",
+        promptPreview: "A",
+        routeMode: "main" as const,
+        decisionContext: {
+          kind: "task_blocking_question" as const,
+          question: "Choose",
+          blockingQuestionGeneration: "gen-a",
+        },
+      },
+      clientMessageId: "stable-topic-attempt",
+    };
+    const { queued } = queueComposerMessage({
+      agentId: "agent",
+      text: "Use A",
+      attachments: [],
+      queue,
+      topicReply,
+    });
+    const submitMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Disconnected"))
+      .mockResolvedValueOnce(undefined);
+    const input = { agentId: "agent", messageId: queued!.id, queue, submitMessage };
+    expect((await sendQueuedComposerMessageNow(input)).status).toBe("failed");
+    expect((await sendQueuedComposerMessageNow(input)).status).toBe("submitted");
+    expect(submitMessage.mock.calls).toEqual([
+      [{ text: "Use A", attachments: [], topicReply }],
+      [{ text: "Use A", attachments: [], topicReply }],
+    ]);
+  });
+
   it("returns missing without submitting when the message id is gone", async () => {
     const queue = createFakeQueue();
     const submitted: Array<{ text: string; attachments: ComposerAttachment[] }> = [];

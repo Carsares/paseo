@@ -19,6 +19,7 @@ export interface UseTopicViewportReadInput {
   isPaneFocused: boolean;
   hasUnread: boolean;
   topicKey: string;
+  epoch?: string | null;
   /**
    * Measured watermark covering ONLY unread content currently visible inside the viewport.
    * Must be `null` whenever the card or its unread replies have not yet been laid out or are
@@ -27,6 +28,7 @@ export interface UseTopicViewportReadInput {
   seenWatermark: SeenTopicWatermark | null;
   onAutoMarkRead: (input: {
     topicKey: string;
+    epoch?: string | null;
     seq: number | null;
     timestampMs: number;
     fallbackItemIds: string[];
@@ -43,6 +45,7 @@ export function useTopicViewportRead({
   isPaneFocused,
   hasUnread,
   topicKey,
+  epoch,
   seenWatermark,
   onAutoMarkRead,
 }: UseTopicViewportReadInput): void {
@@ -62,7 +65,7 @@ export function useTopicViewportRead({
   const seq = seenWatermark?.seq ?? null;
   const timestampMs = seenWatermark?.timestampMs ?? 0;
   const fallbackIdsKey = seenWatermark ? seenWatermark.fallbackItemIds.join(",") : "";
-  const watermarkToken = `${topicKey}:${seq ?? "none"}:${timestampMs}:${fallbackIdsKey}`;
+  const watermarkToken = `${topicKey}:${epoch ?? "none"}:${seq ?? "none"}:${timestampMs}:${fallbackIdsKey}`;
 
   useEffect(() => {
     if (!shouldSchedule || !seenWatermark) return;
@@ -72,6 +75,7 @@ export function useTopicViewportRead({
       lastMarkedKeyRef.current = watermarkToken;
       markRead({
         topicKey,
+        ...(epoch === undefined ? {} : { epoch }),
         seq: snapshot.seq,
         timestampMs: snapshot.timestampMs,
         fallbackItemIds: snapshot.fallbackItemIds,
@@ -80,5 +84,5 @@ export function useTopicViewportRead({
     return () => {
       clearTimeout(timer);
     };
-  }, [markRead, seenWatermark, shouldSchedule, topicKey, watermarkToken]);
+  }, [epoch, markRead, seenWatermark, shouldSchedule, topicKey, watermarkToken]);
 }

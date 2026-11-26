@@ -32,15 +32,35 @@ import {
 } from "@/panels/pane-context";
 import { getHostRuntimeStore, type HostRuntimeSnapshot } from "@/runtime/host-runtime";
 import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane/host";
+import { useDraftStore } from "@/stores/draft-store";
+import {
+  buildTopicAgentKey,
+  buildTopicReplyDraftKey,
+  useTopicStreamViewStore,
+} from "@/stores/topic-stream-view-store";
 import { useSessionStore } from "@/stores/session-store";
 import { DEFAULT_CONTENT_MAX_WIDTH } from "@/styles/theme";
 import {
   createTeamMessageJumpStore,
   TeamMessageJumpProvider,
 } from "@/subagents/team-directory/message-jump-store";
+import { workspaceTopicReadQueryKey } from "@/topic-read/queries";
+import type { StreamItem } from "@/types/stream";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { AgentConversationPanel } from "./agent-panel";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
+
+let compactTestLayout: boolean | undefined;
+vi.mock("@/constants/layout", async (importOriginal) => {
+  const layout = await importOriginal<typeof import("@/constants/layout")>();
+  return {
+    ...layout,
+    useIsCompactFormFactor: () => {
+      const actual = layout.useIsCompactFormFactor();
+      return compactTestLayout ?? actual;
+    },
+  };
+});
 
 const serverId = "inbox-host";
 const agentId = "inbox-agent";
@@ -83,6 +103,8 @@ let root: Root;
 let view: ReturnType<typeof within>;
 
 beforeEach(async () => {
+  compactTestLayout = undefined;
+  await page.viewport(1000, 760);
   await i18n.changeLanguage("en");
   container = document.body.appendChild(document.createElement("div"));
   container.style.width = "1000px";
@@ -94,6 +116,9 @@ afterEach(() => {
   act(() => root.unmount());
   vi.restoreAllMocks();
   store.clearSession(serverId);
+  useTopicStreamViewStore
+    .getState()
+    .setActiveReplyTopic(buildTopicAgentKey(serverId, agentId), null);
   container.remove();
 });
 
@@ -120,17 +145,20 @@ function publishAgent(
   isMain: boolean,
   pendingSubagentInbox?: PendingSubagentInbox,
   requiresAttention = false,
+  workspaceId?: string,
+  status: "idle" | "running" = "idle",
 ) {
   const agent = normalizeAgentSnapshot(
     {
       id: agentId,
       provider: "codex",
       cwd: "/repo",
+      workspaceId,
       model: null,
       createdAt: "2026-04-20T00:00:00.000Z",
       updatedAt: "2026-04-20T00:01:00.000Z",
       lastUserMessageAt: null,
-      status: "idle",
+      status,
       requiresAttention,
       attentionReason: requiresAttention ? "finished" : null,
       capabilities: {
@@ -183,6 +211,334 @@ function ConversationPane({ children }: { children: ReactNode }) {
     </PaneProvider>
   );
 }
+
+async function mountTopicConversation(
+  client: DaemonClient,
+  hasTopics: boolean,
+  width: number,
+  queueWhenRunning = false,
+  additionalTopicItems: StreamItem[] = [],
+) {
+  compactTestLayout = width < 600;
+  await page.viewport(width, 760);
+  container.style.width = `${width}px`;
+  container.style.height = "640px";
+  const snapshot: HostRuntimeSnapshot = {
+    serverId,
+    client,
+    connectionStatus: "online",
+    activeConnectionId: null,
+    activeConnection: null,
+    lastError: null,
+    lastOnlineAt: null,
+    agentDirectoryStatus: "ready",
+    agentDirectoryError: null,
+    hasEverLoadedAgentDirectory: true,
+    probeByConnectionId: new Map(),
+    clientGeneration: 0,
+    connectionEpoch: 0,
+  };
+  const runtime = getHostRuntimeStore();
+  const getSnapshot = runtime.getSnapshot.bind(runtime);
+  vi.spyOn(runtime, "getSnapshot").mockImplementation((id) =>
+    id === serverId ? snapshot : getSnapshot(id),
+  );
+  store.initializeSession(serverId, client);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: null,
+    features: {
+      workspaceTopicReadState: true,
+      workspaceTopicThreads: true,
+    },
+  });
+  publishAgent(true, undefined, false, pane.workspaceId, queueWhenRunning ? "running" : "idle");
+  useTopicStreamViewStore.getState().setViewMode(buildTopicAgentKey(serverId, agentId), "topics");
+  store.applyAgentTimelineResponseState(serverId, agentId, {
+    items: [
+      ...(hasTopics
+        ? ["a", "b"].map((id) => ({
+            kind: "user_message" as const,
+            id,
+            messageId: id,
+            text: `Topic ${id}`,
+            timestamp: new Date("2026-04-20T00:00:00.000Z"),
+          }))
+        : []),
+      ...additionalTopicItems,
+    ],
+    head: [],
+    range: null,
+    older: "none",
+    newer: false,
+    synchronized: true,
+    acknowledgedClientMessageIds: [],
+  });
+  const settings = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (additionalTopicItems.length > 0) {
+    settings.setQueryData(workspaceTopicReadQueryKey(serverId, pane.workspaceId, agentId), {
+      workspaceId: pane.workspaceId,
+      mainAgentId: agentId,
+      watermarkEpoch: "browser-epoch",
+      watermarkSeq: 0,
+      watermarkTimestampMs: 0,
+      topics: [],
+      revision: 1,
+    });
+  }
+  settings.setQueryData(
+    APP_SETTINGS_QUERY_KEY,
+    queueWhenRunning ? { ...DEFAULT_APP_SETTINGS, sendBehavior: "queue" } : DEFAULT_APP_SETTINGS,
+  );
+  await act(async () =>
+    root.render(
+      <QueryClientProvider client={settings}>
+        <ConversationShell>
+          <TeamMessageJumpProvider store={createTeamMessageJumpStore()}>
+            <ConversationPane>
+              <AgentConversationPanel />
+            </ConversationPane>
+          </TeamMessageJumpProvider>
+        </ConversationShell>
+      </QueryClientProvider>,
+    ),
+  );
+  await vi.waitFor(() => expect(view.getByTestId("topic-stream-list")).toBeTruthy());
+}
+
+it("preserves a wide draft when the viewport marks its topic read and the filter hides it", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  const response =
+    Promise.withResolvers<Awaited<ReturnType<DaemonClient["markWorkspaceTopicRead"]>>>();
+  const markRead = vi.spyOn(client, "markWorkspaceTopicRead").mockReturnValue(response.promise);
+  const topicView = useTopicStreamViewStore.getState();
+  const agentKey = buildTopicAgentKey(serverId, agentId);
+  const timestamp = new Date("2026-04-20T00:01:00.000Z");
+  topicView.setUnreadOnly(agentKey, true);
+  try {
+    await mountTopicConversation(client, true, 1000, false, [
+      {
+        kind: "assistant_message",
+        id: "visible-answer",
+        messageId: "visible-answer",
+        text: "Answer visible in B",
+        timestamp,
+        timelineCursor: { epoch: "browser-epoch", seq: 2 },
+      },
+    ]);
+    await userEvent.click(page.getByTestId("topic-inline-reply-trigger-msg:b"));
+    const input = page.getByTestId("topic-inline-reply-input-msg:b");
+    await input.fill("Draft while reading");
+    await vi.waitFor(
+      () =>
+        expect(markRead).toHaveBeenCalledWith(
+          expect.objectContaining({ topicKey: "msg:b", epoch: "browser-epoch", seq: 2 }),
+        ),
+      5000,
+    );
+    await act(async () => {
+      response.resolve({
+        requestId: "auto-read",
+        snapshot: {
+          workspaceId: pane.workspaceId,
+          mainAgentId: agentId,
+          watermarkEpoch: "browser-epoch",
+          watermarkSeq: 2,
+          watermarkTimestampMs: timestamp.getTime(),
+          topics: [],
+          revision: 2,
+        },
+        error: null,
+      });
+    });
+    await expect.element(input).not.toBeInTheDocument();
+    await userEvent.click(page.getByTestId("topic-stream-unread-only"));
+    await expect.element(input).toHaveValue("Draft while reading");
+  } finally {
+    topicView.setUnreadOnly(agentKey, false);
+  }
+});
+
+it.each([
+  [390, false],
+  [1000, true],
+] as const)(
+  "handles the main permission request in the topic stream at %i px (topics: %s)",
+  async (width, hasTopics) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    const respond = vi
+      .spyOn(client, "respondToPermissionAndWait")
+      .mockResolvedValue({ agentId, requestId: "ask-1", resolution: { behavior: "allow" } });
+    await mountTopicConversation(client, hasTopics, width);
+    const request = {
+      id: "ask-1",
+      name: "Main request",
+      kind: "tool" as const,
+      provider: "codex" as const,
+    };
+    await act(async () => {
+      store.setPendingPermissions(
+        serverId,
+        new Map([
+          ["main", { key: "main", agentId, request }],
+          [
+            "other",
+            {
+              key: "other",
+              agentId: "other-agent",
+              request: { ...request, name: "Other request" },
+            },
+          ],
+        ]),
+      );
+    });
+    expect(view.queryByText("Other request")).toBeNull();
+    await userEvent.click(page.getByTestId("permission-request-accept"));
+    expect(respond).toHaveBeenCalledExactlyOnceWith(
+      agentId,
+      "ask-1",
+      expect.objectContaining({ behavior: "allow" }),
+      15000,
+    );
+  },
+);
+
+it.each(["accepted", "rejected"] as const)(
+  "keeps compact drafts and attachments isolated when A is %s after switching to B",
+  async (result) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    const response =
+      Promise.withResolvers<Awaited<ReturnType<DaemonClient["replyWorkspaceTopic"]>>>();
+    const reply = vi.spyOn(client, "replyWorkspaceTopic").mockReturnValue(response.promise);
+    const drafts = useDraftStore.getState();
+    const draftKey = (topicKey: string) =>
+      buildTopicReplyDraftKey({
+        serverId,
+        workspaceId: pane.workspaceId,
+        agentId,
+        topicKey,
+      });
+    for (const id of ["a", "b"]) {
+      drafts.saveDraftInput({
+        draftKey: draftKey(`msg:${id}`),
+        draft: {
+          text: `Draft ${id}`,
+          attachments: [
+            {
+              kind: "file",
+              attachment: {
+                type: "uploaded_file",
+                id,
+                path: `/tmp/${id}.txt`,
+                fileName: `${id}.txt`,
+                mimeType: "text/plain",
+                size: 1,
+              },
+            },
+          ],
+        },
+      });
+    }
+    await mountTopicConversation(client, true, 390);
+    await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:a"));
+    await vi.waitFor(() =>
+      expect(view.getByTestId("composer-file-attachment-pill").textContent).toContain("a.txt"),
+    );
+    await userEvent.click(page.getByRole("button", { name: "Send message", exact: true }));
+    await vi.waitFor(() =>
+      expect(reply).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          topicKey: "msg:a",
+          text: "Draft a",
+          attachments: [expect.objectContaining({ id: "a" })],
+        }),
+      ),
+    );
+    await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:b"));
+    await act(async () => {
+      response.resolve({
+        requestId: "request",
+        workspaceId: pane.workspaceId,
+        topicKey: "msg:a",
+        routedTo: "main",
+        targetAgentId: agentId,
+        entry: null,
+        error: result === "rejected" ? "declined" : null,
+      });
+    });
+    const b = drafts.getDraftInput(draftKey("msg:b"));
+    expect(b?.text).toBe("Draft b");
+    expect(b?.attachments).toHaveLength(1);
+    expect(view.getByTestId("composer-file-attachment-pill").textContent).toContain("b.txt");
+    await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:a"));
+    const a = drafts.getDraftInput(draftKey("msg:a"));
+    expect(a?.text ?? "").toBe(result === "accepted" ? "" : "Draft a");
+    if (result === "accepted") {
+      expect(view.queryByTestId("composer-file-attachment-pill")).toBeNull();
+    } else {
+      expect(view.getByTestId("composer-file-attachment-pill").textContent).toContain("a.txt");
+    }
+    for (const id of ["a", "b"])
+      drafts.clearDraftInput({ draftKey: draftKey(`msg:${id}`), lifecycle: "abandoned" });
+    useTopicStreamViewStore
+      .getState()
+      .setActiveReplyTopic(buildTopicAgentKey(serverId, agentId), null);
+  },
+);
+
+it("sends queued topic A and an ordinary message to their own targets while B is selected", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  const sendOrdinary = vi.spyOn(client, "sendAgentMessage").mockResolvedValue({});
+  const reply = vi.spyOn(client, "replyWorkspaceTopic").mockResolvedValue({
+    requestId: "request",
+    workspaceId: pane.workspaceId,
+    topicKey: "msg:a",
+    routedTo: "main",
+    targetAgentId: agentId,
+    entry: null,
+    error: null,
+  });
+  const draftKey = buildTopicReplyDraftKey({
+    serverId,
+    workspaceId: pane.workspaceId,
+    agentId,
+    topicKey: "msg:a",
+  });
+  useDraftStore
+    .getState()
+    .saveDraftInput({ draftKey, draft: { text: "Queued for topic A", attachments: [] } });
+  await mountTopicConversation(client, true, 390, true);
+  await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:a"));
+  await userEvent.click(page.getByRole("button", { name: "Queue message", exact: true }));
+  expect(reply).not.toHaveBeenCalled();
+  await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:b"));
+  await userEvent.click(page.getByRole("button", { name: "Send queued message now" }));
+  expect(reply).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      topicKey: "msg:a",
+      rootMessageId: "a",
+      text: "Queued for topic A",
+      clientMessageId: expect.any(String),
+    }),
+  );
+  expect(view.getByTestId("compact-topic-reply-context").textContent).toContain("Topic b");
+
+  await userEvent.click(page.getByTestId("compact-topic-reply-cancel"));
+  await page.getByRole("textbox").fill("Queued for the main conversation");
+  await userEvent.click(page.getByRole("button", { name: "Queue message", exact: true }));
+  expect(sendOrdinary).not.toHaveBeenCalled();
+  await userEvent.click(page.getByTestId("topic-inline-reply-compact-msg:b"));
+  await userEvent.click(page.getByRole("button", { name: "Send queued message now" }));
+  await vi.waitFor(() =>
+    expect(sendOrdinary).toHaveBeenCalledExactlyOnceWith(
+      agentId,
+      "Queued for the main conversation",
+      expect.objectContaining({ activeTurnBehavior: "interrupt" }),
+    ),
+  );
+  expect(reply).toHaveBeenCalledTimes(1);
+});
 
 it.each(["the historical report", "the composer"])(
   "keeps a new conclusion after a historical jump until the user clicks %s",

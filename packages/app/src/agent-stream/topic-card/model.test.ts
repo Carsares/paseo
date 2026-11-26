@@ -291,6 +291,52 @@ describe("projectTopicUnits", () => {
     expect(readProjection.topics[0]!.hasUnread).toBe(false);
   });
 
+  it("combines explicit timeline times with only the current generation's sequence", () => {
+    const items = [
+      makeHumanPrompt({ id: "root", text: "Check rollout", seq: 1, ts: 1_000 }),
+      makeAssistantConclusion({ id: "seen-by-seq", text: "Started", seq: 2, ts: 2_000 }),
+      makeAssistantConclusion({ id: "seen-by-time", text: "Verified", seq: 3, ts: 3_000 }),
+      makeAssistantConclusion({ id: "new", text: "Finished", seq: 4, ts: 4_000 }),
+    ];
+    const readSnapshot: WorkspaceTopicReadSnapshot = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      watermarkEpoch: "ep-1",
+      watermarkSeq: 2,
+      watermarkTimestampMs: 4_000,
+      topics: [],
+      revision: 1,
+    };
+    const unread = (snapshot: WorkspaceTopicReadSnapshot) =>
+      projectTopicUnits({ items, readSnapshot: snapshot }).topics[0]!.replies.map(
+        ({ isUnread }) => isUnread,
+      );
+
+    expect(unread(readSnapshot)).toEqual([false, true, true]);
+    expect(unread({ ...readSnapshot, watermarkTimelineTimestampMs: 3_000 })).toEqual([
+      false,
+      false,
+      true,
+    ]);
+    expect(
+      unread({
+        ...readSnapshot,
+        watermarkEpoch: "previous",
+        watermarkSeq: 100,
+        topics: [
+          {
+            topicKey: "msg:root",
+            readUpToSeq: 100,
+            readUpToTimestampMs: 4_000,
+            readUpToTimelineTimestampMs: 3_000,
+            markedUnreadAtMs: null,
+            updatedAt: new Date(4_000).toISOString(),
+          },
+        ],
+      }),
+    ).toEqual([false, false, true]);
+  });
+
   it("merges fallback-to-main follow-ups into the originating topic without creating duplicate root cards or replies", () => {
     const items: StreamItem[] = [
       makeHumanPrompt({ id: "u-1", messageId: "m-1", text: "Root question", seq: 1, ts: 1_000 }),
@@ -410,7 +456,7 @@ describe("projectTopicUnits", () => {
     expect(result.unmatchedExplicitRefs.length).toBeGreaterThan(0);
   });
 
-  it("detects interrupted topic lifecycle and provides an in-card retry candidate", () => {
+  it("preserves interrupted lifecycle without advertising an unconfirmed root retry", () => {
     const tasks: WorkspaceTaskSummary[] = [
       {
         taskId: "T-cancel",
@@ -436,11 +482,42 @@ describe("projectTopicUnits", () => {
 
     const result = projectTopicUnits({ items, tasks });
     expect(result.topics[0]!.lifecycleStatus).toBe("interrupted");
-    expect(result.topics[0]!.retryCandidate).toEqual({
-      text: "Run DB migration check",
-      routeMode: "auto",
-      clientMessageId: "retry:task:T-cancel:u-cancel",
+    expect(result.topics[0]!.retryCandidate).toBeNull();
+  });
+
+  it("keeps a same-text independent root when the thread follow-up has a different client ID", () => {
+    const result = projectTopicUnits({
+      items: [
+        makeHumanPrompt({ id: "u-a", messageId: "m-a", text: "Topic A", seq: 1, ts: 1000 }),
+        makeHumanPrompt({ id: "u-b", messageId: "m-b", text: "Same text", seq: 2, ts: 2000 }),
+        makeHumanPrompt({
+          id: "u-mirror",
+          messageId: "id-followup",
+          text: "Same text",
+          seq: 3,
+          ts: 2100,
+        }),
+      ],
+      threadEntries: [
+        {
+          entryId: "followup",
+          workspaceId: "ws-1",
+          mainAgentId: "mc-1",
+          topicKey: "msg:m-a",
+          rootMessageId: "m-a",
+          sourceMessageId: "id-followup",
+          routedAgentId: "mc-1",
+          role: "user_followup",
+          text: "Same text",
+          status: "completed",
+          seq: 1,
+          createdAt: new Date(2100).toISOString(),
+          updatedAt: new Date(2100).toISOString(),
+        },
+      ],
     });
+    expect(result.topics.map((topic) => topic.topicKey)).toEqual(["msg:m-a", "msg:m-b"]);
+    expect(result.topics[0]?.replies.map((reply) => reply.id)).toEqual(["thread:followup"]);
   });
 
   it("deduplicates fallback-to-main replies even when provider omits optional messageId and sourceMessageId", () => {
@@ -588,11 +665,12 @@ describe("projectTopicUnits", () => {
       role: "user_followup" as const,
       sourceMessageId: "used-message-id",
       text: "Retry my follow-up",
+      retryable: true,
     };
     const failed = projectTopicUnits({ items: baseItems, threadEntries: [failedFollowup] });
     expect(failed.topics[0]!.retryCandidate).toMatchObject({
       text: "Retry my follow-up",
-      clientMessageId: "retry:te-old-err",
+      entryId: "te-old-err",
     });
 
     // 2) Legacy taskless main turn canceled via reduceStreamUpdate -> projected as interrupted!
@@ -614,7 +692,7 @@ describe("projectTopicUnits", () => {
     );
     const canceledProjection = projectTopicUnits({ items: stream });
     expect(canceledProjection.topics[0]!.lifecycleStatus).toBe("interrupted");
-    expect(canceledProjection.topics[0]!.retryCandidate?.text).toBe("Explain trace");
+    expect(canceledProjection.topics[0]!.retryCandidate).toBeNull();
   });
 
   it("maps task-scoped pending inbox items, todos, and durable items onto their topic card", () => {

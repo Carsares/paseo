@@ -13,7 +13,7 @@ import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
 import { DurableItemCard } from "@/durable-items/card";
 import { useTopicInboxReadStore } from "@/stores/topic-inbox-read-store";
-import { markAllTopicsReadOnHost } from "@/topic-read/queries";
+import { markTopicReadOnHost } from "@/topic-read/queries";
 import type { Theme } from "@/styles/theme";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { getStatusDotColor } from "@/utils/status-dot-color";
@@ -97,42 +97,78 @@ export const DirectoryMessagesView = memo(function DirectoryMessagesView({
   );
 
   const hasMarkableUnread = (projection.markAllSnapshot.itemIds?.length ?? 0) > 0;
-  const onMarkAllPress = useCallback(() => {
-    markAllRead(readScopeKey, projection.markAllSnapshot);
-    if (mainAgentId) {
-      void markAllTopicsReadOnHost({
+  const markHostTopic = useCallback(
+    (target: NonNullable<TeamInboxMessageItem["topicReadTarget"]>) => {
+      if (!mainAgentId) return;
+      void markTopicReadOnHost({
         queryClient,
         serverId,
         workspaceId,
         mainAgentId,
-        epoch: projection.markAllSnapshot.epoch ?? null,
-        maxSeq: projection.markAllSnapshot.maxSeq ?? null,
-        maxTimestampMs: projection.markAllSnapshot.maxTimestampMs ?? null,
-        fallbackItemIds: projection.markAllSnapshot.itemIds,
+        topicKey: target.topicKey,
+        mode: "read",
+        epoch: target.epoch,
+        seq: target.epoch ? (target.seq ?? undefined) : undefined,
+        timestampMs: target.timestampMs,
+        fallbackItemIds: [],
       }).catch(() => undefined);
-    }
-    const conclusion = projection.unread.find((item) => item.kind === "main_conclusion");
-    if (conclusion) clearConclusionAttention(conclusion);
-  }, [
-    clearConclusionAttention,
-    mainAgentId,
-    markAllRead,
-    projection.markAllSnapshot,
-    projection.unread,
-    queryClient,
-    readScopeKey,
-    serverId,
-    workspaceId,
-  ]);
+    },
+    [mainAgentId, queryClient, serverId, workspaceId],
+  );
 
   const handleMarkSingleRead = useCallback(
     (item: TeamInboxMessageItem) => {
       if (item.isRead || !item.readCandidate) return;
+      if (item.topicReadTarget) {
+        markHostTopic(item.topicReadTarget);
+        return;
+      }
       markItemRead(readScopeKey, item.readCandidate.id, item.mainConclusionSnapshot);
       clearConclusionAttention(item);
     },
-    [clearConclusionAttention, markItemRead, readScopeKey],
+    [clearConclusionAttention, markHostTopic, markItemRead, readScopeKey],
   );
+
+  const onMarkAllPress = useCallback(() => {
+    if (!projection.usesHostTopicRead) {
+      markAllRead(readScopeKey, projection.markAllSnapshot);
+      const conclusion = projection.unread.find((item) => item.kind === "main_conclusion");
+      if (conclusion) clearConclusionAttention(conclusion);
+      return;
+    }
+
+    // The inbox shows a subset of each timeline. A workspace watermark would read
+    // replies that were never shown here, so only advance the topics we observed.
+    type Target = NonNullable<TeamInboxMessageItem["topicReadTarget"]>;
+    const bounds = new Map<string, Target>();
+    for (const item of projection.unread) {
+      const target = item.topicReadTarget;
+      if (!target) {
+        handleMarkSingleRead(item);
+        continue;
+      }
+      const key = JSON.stringify([target.topicKey, target.epoch]);
+      const previous = bounds.get(key);
+      bounds.set(
+        key,
+        previous
+          ? {
+              ...target,
+              seq: target.seq === null ? previous.seq : Math.max(previous.seq ?? -1, target.seq),
+              timestampMs: Math.max(previous.timestampMs, target.timestampMs),
+            }
+          : target,
+      );
+    }
+    for (const target of bounds.values()) markHostTopic(target);
+  }, [
+    clearConclusionAttention,
+    handleMarkSingleRead,
+    markAllRead,
+    markHostTopic,
+    projection,
+    readScopeKey,
+  ]);
 
   const handleSelectItem = useCallback(
     (item: TeamInboxMessageItem) => {

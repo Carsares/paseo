@@ -29,11 +29,14 @@ const TopicFileSchema = z.union([
 ]);
 
 export type TopicReadKey = Pick<WorkspaceTopicReadSnapshot, "workspaceId" | "mainAgentId">;
-export interface TopicReadScope extends TopicReadKey {
+export interface TopicReadCoordinates {
   /** Current authoritative epoch, or null when the timeline has no sequence coordinates. */
   epoch: string | null;
   headSeq?: number;
 }
+
+export type TopicReadScope = TopicReadKey &
+  (TopicReadCoordinates | { readCoordinates: () => Promise<TopicReadCoordinates> });
 
 type MarkInput = Omit<WorkspaceTopicReadMarkRequest, "type" | "requestId">;
 export type TopicReadBounds = Pick<
@@ -83,12 +86,44 @@ function alignEpoch(
   };
 }
 
+function matchesObservedEpoch(
+  scope: TopicReadCoordinates,
+  epoch: string | null | undefined,
+): boolean {
+  return typeof epoch === "string" && epoch === scope.epoch;
+}
+
+function boundObservedSeq(
+  scope: TopicReadCoordinates,
+  epoch: string | null | undefined,
+  seq: number | undefined,
+): number | undefined {
+  if (!matchesObservedEpoch(scope, epoch) || scope.headSeq === undefined || seq === undefined)
+    return undefined;
+  return Math.max(NO_SEQ, Math.min(seq, scope.headSeq));
+}
+
+function advanceTimestamp(previous: number | undefined, observed: number | undefined) {
+  return observed === undefined ? previous : Math.max(previous ?? 0, observed);
+}
+
+function explicitCardReadTime(input: MarkInput, observedSeq: number | undefined) {
+  if (observedSeq !== undefined) return undefined;
+  // COMPAT(topicReadLegacyTime): added in v0.18.0, remove once pre-epoch clients are unsupported.
+  // Older card marks omitted the epoch. A modern mark with only a timestamp and an explicit
+  // epoch (including null) can address a thread reply, whose time cannot cover timeline rows.
+  if (input.epoch === undefined || input.seq !== undefined) return input.timestampMs;
+  return undefined;
+}
+
 function clearCoveredUnread(entry: TopicReadEntry, bounds: TopicReadBounds): TopicReadEntry {
   if (entry.markedUnreadAtMs === null) return entry;
   // A manual unread entry stores one less than the observed sequence.
   const anchorSeq = entry.readUpToSeq + 1;
   const anchorTimestampMs = entry.readUpToTimestampMs;
-  const compareSeq = bounds.maxSeq !== undefined;
+  // -1 can represent either sequence zero or a time-only override.
+  const compareSeq =
+    bounds.maxSeq !== undefined && (entry.readUpToSeq !== NO_SEQ || anchorTimestampMs === 0);
   const timestampBound = anchorTimestampMs > 0 ? bounds.maxTimestampMs : undefined;
   const compareTimestamp = timestampBound !== undefined;
   if (!compareSeq && !compareTimestamp) return entry;
@@ -119,11 +154,15 @@ export class TopicReadStateStore {
   }
 
   mark(scope: TopicReadScope, input: MarkInput): Promise<TopicReadMutation> {
-    return this.mutate(scope, (current) => {
-      const aligned = alignEpoch(current, scope.epoch);
+    return this.mutate(scope, (current, coordinates) => {
+      if (typeof input.epoch === "string" && !matchesObservedEpoch(coordinates, input.epoch))
+        return null;
+      const observedSeq = boundObservedSeq(coordinates, input.epoch, input.seq);
+      // An old sender can still mark by time. A sequence alone cannot identify its generation.
+      if (observedSeq === undefined && input.timestampMs === undefined) return null;
+      const aligned = coordinates.epoch === null ? current : alignEpoch(current, coordinates.epoch);
       const previous = aligned.topics.find((entry) => entry.topicKey === input.topicKey);
-      const clientSeq = scope.epoch === null ? NO_SEQ : (input.seq ?? NO_SEQ);
-      const seq = Math.max(NO_SEQ, Math.min(clientSeq, scope.headSeq ?? clientSeq));
+      const seq = Math.max(NO_SEQ, observedSeq ?? NO_SEQ);
       const now = this.now();
       const isRead = input.mode === "read";
       const readUpToSeq = isRead
@@ -133,10 +172,17 @@ export class TopicReadStateStore {
       const readUpToTimestampMs = isRead
         ? Math.max(previous?.readUpToTimestampMs ?? 0, timestampMs)
         : timestampMs;
+      const readUpToTimelineTimestampMs = isRead
+        ? advanceTimestamp(
+            previous?.readUpToTimelineTimestampMs,
+            explicitCardReadTime(input, observedSeq),
+          )
+        : undefined;
       const entry: TopicReadEntry = {
         topicKey: input.topicKey,
         readUpToSeq,
         readUpToTimestampMs,
+        ...(readUpToTimelineTimestampMs === undefined ? {} : { readUpToTimelineTimestampMs }),
         markedUnreadAtMs: isRead ? null : now,
         updatedAt: new Date(now).toISOString(),
       };
@@ -146,36 +192,43 @@ export class TopicReadStateStore {
   }
 
   markAll(scope: TopicReadScope, bounds: TopicReadBounds): Promise<TopicReadMutation> {
-    return this.mutate(scope, (current) => {
-      if (typeof bounds.epoch === "string" && bounds.epoch !== scope.epoch) return null;
-      const hasMatchingEpoch = typeof bounds.epoch === "string" && bounds.epoch === scope.epoch;
-      const clientMaxSeq = hasMatchingEpoch ? bounds.maxSeq : undefined;
-      const maxSeq =
-        clientMaxSeq === undefined
-          ? undefined
-          : Math.min(clientMaxSeq, scope.headSeq ?? clientMaxSeq);
+    return this.mutate(scope, (current, coordinates) => {
+      if (typeof bounds.epoch === "string" && !matchesObservedEpoch(coordinates, bounds.epoch))
+        return null;
+      const maxSeq = boundObservedSeq(coordinates, bounds.epoch, bounds.maxSeq);
       const maxTimestampMs = bounds.maxTimestampMs;
       if (maxSeq === undefined && maxTimestampMs === undefined) return null;
 
-      const aligned = hasMatchingEpoch ? alignEpoch(current, scope.epoch) : current;
+      const aligned = coordinates.epoch === null ? current : alignEpoch(current, coordinates.epoch);
       // Previous watermarks may be higher. Unread overrides are cleared only by this request's bounds.
       const topics = aligned.topics.map((entry) => {
         return clearCoveredUnread(entry, {
-          maxSeq: hasMatchingEpoch && aligned === current ? maxSeq : undefined,
+          maxSeq: aligned === current ? maxSeq : undefined,
           maxTimestampMs,
         });
       });
       const watermarkSeq = Math.max(aligned.watermarkSeq, maxSeq ?? NO_SEQ);
       const watermarkTimestampMs = Math.max(aligned.watermarkTimestampMs, maxTimestampMs ?? 0);
+      const watermarkTimelineTimestampMs = advanceTimestamp(
+        aligned.watermarkTimelineTimestampMs,
+        maxSeq === undefined ? maxTimestampMs : undefined,
+      );
       if (
         aligned === current &&
         watermarkSeq === current.watermarkSeq &&
         watermarkTimestampMs === current.watermarkTimestampMs &&
+        watermarkTimelineTimestampMs === current.watermarkTimelineTimestampMs &&
         topics.every((topic, index) => topic === current.topics[index])
       ) {
         return current;
       }
-      return { ...aligned, watermarkSeq, watermarkTimestampMs, topics };
+      return {
+        ...aligned,
+        watermarkSeq,
+        watermarkTimestampMs,
+        ...(watermarkTimelineTimestampMs === undefined ? {} : { watermarkTimelineTimestampMs }),
+        topics,
+      };
     });
   }
 
@@ -214,15 +267,19 @@ export class TopicReadStateStore {
   }
 
   private mutate(
-    key: TopicReadKey,
-    update: (current: WorkspaceTopicReadSnapshot) => WorkspaceTopicReadSnapshot | null,
+    key: TopicReadScope,
+    update: (
+      current: WorkspaceTopicReadSnapshot,
+      coordinates: TopicReadCoordinates,
+    ) => WorkspaceTopicReadSnapshot | null,
   ): Promise<TopicReadMutation> {
     const filePath = this.filePath(key.workspaceId);
     return this.serialize(key.workspaceId, async () => {
       const snapshots = await this.read(key.workspaceId);
       const index = snapshots.findIndex((snapshot) => snapshot.mainAgentId === key.mainAgentId);
       const current = snapshots[index] ?? emptySnapshot(key);
-      const next = update(current);
+      const coordinates = "readCoordinates" in key ? await key.readCoordinates() : key;
+      const next = update(current, coordinates);
       if (next === null) return { snapshot: current, changed: false, applied: false };
       if (next === current) return { snapshot: current, changed: false, applied: true };
 

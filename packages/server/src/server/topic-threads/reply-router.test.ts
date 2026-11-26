@@ -856,3 +856,98 @@ test("backfills a historical stand-alone first question from the reply request w
     }),
   );
 });
+
+test("retries only a confirmed rejected operation, using its stored attachment and route", async () => {
+  const { dispatch, broadcast } = setup();
+  await ledger.upsert(request.workspaceId, {
+    taskId: "task",
+    title: "Task",
+    rootMessageId: "root",
+    leadAgentId: "lead",
+  });
+  const attachment = {
+    type: "uploaded_file",
+    id: "upload",
+    path: "/uploads/retained-image.png",
+    fileName: "retained-image.png",
+    size: 5,
+    mimeType: "image/png",
+  } as const;
+  dispatch.mockImplementationOnce(async ({ onHandoff }) => {
+    await onHandoff(true);
+    await onHandoff(false);
+    throw new Error("Provider declined");
+  });
+  const original = await router.reply({
+    ...request,
+    text: "[attachment]",
+    routeMode: "lead",
+    attachments: [attachment],
+  });
+  const originalId = original.payload.entry?.entryId;
+  if (!originalId) throw new Error("Missing original entry");
+  await vi.waitFor(async () =>
+    expect((await store.list(request))[0]).toMatchObject({ status: "error", retryable: true }),
+  );
+  await router.close();
+  const { dispatch: restarted } = setup();
+  const retry = {
+    ...request,
+    retryOfEntryId: originalId,
+    clientMessageId: "retry-one",
+    text: "Ignore this text",
+    routeMode: "main" as const,
+    taskId: "different",
+    attachments: [{ ...attachment, path: "/uploads/other.png" }],
+  };
+  expect(
+    (await router.reply({ ...retry, topicKey: "a-different-topic" })).payload.error,
+  ).toBeTruthy();
+  restarted.mockRejectedValueOnce(new Error("Could not open the provider"));
+  const [first, repeat] = await Promise.all([router.reply(retry), router.reply(retry)]);
+  expect(first.payload.entry?.entryId).toBeTruthy();
+  expect(repeat.payload.entry?.entryId).toBe(first.payload.entry?.entryId);
+  await vi.waitFor(async () => expect((await store.list(request))[0]?.retryable).toBe(true));
+  expect((await router.reply({ ...retry, clientMessageId: "retry-two" })).payload.error).toBeNull();
+  await vi.waitFor(async () => expect((await store.list(request))[2]?.status).toBe("completed"));
+  expect(
+    (await router.reply({ ...retry, clientMessageId: "retry-three" })).payload.error,
+  ).toBeTruthy();
+  expect(restarted).toHaveBeenCalledTimes(2);
+  for (const [send] of restarted.mock.calls) {
+    expect(send.agentId).toBe("lead");
+    expect(send.prompt).toContainEqual(attachment);
+    expect(JSON.stringify(send.prompt)).not.toContain("Ignore this text");
+  }
+  expect(JSON.stringify(broadcast.mock.calls)).not.toContain(attachment.path);
+  expect(JSON.stringify(await store.list(request))).not.toContain(attachment.path);
+});
+
+test("reopens an uncertain handoff without offering a new execution", async () => {
+  const { dispatch } = setup();
+  const waiting = Promise.withResolvers<void>();
+  dispatch.mockImplementationOnce(async ({ onHandoff, signal }) => {
+    await onHandoff(true);
+    waiting.resolve();
+    if (!signal.aborted)
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    throw new Error("Daemon stopped during handoff");
+  });
+  const first = await router.reply(request);
+  const originalId = first.payload.entry?.entryId;
+  if (!originalId) throw new Error("Missing original entry");
+  await waiting.promise;
+  await router.close();
+  const { dispatch: restarted } = setup();
+  expect((await router.reply(request)).payload.entry).toMatchObject({ status: "error" });
+  expect((await store.list(request))[0]?.retryable).not.toBe(true);
+  expect(
+    (await router.reply({ ...request, retryOfEntryId: originalId, clientMessageId: "retry" }))
+      .payload.error,
+  ).toBeTruthy();
+  const olderClient = await router.reply({ ...request, clientMessageId: `retry:${originalId}` });
+  expect(olderClient.payload.error).toBeTruthy();
+  expect(restarted).not.toHaveBeenCalled();
+});

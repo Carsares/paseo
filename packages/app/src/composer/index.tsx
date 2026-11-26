@@ -1,4 +1,8 @@
 import {
+  assertTopicDecisionAttachments,
+  rememberTopicSubmission,
+} from "@/agent-stream/topic-card/submit-topic-reply";
+import {
   useComposerEditingSession,
   useComposerFullscreen,
   type ComposerEditingSession,
@@ -109,6 +113,7 @@ import {
   type AttachmentPersister,
   type QueueWriter,
   type QueuedComposerMessage,
+  type QueuedTopicReply,
 } from "@/composer/actions";
 import { useVoiceOptional } from "@/contexts/voice-context";
 import { useToast } from "@/contexts/toast-context";
@@ -766,17 +771,22 @@ function QueuedMessageRow({
   return (
     <View style={styles.queueItem}>
       <Text style={styles.queueText} numberOfLines={2} ellipsizeMode="tail">
+        {item.topicReply
+          ? `${item.topicReply.target.promptPreview || item.topicReply.target.topicKey}: `
+          : ""}
         {previewText}
       </Text>
       <View style={styles.queueActions}>
-        <Pressable
-          onPress={handleEdit}
-          style={styles.queueActionButton}
-          accessibilityLabel={editLabel}
-          accessibilityRole="button"
-        >
-          <ThemedPencil size={ICON_SIZE.sm} uniProps={iconForegroundMapping} />
-        </Pressable>
+        {!item.topicReply ? (
+          <Pressable
+            onPress={handleEdit}
+            style={styles.queueActionButton}
+            accessibilityLabel={editLabel}
+            accessibilityRole="button"
+          >
+            <ThemedPencil size={ICON_SIZE.sm} uniProps={iconForegroundMapping} />
+          </Pressable>
+        ) : null}
         <Pressable
           onPress={handleSendNow}
           style={[styles.queueActionButton, styles.queueSendButton]}
@@ -966,6 +976,14 @@ interface ComposerProps {
   workspaceId?: string | null;
   isPaneFocused: boolean;
   onSubmitMessage?: (payload: MessagePayload) => Promise<void>;
+  topicDraftKey?: string;
+  topicQueue?: {
+    draftKey: string;
+    target: QueuedTopicReply["target"];
+    onQueued: (clientMessageId: string) => void;
+    onEditOrdinary: (text: string, attachments: UserComposerAttachment[]) => void;
+  };
+  onDeliverQueuedTopic?: (reply: QueuedTopicReply, payload: MessagePayload) => Promise<void>;
   onClientSlashCommand?: (command: ClientSlashCommand) => Promise<void>;
   allowSideChat?: boolean;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
@@ -1303,6 +1321,8 @@ function ComposerContentImpl({
   serverId,
   workspaceId,
   onSubmitMessage,
+  topicQueue,
+  onDeliverQueuedTopic,
   onClientSlashCommand,
   allowSideChat = false,
   hasExternalContent = false,
@@ -1787,9 +1807,9 @@ function ComposerContentImpl({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (text: string, submitAttachments: ComposerAttachment[], useOverride = true) => {
       onMessageSent?.();
-      if (onSubmitMessageRef.current) {
+      if (useOverride && onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
         return;
       }
@@ -1892,21 +1912,47 @@ function ComposerContentImpl({
 
   const queueMessage = useCallback(
     (queuedMessage: string, queuedAttachments: ComposerAttachment[]) => {
+      if (topicQueue?.target.decisionContext) {
+        try {
+          assertTopicDecisionAttachments(queuedAttachments);
+        } catch (error) {
+          setSendError(error instanceof Error ? error.message : String(error));
+          return false;
+        }
+      }
+      const topicReply =
+        topicQueue && workspaceId
+          ? {
+              workspaceId,
+              target: topicQueue.target,
+              clientMessageId: rememberTopicSubmission(topicQueue.draftKey, topicQueue.target, {
+                text: queuedMessage,
+                attachments: queuedAttachments,
+                cwd,
+              }),
+            }
+          : undefined;
       const result = queueComposerMessage({
         agentId,
         text: queuedMessage,
         attachments: queuedAttachments,
+        topicReply,
         queue: queueWriter,
       });
-      if (!result.queued) return;
+      if (!result.queued) return false;
 
       replaceUserInput("");
       setSelectedAttachments([]);
       resetSuppression();
       clearSentAttachments(queuedAttachments);
+      if (topicReply) topicQueue?.onQueued(topicReply.clientMessageId);
+      return true;
     },
     [
       agentId,
+      cwd,
+      topicQueue,
+      workspaceId,
       clearSentAttachments,
       queueWriter,
       resetSuppression,
@@ -1936,10 +1982,10 @@ function ComposerContentImpl({
           // transport is disconnected, because the parent decides the failure mode.
           canSubmit: Boolean(sendAgentMessageRef.current || onSubmitMessageRef.current),
           queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
-            queueMessage(queuedText, queuedAttachments);
+            return queueMessage(queuedText, queuedAttachments);
           },
           submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
-            if (submitBehavior !== "preserve-and-lock") {
+            if (topicQueue || submitBehavior !== "preserve-and-lock") {
               beginSubmit(submitAttachments);
             }
             await submitMessage(submitText, submitAttachments);
@@ -1977,6 +2023,7 @@ function ComposerContentImpl({
       serverId,
       submitBehavior,
       submitMessage,
+      topicQueue,
       t,
     ],
   );
@@ -2234,15 +2281,21 @@ function ComposerContentImpl({
         queue: queueWriter,
       });
       if (!result) return;
-      replaceUserInput(result.text);
-      setSelectedAttachments(result.attachments);
+      if (topicQueue) {
+        topicQueue.onEditOrdinary(result.text, result.attachments);
+      } else {
+        replaceUserInput(result.text);
+        setSelectedAttachments(result.attachments);
+      }
     },
-    [agentId, isHandoffLocked, queueWriter, replaceUserInput, setSelectedAttachments],
+    [agentId, isHandoffLocked, queueWriter, replaceUserInput, setSelectedAttachments, topicQueue],
   );
 
   const handleSendQueuedNow = useCallback(
     async (id: string) => {
-      if (!sendAgentMessageRef.current && !onSubmitMessageRef.current) return;
+      if (!sendAgentMessageRef.current && !onSubmitMessageRef.current && !onDeliverQueuedTopic) {
+        return;
+      }
       const finish = beginComposerWork(serverId, agentId, "submit");
       if (!finish) return;
       // Reuse the regular send path; server-side send atomically interrupts any active run.
@@ -2251,8 +2304,17 @@ function ComposerContentImpl({
           agentId,
           messageId: id,
           queue: queueWriter,
-          submitMessage: ({ text, attachments: queuedAttachments }) =>
-            submitMessage(text, queuedAttachments),
+          submitMessage: ({ text, attachments: queuedAttachments, topicReply }) => {
+            if (topicReply) {
+              if (!onDeliverQueuedTopic) throw new Error(t("composer.errors.failedToSend"));
+              return onDeliverQueuedTopic(topicReply, {
+                text,
+                attachments: queuedAttachments,
+                cwd,
+              });
+            }
+            return submitMessage(text, queuedAttachments, !topicQueue);
+          },
           failedToSendMessage: t("composer.errors.failedToSend"),
         });
         if (result.status === "failed") {
@@ -2262,7 +2324,7 @@ function ComposerContentImpl({
         finish();
       }
     },
-    [agentId, queueWriter, serverId, submitMessage, t],
+    [agentId, cwd, onDeliverQueuedTopic, queueWriter, serverId, submitMessage, t, topicQueue],
   );
 
   const handleQueue = useCallback(
@@ -2702,6 +2764,11 @@ function ComposerContentImpl({
     ],
   );
 
+  // MessageInput clears its text after invoking onQueue. Send unsupported decision payloads
+  // through the draft-preserving submit path, which reports the attachment error.
+  const canQueue =
+    !topicQueue?.target.decisionContext ||
+    buildOutgoingAttachments(attachments).every((attachment) => attachment.kind === "quote");
   const isSubmitLoadingVisible =
     isProcessing || isSubmitLoading || isUploadingFile || pendingNativeImagePastes > 0;
   const isSubmitDisabled =
@@ -2818,7 +2885,7 @@ function ComposerContentImpl({
                   isAgentRunning={isAgentRunning}
                   defaultSendBehavior={activeSendBehavior}
                   sendShortcut={appSettings.sendShortcut}
-                  onQueue={handleQueue}
+                  onQueue={canQueue ? handleQueue : undefined}
                   onSubmitLoadingPress={submitLoadingPressHandler}
                   onKeyPress={handleCommandKeyPress}
                   onSelectionChange={handleSelectionChange}

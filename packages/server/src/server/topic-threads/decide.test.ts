@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import { expect, onTestFinished, test, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage } from "../agent/agent-storage.js";
 import { WorkspaceTaskLedgerStore } from "../agent/task-ledger/index.js";
+import * as atomicFile from "../atomic-file.js";
 import { DurableItemStore } from "../durable-items/store.js";
 import { listWorkspaceTaskSummaries } from "../task-ledger-rpc.js";
 import {
@@ -311,6 +312,7 @@ test("recovers a committed durable write after a lost result and dispatches one 
   const interrupted = open({
     durableItems: {
       get: (query) => durable.get(query),
+      getCommittedTopicDecision: (attempt) => durable.getCommittedTopicDecision(attempt),
       decide: async (attempt, assertCurrent) => {
         await durable.decide(attempt, assertCurrent);
         throw new Error("Simulated process failure after the atomic write");
@@ -319,6 +321,8 @@ test("recovers a committed durable write after a lost result and dispatches one 
   });
   expect(await interrupted.decide(input, butler)).toMatchObject({
     error: expect.any(String),
+    errorCode: "topic_decision_resume_required",
+    durableItem: { status: "decided", revision: 1 },
     entry: null,
   });
   await interrupted.router.close();
@@ -341,6 +345,7 @@ test("recovers a committed durable write after a lost result and dispatches one 
     ),
   );
   expect(await recovered.store.listWithAnchors(request)).toEqual({ entries: [], anchors: [] });
+  expect(mismatchedReplays.map(({ errorCode }) => errorCode)).toEqual(Array(5).fill(undefined));
   expect(dispatch).not.toHaveBeenCalled();
 
   const [first, retry, differentId] = await Promise.all([
@@ -379,12 +384,18 @@ test("an approval through the dedicated view cannot be adopted by an interrupted
   const first = open({
     durableItems: {
       get: (query) => durable.get(query),
+      getCommittedTopicDecision: (input) => durable.getCommittedTopicDecision(input),
       decide: async () => {
         throw new Error("Stopped before durable write");
       },
     },
   });
-  expect(await first.decide(request, actor)).toMatchObject({ error: expect.any(String) });
+  const unsubmitted = await first.decide(request, actor);
+  expect(unsubmitted).toMatchObject({
+    error: expect.any(String),
+    durableItem: null,
+  });
+  expect(unsubmitted.errorCode).toBeUndefined();
   await durable.decide({
     serverId: "host",
     workspaceId: request.workspaceId,
@@ -411,7 +422,15 @@ test("a task-only reply clears the original question and routes directly to its 
     decision: undefined,
     note: "Ship it",
   } as const;
-  const first = await decide(blocking, actor);
+  const generation = (await ledger.list(request.workspaceId))[0]?.blockingQuestionGeneration;
+  expect(await decide(blocking, actor)).toMatchObject({
+    errorCode: "stale_blocking_question",
+    task: { blockingQuestionGeneration: generation },
+  });
+  const first = await decide(
+    { ...blocking, expectedBlockingQuestionGeneration: generation },
+    actor,
+  );
   expect(first).toMatchObject({
     error: null,
     durableItem: null,
@@ -420,7 +439,12 @@ test("a task-only reply clears the original question and routes directly to its 
     task: { status: "in_progress" },
     entry: { role: "user_followup", text: "Ship it" },
   });
-  expect(await decide({ ...blocking, note: "Changed meaning" }, actor)).toMatchObject({
+  expect(
+    await decide(
+      { ...blocking, expectedBlockingQuestionGeneration: generation, note: "Changed meaning" },
+      actor,
+    ),
+  ).toMatchObject({
     error: "This message ID is already used by another topic decision.",
   });
   expect(await decide({ ...blocking, clientMessageId: "another" }, actor)).toMatchObject({
@@ -628,41 +652,234 @@ test("ending the human turn while reading the lead prevents the Butler from reco
 });
 
 test.each([
+  { question: undefined, legacy: false },
   { question: "A different question", legacy: false },
   { question: "Should this ship?", legacy: false },
   { question: "Should this ship?", legacy: true },
 ])(
-  "an interrupted approval cannot clear a new $question (legacy: $legacy)",
+  "recovers an approval after the task write fails (new question: $question, legacy: $legacy)",
   async ({ question, legacy }) => {
-    const { home, open, dispatch, ledger } = await scenario("decision");
-    const interrupted = open({
-      taskLedger: {
-        list: (id) => ledger.list(id),
-        syncFromTurnOutcome: async () => {
-          throw new Error("Task file unavailable");
-        },
-      },
-    });
-    expect(await interrupted.decide(request, actor)).toMatchObject({
+    const { home, open, dispatch, ledger, durable, broadcast, readTask } =
+      await scenario("decision");
+    const original = await readTask();
+    const input = legacy
+      ? request
+      : { ...request, expectedBlockingQuestionGeneration: original.blockingQuestionGeneration };
+    const storage = ledger as unknown as { writeTasks: () => Promise<void> };
+    const failure = vi
+      .spyOn(storage, "writeTasks")
+      .mockRejectedValueOnce(new Error("Task write failed"));
+    const interrupted = open();
+    expect(await interrupted.decide(input, actor)).toMatchObject({
       error: expect.any(String),
+      errorCode: "topic_decision_resume_required",
       durableItem: { status: "decided", revision: 1 },
+      entry: null,
     });
+    expect(failure).toHaveBeenCalledOnce();
+    expect(await readTask()).toEqual(original);
+    expect(broadcast).not.toHaveBeenCalled();
+    failure.mockRestore();
+    await interrupted.router.close();
     if (legacy) {
       const file = join(home, "topic-threads", `${request.workspaceId}.json`);
       const data = JSON.parse(await readFile(file, "utf8"));
       delete data.decisions[0].blockingQuestionGeneration;
       await writeFile(file, JSON.stringify(data));
     }
-    const newlyBlocked = await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
-      blockingQuestion: question,
-      status: "awaiting_decision",
-    });
-    expect(await open().decide(request, actor)).toMatchObject({
-      error: "The task changed. Refresh it before continuing this decision.",
+    const resumed = open();
+    if (question !== undefined) {
+      const newlyBlocked = await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
+        blockingQuestion: question,
+        status: "awaiting_decision",
+      });
+      const result = await resumed.decide(input, actor);
+      expect(result).toMatchObject({
+        accepted: false,
+        durableItem: { status: "decided", revision: 1 },
+        error: "The approval was recorded, but the task changed before follow-up delivery.",
+        routedTo: "none",
+        task: {
+          blockingQuestion: question,
+          blockingQuestionGeneration: newlyBlocked?.blockingQuestionGeneration,
+        },
+        entry: {
+          role: "system_note",
+          status: "completed",
+          sourceMessageId: request.clientMessageId,
+          rootMessageId: "first",
+        },
+      });
+      expect(result.errorCode).toBeUndefined();
+      expect(await open().decide(input, actor)).toEqual(result);
+      expect(await resumed.store.list(request)).toEqual([result.entry]);
+      expect(await ledger.list(request.workspaceId)).toEqual([newlyBlocked]);
+      expect(dispatch).not.toHaveBeenCalled();
+    } else {
+      const result = await resumed.decide(input, actor);
+      expect(result).toMatchObject({
+        accepted: true,
+        error: null,
+        task: { status: "in_progress" },
+        entry: { role: "user_followup", sourceMessageId: request.clientMessageId },
+      });
+      expect(result.task?.blockingQuestion).toBeUndefined();
+      expect((await resumed.decide(input, actor)).entry?.entryId).toBe(result.entry?.entryId);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+    }
+    expect(
+      await durable.get({
+        workspaceId: request.workspaceId,
+        requestId: "durable",
+        serverId: "host",
+      }),
+    ).toMatchObject({ status: "decided", revision: 1 });
+  },
+);
+
+test.each([
+  { phase: "approval", newerQuestion: false },
+  { phase: "approval progress", newerQuestion: false },
+  { phase: "approval progress", newerQuestion: true },
+  { phase: "task progress", newerQuestion: false },
+])(
+  "same-ID retry recovers a failed $phase write (new question: $newerQuestion)",
+  async ({ phase, newerQuestion }) => {
+    const { home, open, readTask, durable, dispatch, ledger } = await scenario();
+    const original = await readTask();
+    const input = {
+      ...request,
+      expectedBlockingQuestionGeneration: original.blockingQuestionGeneration,
+    };
+    const service = open();
+    const operation = atomicFile.writeJsonFileAtomic;
+    const topicFile = join(await realpath(home), "topic-threads", `${request.workspaceId}.json`);
+    let failed = false;
+    const fault = vi
+      .spyOn(atomicFile, "writeJsonFileAtomic")
+      .mockImplementation(async (file, value, runtime) => {
+        if (
+          !failed &&
+          (phase === "approval"
+            ? file === join(home, "items.json")
+            : file === topicFile &&
+              (
+                value as { decisions?: { task?: unknown; durableItem?: unknown }[] }
+              ).decisions?.some((decision) =>
+                phase === "approval progress" ? decision.durableItem : decision.task,
+              ))
+        ) {
+          failed = true;
+          throw new Error(`Injected ${phase} write failure`);
+        }
+        return operation(file, value, runtime);
+      });
+    let result;
+    try {
+      result = await service.decide(input, actor);
+    } finally {
+      fault.mockRestore();
+    }
+    expect(failed).toBe(true);
+    expect(result).toMatchObject({
+      accepted: false,
+      error: expect.any(String),
+      durableItem: phase === "approval" ? null : { status: "decided", revision: 1 },
       entry: null,
     });
-    expect(await ledger.list(request.workspaceId)).toEqual([newlyBlocked]);
+    expect(result.errorCode).toBe(
+      phase === "approval" ? undefined : "topic_decision_resume_required",
+    );
+    expect(
+      await durable.get({
+        workspaceId: request.workspaceId,
+        requestId: "durable",
+        serverId: "host",
+      }),
+    ).toMatchObject({ status: phase === "approval" ? "pending" : "decided" });
+    if (phase !== "task progress") expect(await readTask()).toEqual(original);
+    else expect(await readTask()).toMatchObject({ status: "completed" });
+    if (newerQuestion) {
+      expect(
+        (await service.store.getDecision(request, request.clientMessageId))?.durableItem,
+      ).toBeUndefined();
+      await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
+        blockingQuestion: "Approve the replacement build?",
+      });
+      await service.router.close();
+    }
+    const recovery = newerQuestion ? open() : service;
+    const current = await readTask();
+    const retry = await recovery.decide(input, actor);
+    expect(retry).toMatchObject({
+      accepted: true,
+      durableItem: { revision: 1 },
+      task: newerQuestion ? current : { status: "completed" },
+      entry: { role: "system_note", sourceMessageId: request.clientMessageId },
+    });
+    expect(retry.errorCode).toBeUndefined();
+    expect(await recovery.decide(input, actor)).toEqual(retry);
+    expect(await recovery.store.list(request)).toEqual([retry.entry]);
+    if (newerQuestion) expect(await readTask()).toEqual(current);
     expect(dispatch).not.toHaveBeenCalled();
+  },
+);
+
+test.each([
+  { followup: false, entryPersisted: false },
+  { followup: false, entryPersisted: true },
+  { followup: true, entryPersisted: false },
+])(
+  "signals recovery only when the final entry is absent (follow-up: $followup, persisted: $entryPersisted)",
+  async ({ followup, entryPersisted }) => {
+    const { home, open, dispatch } = await scenario();
+    const input = { ...request, dispatchFollowup: followup };
+    const service = open();
+    const write = atomicFile.writeJsonFileAtomic;
+    const topicFile = join(await realpath(home), "topic-threads", `${request.workspaceId}.json`);
+    const role = followup ? "user_followup" : "system_note";
+    let failed = false;
+    const fault = vi
+      .spyOn(atomicFile, "writeJsonFileAtomic")
+      .mockImplementation(async (file, value, runtime) => {
+        const entries = (value as { entries?: { role?: string; sourceMessageId?: string }[] })
+          .entries;
+        if (
+          !failed &&
+          file === topicFile &&
+          entries?.some(
+            (entry) => entry.role === role && entry.sourceMessageId === input.clientMessageId,
+          )
+        ) {
+          failed = true;
+          if (entryPersisted) await write(file, value, runtime);
+          throw new Error("Interrupted final topic entry write");
+        }
+        await write(file, value, runtime);
+      });
+    try {
+      const interrupted = await service.decide(input, actor);
+      expect(interrupted).toMatchObject({
+        accepted: false,
+        durableItem: { status: "decided", revision: 1 },
+        entry: null,
+      });
+      expect(interrupted.errorCode).toBe(
+        entryPersisted ? undefined : "topic_decision_resume_required",
+      );
+    } finally {
+      fault.mockRestore();
+    }
+    expect(failed).toBe(true);
+    expect(await service.store.list(request)).toHaveLength(entryPersisted ? 1 : 0);
+    const retry = await service.decide(input, actor);
+    expect(retry).toMatchObject({
+      accepted: true,
+      entry: { role, sourceMessageId: input.clientMessageId },
+    });
+    expect(retry.errorCode).toBeUndefined();
+    if (followup) await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+    else expect(dispatch).not.toHaveBeenCalled();
   },
 );
 
@@ -671,8 +888,8 @@ test("a retry finishes a task decision whose ledger write committed before its r
   const interrupted = open({
     taskLedger: {
       list: (id) => ledger.list(id),
-      syncFromTurnOutcome: async (workspaceId, taskId, patch) => {
-        await ledger.syncFromTurnOutcome(workspaceId, taskId, patch);
+      syncFromTurnOutcome: async (workspaceId, taskId, patch, coordination) => {
+        await ledger.syncFromTurnOutcome(workspaceId, taskId, patch, coordination);
         throw new Error("Lost the task write acknowledgement");
       },
     },
@@ -691,15 +908,46 @@ test("a retry finishes a task decision whose ledger write committed before its r
   await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
 });
 
-test("a structured follow-up does not clear a new blocking question raised before handoff", async () => {
+test("a committed approval cannot be recovered against a replacement with the same task ID", async () => {
+  const { home, open, ledger, dispatch } = await scenario("decision");
+  const storage = ledger as unknown as { writeTasks: () => Promise<void> };
+  const failure = vi
+    .spyOn(storage, "writeTasks")
+    .mockRejectedValueOnce(new Error("Task write failed"));
+  expect(await open().decide(request, actor)).toMatchObject({
+    accepted: false,
+    durableItem: { status: "decided" },
+    entry: null,
+  });
+  failure.mockRestore();
+  const [task] = await ledger.list(request.workspaceId);
+  const replacement = { ...task, createdAt: now, title: "Replacement" };
+  await atomicFile.writeJsonFileAtomic(join(home, "tasks", `${request.workspaceId}.json`), [
+    replacement,
+  ]);
+
+  const recovered = open();
+  const rejected = await recovered.decide(request, actor);
+  expect(rejected).toMatchObject({
+    accepted: false,
+    error: "The original task for this decision is unavailable.",
+    entry: null,
+  });
+  expect(rejected.errorCode).toBeUndefined();
+  expect(await ledger.list(request.workspaceId)).toEqual([replacement]);
+  expect(await recovered.store.list(request)).toEqual([]);
+  expect(dispatch).not.toHaveBeenCalled();
+});
+
+test("a structured follow-up already handed off keeps the next blocking question", async () => {
   const { open, ledger } = await scenario("decision");
   const { decide, store } = open({}, async ({ validate, onHandoff, onStarted }) => {
     await validate();
+    await onHandoff(true);
     await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
       status: "awaiting_decision",
       blockingQuestion: "Should this ship?",
     });
-    await onHandoff(true);
     await onStarted();
     return { reply: { text: "I applied the original decision." }, touchedFiles: ["src/ship.ts"] };
   });
@@ -719,12 +967,46 @@ test("a structured follow-up does not clear a new blocking question raised befor
   });
 });
 
+test("a new blocking question before handoff supersedes a queued approval follow-up", async () => {
+  const { open, ledger, readTask } = await scenario("decision");
+  const beforeHandoff = Promise.withResolvers<void>();
+  const submitted = vi.fn();
+  const { decide, store } = open({}, async ({ validate, onHandoff }) => {
+    await validate();
+    await beforeHandoff.promise;
+    await onHandoff(true);
+    submitted();
+  });
+  let result;
+  try {
+    result = await decide(request, actor);
+    expect(result).toMatchObject({ error: null, entry: { status: "queued" } });
+    await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
+      status: "awaiting_decision",
+      blockingQuestion: "Can the replacement ship?",
+    });
+  } finally {
+    beforeHandoff.resolve();
+  }
+  const current = await readTask();
+  await vi.waitFor(async () =>
+    expect(await store.list(request)).toMatchObject([{ status: "error", retryable: false }]),
+  );
+  expect(await open().decide(request, actor)).toMatchObject({
+    error: "The approval was recorded, but the task changed before follow-up delivery.",
+    task: current,
+    entry: { entryId: result.entry?.entryId, status: "error", retryable: false },
+  });
+  expect(submitted).not.toHaveBeenCalled();
+});
+
 test("checks the Main Control turn inside the durable write after validation", async () => {
   const { open, durable, dispatch } = await scenario("decision");
   let guardChecksInStore = 0;
   const { decide, store } = open({
     durableItems: {
       get: (query) => durable.get(query),
+      getCommittedTopicDecision: (input) => durable.getCommittedTopicDecision(input),
       decide: (input, assertCurrent) =>
         durable.decide(input, () => {
           if (++guardChecksInStore === 2) throw new Error("Human turn has ended");
@@ -733,11 +1015,13 @@ test("checks the Main Control turn inside the durable write after validation", a
     },
   });
   const butler = { ...actor, origin: "butler_dispatch", assertCurrent: () => {} } as const;
-  expect(await decide(request, butler)).toMatchObject({
+  const rejected = await decide(request, butler);
+  expect(rejected).toMatchObject({
     error: expect.any(String),
     durableItem: null,
     entry: null,
   });
+  expect(rejected.errorCode).toBeUndefined();
   expect(guardChecksInStore).toBe(2);
   expect(
     await durable.get({
@@ -750,10 +1034,15 @@ test("checks the Main Control turn inside the durable write after validation", a
   expect(dispatch).not.toHaveBeenCalled();
 });
 
-test.each([false, true])(
-  "recovers an interrupted delivery with provider handoff %s",
-  async (handedOff) => {
-    const { open, dispatch } = await scenario("decision");
+test.each([
+  { handedOff: false, taskChanged: false },
+  { handedOff: true, taskChanged: false },
+  { handedOff: false, taskChanged: true },
+  { handedOff: true, taskChanged: true },
+])(
+  "recovers an interrupted delivery (handoff: $handedOff, task changed: $taskChanged)",
+  async ({ handedOff, taskChanged }) => {
+    const { open, dispatch, ledger } = await scenario("decision");
     const enteredDispatch = Promise.withResolvers<void>();
     const preRestart = open({}, async ({ validate, onHandoff, signal }) => {
       await validate();
@@ -767,16 +1056,35 @@ test.each([false, true])(
     expect(first).toMatchObject({ error: null, entry: { status: "queued" } });
     await enteredDispatch.promise;
     await preRestart.router.close();
+    const next = taskChanged
+      ? await ledger.syncFromTurnOutcome(request.workspaceId, "ship", {
+          status: "awaiting_decision",
+          blockingQuestion: "A later question",
+        })
+      : null;
 
     const recovered = open();
     const result = await recovered.decide(request, actor);
+    let expectedError = null;
+    if (handedOff)
+      expectedError = "The decision was recorded, but follow-up delivery could not be confirmed.";
+    else if (taskChanged)
+      expectedError = "The approval was recorded, but the task changed before follow-up delivery.";
     expect(result).toMatchObject({
-      error: handedOff
-        ? "The decision was recorded, but follow-up delivery could not be confirmed."
-        : null,
-      entry: { entryId: first.entry?.entryId, status: handedOff ? "error" : "queued" },
+      error: expectedError,
+      entry: {
+        entryId: first.entry?.entryId,
+        status: handedOff || taskChanged ? "error" : "queued",
+      },
     });
-    if (!handedOff) {
+    expect(result.errorCode).toBeUndefined();
+    if (taskChanged) {
+      expect(await open().decide(request, actor)).toEqual(result);
+      expect(await recovered.store.list(request)).toEqual([result.entry]);
+      expect(result.entry?.retryable).not.toBe(true);
+      expect(await ledger.list(request.workspaceId)).toEqual([next]);
+    }
+    if (!handedOff && !taskChanged) {
       await vi.waitFor(async () => {
         expect(await recovered.store.list(request)).toMatchObject([
           { status: "completed", role: "user_followup" },
@@ -784,6 +1092,89 @@ test.each([false, true])(
         ]);
       });
     }
-    expect(dispatch).toHaveBeenCalledTimes(handedOff ? 0 : 1);
+    expect(dispatch).toHaveBeenCalledTimes(handedOff || taskChanged ? 0 : 1);
   },
 );
+
+test.each([false, true])(
+  "a task change before committing a real approval leaves the item pending (versioned: %s)",
+  async (versioned) => {
+    const { open, durable, ledger, dispatch, broadcast, readTask } = await scenario("decision");
+    const original = await readTask();
+    const input = versioned
+      ? { ...request, expectedBlockingQuestionGeneration: original.blockingQuestionGeneration }
+      : request;
+    const { decide } = open({
+      taskLedger: {
+        syncFromTurnOutcome: async (workspaceId, taskId, patch, coordination) => {
+          await ledger.syncFromTurnOutcome(workspaceId, taskId, {
+            status: "awaiting_decision",
+            blockingQuestion: "A new question displaced the approval.",
+          });
+          return ledger.syncFromTurnOutcome(workspaceId, taskId, patch, coordination);
+        },
+      },
+    });
+    const blocked = await decide(input, actor);
+    expect(blocked).toMatchObject({
+      accepted: false,
+      durableItem: null,
+      error: versioned
+        ? "The blocking question changed. Refresh it before continuing this decision."
+        : "The task changed. Refresh it before continuing this decision.",
+    });
+    expect(blocked.errorCode).toBe(versioned ? "stale_blocking_question" : undefined);
+    expect(await open().decide(input, actor)).toEqual(blocked);
+    expect(
+      await durable.get({
+        workspaceId: request.workspaceId,
+        requestId: "durable",
+        serverId: "host",
+      }),
+    ).toMatchObject({ status: "pending", revision: 0 });
+    expect(broadcast).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  },
+);
+
+test("a confirmed follow-up refusal resumes the recorded structured decision by entry ID", async () => {
+  const { open, dispatch, ledger, durable } = await scenario("decision");
+  const first = open({}, async ({ onHandoff }) => {
+    await onHandoff(true);
+    await onHandoff(false);
+    throw new Error("Provider declined");
+  });
+  const decided = await first.decide(
+    { ...request, note: "Apply only to the release branch" },
+    actor,
+  );
+  if (!decided.entry) throw new Error("Missing follow-up");
+  const retryOfEntryId = decided.entry.entryId;
+  await vi.waitFor(async () => expect((await first.store.list(request))[0]?.retryable).toBe(true));
+  await first.router.close();
+  const before = await ledger.list(request.workspaceId);
+  const next = open();
+  const response = await next.router.reply({
+    ...request,
+    type: "workspace.topic.reply.request",
+    clientMessageId: "retry-attempt",
+    retryOfEntryId,
+    text: "Another text",
+  });
+  expect(response.payload).toMatchObject({
+    error: null,
+    entry: { origin: "decision_reply", decision: "approve", durableItemRequestId: "durable" },
+  });
+  await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+  const sent = dispatch.mock.calls[0]?.[0];
+  expect(sent?.prompt).toContain("<paseo-topic-decision");
+  expect(sent?.prompt).toContain("Apply only to the release branch");
+  expect(sent?.prompt).not.toContain("Another text");
+  expect((await ledger.list(request.workspaceId))[0]).toMatchObject({
+    status: before[0]?.status,
+    blockingQuestionGeneration: before[0]?.blockingQuestionGeneration,
+  });
+  expect(
+    await durable.get({ workspaceId: request.workspaceId, requestId: "durable", serverId: "host" }),
+  ).toMatchObject({ status: "decided", revision: 1 });
+});

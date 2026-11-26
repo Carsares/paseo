@@ -900,6 +900,7 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
           serverId: z.string(),
           workspaceId: z.string().optional(),
           agentId: z.string(),
+          topicKey: z.string().min(1).optional(),
           reason: z.enum(["finished", "error", "permission"]),
         }),
       })
@@ -3222,6 +3223,7 @@ export const TopicThreadEntrySchema = z.object({
   sourceMessageId: z.string().min(1).optional(),
   text: z.string(),
   status: z.enum(["queued", "running", "completed", "error"]),
+  retryable: z.boolean().optional(),
   seq: z.number().int().nonnegative(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -3257,6 +3259,7 @@ export const WorkspaceTopicReplyRequestSchema = z.object({
   taskId: z.string().min(1).optional(),
   rootMessageId: z.string().min(1).optional(),
   clientMessageId: z.string().min(1),
+  retryOfEntryId: z.string().min(1).optional(),
   text: z.string().min(1),
   attachments: z.array(AgentAttachmentSchema).optional(),
   routeMode: TopicReplyRouteModeSchema.optional(),
@@ -3398,6 +3401,8 @@ export const TopicReadEntrySchema = z.object({
   topicKey: z.string().min(1),
   readUpToSeq: z.number().int(),
   readUpToTimestampMs: z.number(),
+  // Explicit time-based coverage for replies with timeline coordinates.
+  readUpToTimelineTimestampMs: z.number().optional(),
   markedUnreadAtMs: z.number().nullable(),
   updatedAt: z.iso.datetime(),
 });
@@ -3409,6 +3414,8 @@ export const WorkspaceTopicReadSnapshotSchema = z.object({
   watermarkEpoch: z.string().nullable(),
   watermarkSeq: z.number().int(),
   watermarkTimestampMs: z.number(),
+  // Time observed without a usable timeline sequence.
+  watermarkTimelineTimestampMs: z.number().optional(),
   topics: z.array(TopicReadEntrySchema),
   revision: z.number().int().nonnegative(),
 });
@@ -3442,6 +3449,7 @@ export const WorkspaceTopicReadMarkRequestSchema = z.object({
   mainAgentId: z.string().min(1),
   topicKey: z.string().min(1),
   mode: z.enum(["read", "unread"]),
+  epoch: z.string().nullable().optional(),
   seq: z.number().int().optional(),
   timestampMs: z.number().optional(),
 });
@@ -5802,6 +5810,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceTodos: z.boolean().optional(),
         // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
         workspaceButlerV1: z.boolean().optional(),
+        workspaceTopicReplyRetry: z.boolean().optional(),
         // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         checkoutGitStagingV1: z.boolean().optional(),
         // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
@@ -7139,6 +7148,7 @@ export const AgentAttentionRequiredMessageSchema = z.object({
           serverId: z.string(),
           workspaceId: z.string().optional(),
           agentId: z.string(),
+          topicKey: z.string().min(1).optional(),
           reason: z.enum(["finished", "error", "permission"]),
         }),
       })

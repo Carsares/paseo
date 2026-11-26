@@ -7,6 +7,7 @@ export interface AgentAttentionNotificationData {
   serverId: string;
   workspaceId?: string;
   agentId: string;
+  topicKey?: string;
   reason: AgentAttentionReason;
 }
 
@@ -21,6 +22,7 @@ interface BuildAgentAttentionNotificationPayloadInput {
   serverId: string;
   workspaceId: string;
   agentId: string;
+  topicKey?: string;
   assistantMessage?: string | null;
   permissionRequest?: NotificationPermissionRequest | null;
 }
@@ -212,6 +214,7 @@ export function buildAgentAttentionNotificationPayload(
       serverId: input.serverId,
       workspaceId: input.workspaceId,
       agentId: input.agentId,
+      ...(input.topicKey ? { topicKey: input.topicKey } : {}),
       reason: input.reason,
     },
   };

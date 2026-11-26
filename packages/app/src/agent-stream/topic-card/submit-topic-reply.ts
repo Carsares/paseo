@@ -1,3 +1,4 @@
+import type { QueuedTopicReply } from "@/composer/actions";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceTaskSummary } from "@getpaseo/protocol/messages";
 import type { QueryClient } from "@tanstack/react-query";
@@ -7,6 +8,7 @@ import {
   splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
 import type { MessagePayload } from "@/composer/types";
+import { i18n } from "@/i18n/i18next";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import type { ActiveTopicReplyTarget } from "@/stores/topic-stream-view-store";
 import { decideWorkspaceTopicOnHost, replyToWorkspaceTopic } from "@/topic-threads/queries";
@@ -37,19 +39,28 @@ function buildSubmissionSignature(
   return `${trimmedText}\0${routeMode}\0${attachmentKeys.join(",")}`;
 }
 
+async function encodeTopicImages(
+  images: ReturnType<typeof splitComposerAttachmentsForSubmit>["images"],
+) {
+  const encoded = await encodeImages(images);
+  // The shared encoder omits failed items. Only a complete batch preserves the source order.
+  if (images.length > 0 && encoded?.length !== images.length) {
+    throw new Error(i18n.t("topicWorkbench.topicStream.imageEncodingFailed"));
+  }
+  return encoded ?? [];
+}
+
 async function uploadInlineImagesForTopicReply(
   client: DaemonClient,
   images: ReturnType<typeof splitComposerAttachmentsForSubmit>["images"],
 ) {
   const uploaded = [];
-  const encodedImages = await encodeImages(images);
-  for (let i = 0; i < images.length; i += 1) {
-    const encoded = encodedImages?.[i];
-    if (!encoded) continue;
+  const encodedImages = await encodeTopicImages(images);
+  for (const [i, encoded] of encodedImages.entries()) {
     const meta = images[i];
     const ext = encoded.mimeType.split("/")[1] ?? "png";
     const response = await client.uploadFile({
-      fileName: `image-${meta?.id ?? i}.${ext}`,
+      fileName: meta?.fileName?.trim() || `image-${meta?.id ?? i}.${ext}`,
       mimeType: encoded.mimeType,
       bytes: decodeBase64ToBytes(encoded.data),
     });
@@ -79,10 +90,10 @@ async function sendLegacyQuotedTopicReply(input: {
     : payload.attachments;
   const quotedText = composePromptTextWithQuotes(payload.text, combinedAttachments);
   const legacyWire = splitComposerAttachmentsForSubmit(combinedAttachments, { format });
-  const imagesData = await encodeImages(legacyWire.images);
+  const imagesData = await encodeTopicImages(legacyWire.images);
   await client.sendAgentMessage(agentId, quotedText, {
     messageId: clientMessageId,
-    images: imagesData ?? [],
+    images: imagesData,
     attachments: legacyWire.attachments,
   });
   return true;
@@ -99,6 +110,12 @@ export class TopicDecisionStaleQuestionError extends Error {
   }
 }
 
+export function assertTopicDecisionAttachments(attachments: MessagePayload["attachments"]) {
+  if (attachments.some((attachment) => attachment.kind !== "quote")) {
+    throw new Error(i18n.t("topicWorkbench.topicStream.decisionAttachmentsUnsupported"));
+  }
+}
+
 async function submitBlockingDecisionReply(input: {
   queryClient: QueryClient;
   serverId: string;
@@ -108,6 +125,7 @@ async function submitBlockingDecisionReply(input: {
   payload: MessagePayload;
   clientMessageId: string;
 }): Promise<boolean> {
+  assertTopicDecisionAttachments(input.payload.attachments);
   const note = composePromptTextWithQuotes(input.payload.text, input.payload.attachments).trim();
   if (!note) return false;
   const response = await decideWorkspaceTopicOnHost({
@@ -136,18 +154,50 @@ async function submitBlockingDecisionReply(input: {
   return true;
 }
 
-function resolveSubmissionClientMessageId(
-  activeReplyTopic: ActiveTopicReplyTarget,
-  signature: string,
-  onPersistSubmissionIntent?: (signature: string, clientMessageId: string) => void,
+interface TopicSubmissionIntent {
+  signature: string;
+  clientMessageId: string;
+}
+
+const draftIntents = new Map<string, TopicSubmissionIntent>();
+
+function describeTopicSubmission(target: ActiveTopicReplyTarget, payload: MessagePayload) {
+  const trimmed = payload.text.trim();
+  const directToMain = trimmed.startsWith("@主控") || trimmed.startsWith("@main");
+  const route = directToMain ? "main" : target.routeMode;
+  const signature = buildSubmissionSignature(
+    trimmed,
+    target.decisionContext
+      ? `decision:${target.decisionContext.blockingQuestionGeneration ?? ""}`
+      : route,
+    payload.attachments,
+  );
+  return { route, signature };
+}
+
+function getTopicSubmissionId(target: ActiveTopicReplyTarget, signature: string) {
+  return target.pendingSubmissionSignature === signature && target.pendingClientMessageId
+    ? target.pendingClientMessageId
+    : generateMessageId();
+}
+
+export function rememberTopicSubmission(
+  draftKey: string,
+  target: ActiveTopicReplyTarget,
+  payload: MessagePayload,
 ): string {
-  const clientMessageId =
-    activeReplyTopic.pendingClientMessageId &&
-    activeReplyTopic.pendingSubmissionSignature === signature
-      ? activeReplyTopic.pendingClientMessageId
-      : generateMessageId();
-  onPersistSubmissionIntent?.(signature, clientMessageId);
+  const { signature } = describeTopicSubmission(target, payload);
+  const saved = draftIntents.get(draftKey);
+  if (saved?.signature === signature) return saved.clientMessageId;
+  const clientMessageId = getTopicSubmissionId(target, signature);
+  draftIntents.set(draftKey, { signature, clientMessageId });
   return clientMessageId;
+}
+
+export function finishTopicSubmission(draftKey: string, clientMessageId: string) {
+  if (draftIntents.get(draftKey)?.clientMessageId === clientMessageId) {
+    draftIntents.delete(draftKey);
+  }
 }
 
 export async function submitActiveTopicReply(input: {
@@ -163,6 +213,7 @@ export async function submitActiveTopicReply(input: {
   disconnectedMessage: string;
   /** Persists the allocated idempotency key on the active draft intent so retries reuse it. */
   onPersistSubmissionIntent?: (signature: string, clientMessageId: string) => void;
+  clientMessageId?: string;
 }): Promise<boolean> {
   const {
     queryClient,
@@ -178,28 +229,21 @@ export async function submitActiveTopicReply(input: {
     onPersistSubmissionIntent,
   } = input;
   const format = resolveComposerAttachmentSubmitFormat({ supportsForgeAttachments });
-  const trimmed = payload.text.trim();
+  const composedText = composePromptTextWithQuotes(payload.text, payload.attachments).trim();
   const baseWire = splitComposerAttachmentsForSubmit(payload.attachments, { format });
-  if (!trimmed && baseWire.attachments.length === 0 && baseWire.images.length === 0) {
+  if (!composedText && baseWire.attachments.length === 0 && baseWire.images.length === 0) {
     return false;
   }
 
-  const isDecisionReply = Boolean(activeReplyTopic.decisionContext);
-  const explicitMain = trimmed.startsWith("@主控") || trimmed.startsWith("@main");
-  const effectiveRouteMode = explicitMain ? "main" : activeReplyTopic.routeMode;
-  const decisionRouteKey = `decision:${activeReplyTopic.decisionContext?.blockingQuestionGeneration ?? ""}`;
-  const signature = buildSubmissionSignature(
-    trimmed,
-    isDecisionReply ? decisionRouteKey : effectiveRouteMode,
-    payload.attachments,
-  );
-  const clientMessageId = resolveSubmissionClientMessageId(
+  const { route: effectiveRouteMode, signature } = describeTopicSubmission(
     activeReplyTopic,
-    signature,
-    onPersistSubmissionIntent,
+    payload,
   );
+  const clientMessageId =
+    input.clientMessageId ?? getTopicSubmissionId(activeReplyTopic, signature);
+  onPersistSubmissionIntent?.(signature, clientMessageId);
 
-  if (isDecisionReply && supportsButlerV1) {
+  if (activeReplyTopic.decisionContext && supportsButlerV1) {
     return submitBlockingDecisionReply({
       queryClient,
       serverId,
@@ -233,7 +277,6 @@ export async function submitActiveTopicReply(input: {
     attachmentsToSend.push(...uploaded);
   }
 
-  const composedText = composePromptTextWithQuotes(payload.text, payload.attachments).trim();
   await replyToWorkspaceTopic({
     queryClient,
     serverId,
@@ -249,4 +292,25 @@ export async function submitActiveTopicReply(input: {
     attachments: attachmentsToSend,
   });
   return true;
+}
+
+export async function deliverQueuedTopicReply(input: {
+  queryClient: QueryClient;
+  serverId: string;
+  agentId: string;
+  topicReply: QueuedTopicReply;
+  payload: MessagePayload;
+  supportsTopicThreads: boolean;
+  supportsButlerV1: boolean;
+  supportsForgeAttachments: boolean;
+}) {
+  const { topicReply, ...scope } = input;
+  const sent = await submitActiveTopicReply({
+    ...scope,
+    workspaceId: topicReply.workspaceId,
+    activeReplyTopic: topicReply.target,
+    clientMessageId: topicReply.clientMessageId,
+    disconnectedMessage: i18n.t("workspace.terminal.hostDisconnected"),
+  });
+  if (!sent) throw new Error(i18n.t("composer.errors.failedToSend"));
 }

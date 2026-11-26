@@ -234,6 +234,14 @@ export class DurableItemStore {
       .filter((item) => item.workspaceId === input.workspaceId && item.status === "pending");
   }
 
+  // The caller holds the task ledger lane first. The reader must not re-enter either lane.
+  withPendingWorkspaceItems<T>(
+    input: { serverId: string; workspaceId: string },
+    use: (items: readonly WorkspaceDurableItem[]) => Promise<T>,
+  ): Promise<T> {
+    return this.withWriteLane(async () => use(await this.listPendingWorkspaceItems(input)));
+  }
+
   async get(input: ItemKey & { serverId: string }): Promise<WorkspaceDurableItem | null> {
     this.assertLocalHost(input.serverId);
     const workspace = await this.options.getWorkspace(input.workspaceId);
@@ -241,7 +249,24 @@ export class DurableItemStore {
     return findItem(await this.read(), input)?.item ?? null;
   }
 
-  async decide(input: DecideInput, assertCurrent?: () => void): Promise<WorkspaceDurableItem> {
+  async getCommittedTopicDecision(input: DecideInput): Promise<WorkspaceDurableItem | undefined> {
+    this.assertLocalHost(input.serverId);
+    const decision = DecideInputSchema.parse(input);
+    await this.requireWorkspace(decision.workspaceId);
+    const entry = findItem(await this.read(), {
+      workspaceId: decision.workspaceId,
+      requestId: decision.durableItemRequestId,
+    });
+    // The item and its operation ID are committed in the same atomic file write.
+    if (entry && entry.item.kind !== "authorization" && isTopicDecisionReplay(entry, decision))
+      return entry.item;
+  }
+
+  async decide(
+    input: DecideInput,
+    assertCurrent?: () => void,
+    options?: { deferNotification?: boolean },
+  ): Promise<WorkspaceDurableItem> {
     this.assertLocalHost(input.serverId);
     const decision = DecideInputSchema.parse(input);
     return this.write(async (data, skipPersist) => {
@@ -284,7 +309,7 @@ export class DurableItemStore {
       entry.decidedByPrincipalId = decision.principalId;
       entry.topicDecisionOperationId = decision.topicDecisionOperationId;
       return entry.item;
-    });
+    }, !options?.deferNotification);
   }
 
   /** A daemon producer can invalidate a pending item when its originating action expires. */
@@ -341,9 +366,9 @@ export class DurableItemStore {
 
   private write(
     update: (data: StoreFile, skipPersist: () => void) => Promise<WorkspaceDurableItem>,
+    notify = true,
   ): Promise<WorkspaceDurableItem> {
-    const prior = writeTails.get(this.filePath) ?? Promise.resolve();
-    const result = prior.then(async () => {
+    return this.withWriteLane(async () => {
       const data = await this.read();
       let changed = true;
       const value = await update(data, () => {
@@ -351,10 +376,15 @@ export class DurableItemStore {
       });
       if (changed) {
         await writeJsonFileAtomic(this.filePath, data);
-        publishChange(this.filePath, value);
+        if (notify) publishChange(this.filePath, value);
       }
       return value;
     });
+  }
+
+  private withWriteLane<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = writeTails.get(this.filePath) ?? Promise.resolve();
+    const result = prior.then(operation);
     const tail = result.then(
       () => undefined,
       () => undefined,

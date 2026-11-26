@@ -81,8 +81,11 @@ import {
 import { useCreateResidentAction, useOpenResidentDialog } from "../resident-dialog";
 import { useArchiveSubagent } from "../use-archive-subagent";
 import { useDetachSubagent } from "../use-detach-subagent";
-import { selectTeamDirectoryMessages } from "./messages-model";
+import { selectTeamDirectoryMessages, type TeamTopicReadContext } from "./messages-model";
 import { DirectoryMessagesView } from "./messages-view";
+import { useWorkspaceTopicReadState } from "@/topic-read/queries";
+import { useWorkspaceTopicEntries } from "@/topic-threads/queries";
+import { useWorkspaceTasks } from "@/composer/workspace-task-ledger/query";
 import { DirectoryTodosView } from "./todos-view";
 import { useWorkspaceTodos } from "@/todos/queries";
 import {
@@ -725,6 +728,36 @@ function useMainTimelineInboxSync(input: {
   return syncedStamp !== mainUpdateStamp;
 }
 
+function useTeamTopicReadContext(
+  serverId: string,
+  workspaceId: string,
+  mainAgentId: string | null,
+  active: boolean,
+): TeamTopicReadContext | undefined {
+  const { snapshot, isSupported } = useWorkspaceTopicReadState(
+    serverId,
+    workspaceId,
+    mainAgentId,
+    active,
+  );
+  const supportsTaskLedger = useHostFeature(serverId, "workspaceTaskLedger");
+  const { query: tasksQuery } = useWorkspaceTasks(
+    serverId,
+    workspaceId,
+    active && isSupported && supportsTaskLedger && Boolean(mainAgentId),
+  );
+  const { entries: threadEntries, anchors: topicAnchors } = useWorkspaceTopicEntries(
+    serverId,
+    workspaceId,
+    mainAgentId,
+    active && isSupported,
+  );
+  return useMemo(() => {
+    if (!isSupported || !mainAgentId) return undefined;
+    return { snapshot, tasks: tasksQuery.data, threadEntries, topicAnchors };
+  }, [isSupported, mainAgentId, snapshot, tasksQuery.data, threadEntries, topicAnchors]);
+}
+
 export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   serverId,
   workspaceId,
@@ -897,6 +930,12 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
     [mainAgentId, serverId, workspaceId],
   );
   const readScope = useTopicInboxReadStore((state) => state.scopes[readScopeKey]);
+  const topicRead = useTeamTopicReadContext(
+    serverId,
+    workspaceId,
+    isTopicWorkspace ? mainAgentId : null,
+    active,
+  );
 
   const messagesProjection = useMemo(
     () =>
@@ -911,6 +950,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
         currentMainEpoch,
         durableItems,
         readScope,
+        topicRead,
         fallbackAgentTitle: fallbackTitle,
       }),
     [
@@ -924,6 +964,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
       mainStreamTail,
       mainTimelineHasNewer,
       readScope,
+      topicRead,
       workspaceId,
     ],
   );

@@ -1,4 +1,4 @@
-import type { QueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import type {
   WorkspaceTopicReadMarkAllRequest,
   WorkspaceTopicReadMarkRequest,
@@ -53,6 +53,7 @@ export function useWorkspaceTopicReadState(
   mainAgentId: string | null,
   activeOverride?: boolean,
 ) {
+  const queryClient = useQueryClient();
   const paneActive = useRetainedPanelActive();
   const appVisible = useAppVisible();
   const supported = useHostFeature(serverId, FEATURE);
@@ -61,9 +62,10 @@ export function useWorkspaceTopicReadState(
   const active = activeOverride ?? paneActive;
   const enabled =
     Boolean(workspaceId && mainAgentId) && active && appVisible && supported && online;
+  const queryKey = workspaceTopicReadQueryKey(serverId, workspaceId, mainAgentId ?? "");
 
   const query = useFetchQuery({
-    queryKey: workspaceTopicReadQueryKey(serverId, workspaceId, mainAgentId ?? ""),
+    queryKey,
     dataShape: "value" as const,
     staleTimeMs: TOPIC_READ_STALE_MS,
     enabled,
@@ -76,6 +78,10 @@ export function useWorkspaceTopicReadState(
       const response = await client.getWorkspaceTopicReadState({ workspaceId, mainAgentId });
       signal.throwIfAborted();
       if (response.error) throw new Error(response.error);
+      const current = queryClient.getQueryData<WorkspaceTopicReadSnapshot | null>(queryKey);
+      if (current && (!response.snapshot || current.revision > response.snapshot.revision)) {
+        return current;
+      }
       return response.snapshot;
     },
   });
@@ -95,6 +101,7 @@ export async function markTopicReadOnHost(input: {
   mainAgentId: string;
   topicKey: string;
   mode: WorkspaceTopicReadMarkRequest["mode"];
+  epoch?: string | null;
   seq?: number;
   timestampMs?: number;
   fallbackItemIds?: readonly string[];
@@ -109,6 +116,7 @@ export async function markTopicReadOnHost(input: {
       mainAgentId: input.mainAgentId,
       topicKey: input.topicKey,
       mode: input.mode,
+      ...(input.epoch !== undefined ? { epoch: input.epoch } : {}),
       ...(typeof input.seq === "number" ? { seq: input.seq } : {}),
       ...(typeof input.timestampMs === "number" ? { timestampMs: input.timestampMs } : {}),
     });

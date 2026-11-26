@@ -4619,7 +4619,7 @@ function createToolCatalog(
       {
         title: "Dispatch topic decision",
         description:
-          "Send the user's decision to its topic and record it on the topic card. Requires a direct human turn. Use a stable clientMessageId for retry. System authorizations cannot be decided here.",
+          "Send the user's decision to its topic and record it on the topic card. Requires a direct human turn. For a blocking question, pass expectedBlockingQuestionGeneration from get_workspace_situation. Use a stable clientMessageId for retry. System authorizations cannot be decided here.",
         inputSchema: dispatchInputSchema,
       },
       async (
@@ -7175,12 +7175,17 @@ function createToolCatalog(
     );
   }
 
+  interface ReportTopic {
+    taskId?: string;
+    rootMessageId?: string;
+  }
+
   function reportTopic(
     caller: HierarchyAgent,
     localParent: HierarchyAgent | undefined,
     taskReport: ReturnType<AgentManager["captureTaskReport"]>,
     verified: boolean,
-  ) {
+  ): ReportTopic {
     const topicTask = taskReport?.topicTask;
     if (topicTask) {
       const matchesScope =
@@ -7199,6 +7204,17 @@ function createToolCatalog(
       taskId: taskLabels?.[TASK_ID_LABEL] || undefined,
       rootMessageId: taskLabels?.[TOPIC_ROOT_MESSAGE_ID_LABEL] || undefined,
     };
+  }
+
+  function reportTopicForDelivery(
+    caller: HierarchyAgent,
+    localParent: HierarchyAgent | undefined,
+    taskReport: ReturnType<AgentManager["captureTaskReport"]>,
+    verified: boolean,
+  ): ReportTopic {
+    return taskReport?.explicitlyUnbound
+      ? {}
+      : reportTopic(caller, localParent, taskReport, verified);
   }
 
   registerTool(
@@ -7296,7 +7312,7 @@ function createToolCatalog(
       const localParent = await requireParentReportTarget(parent, localServer);
       const isLocal = parent.serverId === localServer;
       const verified = options.verifiedCallerAgentId === callerAgentId;
-      const topic = reportTopic(caller, localParent, taskReport, verified);
+      const topic = reportTopicForDelivery(caller, localParent, taskReport, verified);
       const report = {
         status,
         summary: neutralizePeerWorkspacePromptMarker(summary),

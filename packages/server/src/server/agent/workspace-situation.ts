@@ -327,6 +327,7 @@ function projectBlockingQuestion(topic: TopicView, task: WorkspaceTask) {
     leadAgentId: topic.leadAgentId,
     leadTitle: previewText(topic.leadTitle, 160),
     blockingQuestion: previewText(task.blockingQuestion?.trim(), 600),
+    blockingQuestionGeneration: task.blockingQuestionGeneration,
   };
 }
 

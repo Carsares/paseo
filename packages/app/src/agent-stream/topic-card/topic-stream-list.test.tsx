@@ -1,15 +1,22 @@
 /** @vitest-environment jsdom */
 import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
-import type { TopicThreadEntry } from "@getpaseo/protocol/messages";
+import type {
+  TopicThreadEntry,
+  WorkspaceDurableItem,
+  WorkspaceTaskSummary,
+  WorkspaceTopicDecideResponse,
+} from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSidebarAttention } from "@/components/sidebar/sidebar-unread-conclusions";
 import { applyWorkspaceTasksUpdateToCache } from "@/composer/workspace-task-ledger/query";
 import { queryClient as sharedQueryClient } from "@/data/query-client";
+import { applyDurableItemUpdateToCache, durableItemsQueryKey } from "@/durable-items/queries";
 import { submitActiveTopicReply, TopicDecisionStaleQuestionError } from "./submit-topic-reply";
 import { PaneProvider, type PaneContextValue } from "@/panels/pane-context";
+import { encodeImages } from "@/utils/encode-images";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { createWorkspaceSheetStack } from "@/screens/workspace/sheet-pane/stack";
 import { useSessionStore } from "@/stores/session-store";
@@ -20,6 +27,7 @@ import {
   TeamMessageJumpProvider,
 } from "@/subagents/team-directory/message-jump-store";
 import { TeamDirectoryShellProvider } from "@/subagents/team-directory/shell-context";
+import { workspaceTopicReadQueryKey } from "@/topic-read/queries";
 import { applyTopicAnchorToCache, workspaceTopicEntriesQueryKey } from "@/topic-threads/queries";
 import type { StreamItem } from "@/types/stream";
 import {
@@ -54,20 +62,6 @@ vi.mock("@/utils/navigate-to-agent", () => ({
   navigateToAgent: vi.fn(),
 }));
 
-const mockDurableItems = vi.hoisted(() => ({
-  items: [] as import("@getpaseo/protocol/messages").WorkspaceDurableItem[],
-}));
-
-vi.mock("@/durable-items/queries", () => ({
-  useWorkspaceDurableItems: () => ({
-    result: { data: mockDurableItems.items },
-    online: true,
-  }),
-  getOnlineDurableItemsClient: () => null,
-  reconcileDurableItemDecision: vi.fn(async () => undefined),
-  applyDurableItemUpdateToCache: vi.fn(),
-}));
-
 vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenu: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DropdownMenuTrigger: ({ children }: { children: ReactNode }) => <div>{children}</div>,
@@ -96,6 +90,7 @@ function seedSession(options: {
   supportsTopicReadState: boolean;
   supportsButlerV1?: boolean;
   supportsTaskLedger?: boolean;
+  supportsDurableItems?: boolean;
   requiresAttention?: boolean;
 }) {
   const agents = new Map([
@@ -145,6 +140,7 @@ function seedSession(options: {
             workspaceTopicThreads: options.supportsTopicThreads,
             workspaceTopicReadState: options.supportsTopicReadState,
             workspaceTaskLedger: options.supportsTaskLedger ?? false,
+            workspaceDurableItemsV1: options.supportsDurableItems ?? false,
             workspaceTodos: false,
             ...(options.supportsButlerV1 !== undefined
               ? { workspaceButlerV1: options.supportsButlerV1 }
@@ -237,7 +233,6 @@ function TestTopBarHarness({ streamItems }: { streamItems: readonly StreamItem[]
 describe("TopicStreamList & read-watermark integration", () => {
   beforeEach(() => {
     mockIsCompactFormFactor = false;
-    mockDurableItems.items = [];
     useTeamDirectoryViewStore.setState({ activeTab: "agents" });
     useTopicStreamViewStore.setState({
       viewModeByAgentKey: {},
@@ -247,6 +242,8 @@ describe("TopicStreamList & read-watermark integration", () => {
       expandedConflictsByTopicKey: {},
       decisionDraftByTopicKey: {},
       decisionDraftMetaByTopicKey: {},
+      durableDecisionIntents: {},
+      inlineReplyDrafts: {},
       activeReplyTopicByAgentKey: {},
       pendingScrollTopicByAgentKey: {},
       returnTopicAnchorByAgentKey: {},
@@ -378,6 +375,237 @@ describe("TopicStreamList & read-watermark integration", () => {
       expect((sendButton as HTMLButtonElement).disabled).toBe(true);
     });
   });
+
+  it("restores the inline draft and transmission ID after unread filtering unmounts the card", async () => {
+    seedSession({ supportsTopicThreads: true, supportsTopicReadState: false });
+    const replyWorkspaceTopic = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Acknowledgement missing"))
+      .mockResolvedValueOnce({ error: null, entry: null });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { replyWorkspaceTopic },
+    } as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const agentKey = buildTopicAgentKey(SERVER_ID, MAIN_AGENT_ID);
+    const onErrorToast = vi.fn();
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={makeStreamItems()}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+            onErrorToast={onErrorToast}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+    const inputId = "topic-inline-reply-input-msg:m-1";
+    const sendId = "topic-inline-reply-send-msg:m-1";
+    fireEvent.click(screen.getByTestId("topic-inline-reply-trigger-msg:m-1"));
+    fireEvent.change(screen.getByTestId(inputId), { target: { value: "Preserve this answer" } });
+    fireEvent.click(screen.getByTestId(sendId));
+    await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("Acknowledgement missing"));
+
+    await act(async () => {
+      useTopicStreamViewStore.getState().setUnreadOnly(agentKey, true);
+    });
+    expect(screen.queryByTestId(inputId)).toBeNull();
+    await act(async () => {
+      useTopicStreamViewStore.getState().setUnreadOnly(agentKey, false);
+    });
+    expect((screen.getByTestId(inputId) as HTMLTextAreaElement).value).toBe("Preserve this answer");
+    fireEvent.click(screen.getByTestId(sendId));
+    await vi.waitFor(() => expect(replyWorkspaceTopic).toHaveBeenCalledTimes(2));
+    expect(replyWorkspaceTopic.mock.calls[1]?.[0]).toMatchObject({
+      topicKey: "msg:m-1",
+      text: "Preserve this answer",
+      clientMessageId: replyWorkspaceTopic.mock.calls[0]?.[0]?.clientMessageId,
+    });
+  });
+
+  it("marks a single card with the observed epoch and omits sequence from a different epoch", async () => {
+    seedSession({ supportsTopicThreads: false, supportsTopicReadState: true });
+    const markWorkspaceTopicRead = vi.fn().mockResolvedValue({ error: null, snapshot: null });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { markWorkspaceTopicRead },
+    } as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(workspaceTopicReadQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      watermarkEpoch: "ep-2",
+      watermarkSeq: 0,
+      watermarkTimestampMs: 0,
+      topics: [],
+      revision: 1,
+    });
+    const oldTopic = makeStreamItems();
+    const currentTopic: StreamItem = {
+      kind: "user_message",
+      id: "new-prompt",
+      messageId: "new-prompt",
+      text: "Current history",
+      timestamp: new Date(3000),
+      timelineCursor: { epoch: "ep-2", seq: 1 },
+    };
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={[...oldTopic, currentTopic]}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId("topic-card-toggle-read-msg:m-1"));
+    expect(markWorkspaceTopicRead).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        topicKey: "msg:m-1",
+        epoch: "ep-2",
+        timestampMs: 2000,
+      }),
+    );
+    expect(markWorkspaceTopicRead.mock.calls[0]?.[0]).not.toHaveProperty("seq");
+  });
+
+  it("resends an unacknowledged retry with the same ID and allocates a new ID after definite refusal", async () => {
+    seedSession({ supportsTopicThreads: true, supportsTopicReadState: false });
+    const replyWorkspaceTopic = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("No acknowledgement"))
+      .mockResolvedValueOnce({ error: "Refused", entry: null })
+      .mockResolvedValueOnce({ error: null, entry: null });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { replyWorkspaceTopic },
+    } as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const entry: TopicThreadEntry = {
+      entryId: "safe-entry",
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      role: "user_followup",
+      topicKey: "msg:m-1",
+      rootMessageId: "m-1",
+      routedAgentId: MAIN_AGENT_ID,
+      text: "[attachment]",
+      status: "error",
+      retryable: true,
+      seq: 1,
+      createdAt: new Date(3000).toISOString(),
+      updatedAt: new Date(3000).toISOString(),
+    };
+    qc.setQueryData(workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), [
+      entry,
+      { ...entry, entryId: "unknown-entry", retryable: false, seq: 2 },
+    ]);
+    const onErrorToast = vi.fn();
+    const list = (
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={makeStreamItems()}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+            onErrorToast={onErrorToast}
+          />
+        </PaneProvider>
+      </QueryClientProvider>
+    );
+    const mounted = render(list);
+    expect(screen.queryByTestId("topic-reply-retry-unknown-entry")).toBeNull();
+    fireEvent.click(screen.getByTestId("topic-reply-retry-safe-entry"));
+    await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("No acknowledgement"));
+    mounted.unmount();
+    render(list);
+    const retry = screen.getByTestId("topic-reply-retry-safe-entry");
+    fireEvent.click(retry);
+    await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("Refused"));
+    fireEvent.click(retry);
+    await vi.waitFor(() => expect(replyWorkspaceTopic).toHaveBeenCalledTimes(3));
+    const [first, resend, newAttempt] = replyWorkspaceTopic.mock.calls.map(([request]) => request);
+    expect(first).toMatchObject({
+      retryOfEntryId: "safe-entry",
+      topicKey: "msg:m-1",
+      text: "[attachment]",
+    });
+    expect(resend.clientMessageId).toBe(first.clientMessageId);
+    expect(newAttempt.clientMessageId).not.toBe(first.clientMessageId);
+  });
+
+  it.each(["partial", "total", "decision"] as const)(
+    "keeps attachments out of an incomplete topic send (%s)",
+    async (failure) => {
+      const replyWorkspaceTopic = vi.fn();
+      const decideWorkspaceTopic = vi.fn();
+      const uploadFile = vi.fn();
+      vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+        connectionStatus: "online",
+        client: { replyWorkspaceTopic, decideWorkspaceTopic, uploadFile },
+      } as never);
+      vi.mocked(encodeImages).mockResolvedValueOnce(
+        failure === "partial" ? [{ data: "AA==", mimeType: "image/png" }] : [],
+      );
+      const attachments = ["first", "second"].map((id) => ({
+        kind: "image" as const,
+        metadata: {
+          id,
+          mimeType: "image/png",
+          fileName: `${id}.png`,
+          storageType: "web-indexeddb" as const,
+          storageKey: id,
+          createdAt: 0,
+        },
+      }));
+      await expect(
+        submitActiveTopicReply({
+          queryClient: new QueryClient(),
+          serverId: SERVER_ID,
+          workspaceId: WORKSPACE_ID,
+          agentId: MAIN_AGENT_ID,
+          activeReplyTopic: {
+            topicKey: "msg:m-1",
+            promptPreview: "First question",
+            routeMode: "auto",
+            ...(failure === "decision"
+              ? {
+                  decisionContext: { kind: "task_blocking_question", question: "Approve?" },
+                }
+              : {}),
+          },
+          payload: { text: failure === "decision" ? "Yes" : "", attachments, cwd: "/repo" },
+          supportsTopicThreads: true,
+          supportsButlerV1: true,
+          supportsForgeAttachments: true,
+          disconnectedMessage: "offline",
+        }),
+      ).rejects.toThrow();
+      expect(uploadFile).not.toHaveBeenCalled();
+      expect(replyWorkspaceTopic).not.toHaveBeenCalled();
+      expect(decideWorkspaceTopic).not.toHaveBeenCalled();
+      if (failure === "decision") vi.mocked(encodeImages).mockReset().mockResolvedValue([]);
+    },
+  );
 
   it("counts attention and cached thread entries in TopicStreamTopBar mark-all-read", () => {
     seedSession({
@@ -953,6 +1181,206 @@ describe("TopicStreamList & read-watermark integration", () => {
     );
   });
 
+  it.each([
+    ["resume_required", null],
+    ["lost_response", "The approval was recorded, but the task changed before follow-up delivery."],
+  ] as const)(
+    "resumes the original approval after the approval closes and a new question appears (%s)",
+    async (firstOutcome, warning) => {
+      seedSession({
+        supportsTopicThreads: true,
+        supportsTopicReadState: false,
+        supportsTaskLedger: true,
+        supportsDurableItems: true,
+        supportsButlerV1: true,
+      });
+      const taskId = "T-resume";
+      const topicKey = `task:${taskId}`;
+      const createdAt = "2026-06-01T00:00:00.000Z";
+      const updatedAt = "2026-06-01T00:01:00.000Z";
+      const approval: WorkspaceDurableItem = {
+        workspaceId: WORKSPACE_ID,
+        requestId: "saved-approval",
+        sourceAgentId: "lead-1",
+        sourceTurnId: "turn-1",
+        kind: "decision",
+        title: "Approve original plan",
+        evidence: [],
+        createdAt,
+        revision: 3,
+        status: "pending",
+        taskId,
+        topicKey,
+        rootMessageId: "m-1",
+      };
+      const approved: WorkspaceDurableItem = {
+        ...approval,
+        revision: 4,
+        status: "decided",
+        decision: "approve",
+        note: "Original conditions",
+        decidedAt: updatedAt,
+      };
+      const task: WorkspaceTaskSummary = {
+        taskId,
+        rootMessageId: "m-1",
+        title: "Approval with a follow-up",
+        tier: "T2",
+        status: "awaiting_decision",
+        participants: [{ agentId: "lead-1" }],
+        leadAgentId: "lead-1",
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const newQuestion: WorkspaceTaskSummary = {
+        ...task,
+        blockingQuestion: "How should we handle the new constraint?",
+        blockingQuestionGeneration: "f5808620-b229-4dd4-9393-f07ce7892f0b",
+        updatedAt,
+      };
+      const first = Promise.withResolvers<WorkspaceTopicDecideResponse["payload"]>();
+      const response = {
+        requestId: "approval-response",
+        workspaceId: WORKSPACE_ID,
+        topicKey,
+        accepted: false,
+        durableItem: approved,
+        task: null,
+        routedTo: "none",
+        targetAgentId: null,
+        entry: null,
+        error: "The approval was saved, but the follow-up needs to be resumed.",
+        errorCode: "topic_decision_resume_required",
+      } satisfies WorkspaceTopicDecideResponse["payload"];
+      const decideWorkspaceTopic = vi
+        .fn()
+        .mockReturnValueOnce(first.promise)
+        .mockResolvedValueOnce({
+          ...response,
+          accepted: warning === null,
+          errorCode: undefined,
+          error: warning,
+          task,
+          entry: {
+            entryId: "recorded-approval",
+            workspaceId: WORKSPACE_ID,
+            mainAgentId: MAIN_AGENT_ID,
+            topicKey,
+            taskId,
+            rootMessageId: "m-1",
+            role: "system_note",
+            routedAgentId: MAIN_AGENT_ID,
+            text: "Approval recorded",
+            status: "completed",
+            seq: 1,
+            createdAt: updatedAt,
+            updatedAt,
+            origin: "decision_reply",
+            durableItemRequestId: approval.requestId,
+            decision: "approve",
+          },
+        } satisfies WorkspaceTopicDecideResponse["payload"]);
+      const listWorkspaceDurableItems = vi.fn().mockResolvedValue({
+        items: [approval],
+        nextCursor: null,
+        error: null,
+      });
+      vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+        connectionStatus: "online",
+        client: { decideWorkspaceTopic, listWorkspaceDurableItems },
+      } as never);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+        workspaceId: WORKSPACE_ID,
+        tasks: [task],
+      });
+      const onErrorToast = vi.fn();
+      const list = (
+        <QueryClientProvider client={qc}>
+          <PaneProvider value={makePaneContextValue()}>
+            <TopicStreamList
+              serverId={SERVER_ID}
+              workspaceId={WORKSPACE_ID}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={makeStreamItems()}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={true}
+              onErrorToast={onErrorToast}
+            />
+          </PaneProvider>
+        </QueryClientProvider>
+      );
+      const mounted = render(list);
+      const approveId = `topic-decision-action-approve-${topicKey}`;
+      const resumeId = `topic-decision-resume-${topicKey}`;
+      const questionInputId = `topic-decision-input-${topicKey}`;
+      fireEvent.change(await screen.findByTestId(`topic-decision-note-input-${topicKey}`), {
+        target: { value: "Original conditions" },
+      });
+      fireEvent.click(screen.getByTestId(approveId));
+      expect(decideWorkspaceTopic).toHaveBeenCalledExactlyOnceWith({
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey,
+        taskId,
+        rootMessageId: "m-1",
+        clientMessageId: expect.any(String),
+        resolutionKind: "durable_item",
+        durableItemRequestId: approval.requestId,
+        expectedRevision: 3,
+        decision: "approve",
+        note: "Original conditions",
+      });
+      const [originalRequest] = decideWorkspaceTopic.mock.calls[0]!;
+
+      listWorkspaceDurableItems.mockResolvedValue({
+        items: [approved],
+        nextCursor: null,
+        error: null,
+      });
+      await act(async () => {
+        if (firstOutcome === "resume_required") first.resolve(response);
+        else {
+          applyDurableItemUpdateToCache(qc, SERVER_ID, {
+            workspaceId: WORKSPACE_ID,
+            item: approved,
+          });
+          first.reject(new Error("Connection closed before a response"));
+        }
+      });
+      expect(screen.queryByTestId(approveId)).toBeNull();
+      expect((screen.getByTestId(resumeId) as HTMLButtonElement).disabled).toBe(false);
+      expect(screen.getByTestId(`topic-decision-resume-feedback-${topicKey}`).textContent).toBe(
+        firstOutcome === "resume_required"
+          ? "topicWorkbench.topicStream.decisionResumeRequired"
+          : "topicWorkbench.topicStream.decisionDeliveryUnconfirmed",
+      );
+
+      mounted.unmount();
+      applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+        workspaceId: WORKSPACE_ID,
+        tasks: [newQuestion],
+      });
+      render(list);
+      const questionInput = screen.getByTestId(questionInputId) as HTMLTextAreaElement;
+      expect(questionInput.value).toBe("");
+      fireEvent.change(questionInput, { target: { value: "Draft for the new question" } });
+      fireEvent.click(screen.getByTestId(resumeId));
+
+      await vi.waitFor(() => expect(screen.queryByTestId(resumeId)).toBeNull());
+      expect(decideWorkspaceTopic.mock.calls).toEqual([[originalRequest], [originalRequest]]);
+      expect(onErrorToast.mock.calls).toEqual(warning === null ? [] : [[warning]]);
+      expect(screen.getByTestId(`topic-decision-question-${topicKey}`).textContent).toBe(
+        newQuestion.blockingQuestion,
+      );
+      expect((screen.getByTestId(questionInputId) as HTMLTextAreaElement).value).toBe(
+        "Draft for the new question",
+      );
+    },
+  );
+
   it("handles stale_blocking_question end-to-end on desktop and compact paths without dropping draft", async () => {
     seedSession({
       supportsTopicThreads: true,
@@ -1134,7 +1562,8 @@ describe("TopicStreamList & read-watermark integration", () => {
       connectionStatus: "online",
       client: { decideWorkspaceTopic },
     } as never);
-    mockDurableItems.items = [
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData<WorkspaceDurableItem[]>(durableItemsQueryKey(SERVER_ID, WORKSPACE_ID), [
       {
         workspaceId: WORKSPACE_ID,
         requestId: "dur-legacy-unbound",
@@ -1147,9 +1576,7 @@ describe("TopicStreamList & read-watermark integration", () => {
         revision: 1,
         status: "pending",
       },
-    ];
-
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    ]);
     applyTopicAnchorToCache(qc, SERVER_ID, {
       workspaceId: WORKSPACE_ID,
       mainAgentId: MAIN_AGENT_ID,
@@ -1415,7 +1842,8 @@ describe("TopicStreamList & read-watermark integration", () => {
       connectionStatus: "online",
       client: { decideWorkspaceTopic },
     } as never);
-    mockDurableItems.items = [
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData<WorkspaceDurableItem[]>(durableItemsQueryKey(SERVER_ID, WORKSPACE_ID), [
       {
         workspaceId: WORKSPACE_ID,
         requestId: "dur-main-unbound",
@@ -1428,9 +1856,7 @@ describe("TopicStreamList & read-watermark integration", () => {
         revision: 1,
         status: "pending",
       },
-    ];
-
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    ]);
     applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
       workspaceId: WORKSPACE_ID,
       tasks: [

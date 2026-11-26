@@ -85,6 +85,47 @@ function snapshot(
 }
 
 describe("coversFinishedAttention", () => {
+  it.each(["topic", "workspace"] as const)(
+    "allows explicit %s time coverage after a sequence mark without consuming a same-time reply from ordinary timestamps",
+    (scope) => {
+      const topic = "msg:request";
+      const input = {
+        epoch,
+        tasks: [],
+        thread: [],
+        rows: [
+          row(1, { type: "user_message", text: "Start", messageId: "request" }, "turn"),
+          row(2, { type: "assistant_message", text: "First reply" }, "turn"),
+          {
+            ...row(3, { type: "assistant_message", text: "Finished" }, "turn"),
+            timestamp: timestamp(2),
+          },
+        ],
+        attentionAt: start + 2,
+        completedTurnId: "turn",
+      };
+      const ordinary = snapshot({ [topic]: 2 }, 2);
+      ordinary.watermarkTimestampMs = start + 100;
+      ordinary.topics[0]!.readUpToTimestampMs = start + 100;
+      expect(coversFinishedAttention({ ...input, snapshot: ordinary })).toBe(false);
+
+      const legacy = structuredClone(ordinary);
+      if (scope === "workspace") legacy.watermarkTimelineTimestampMs = start + 2;
+      else legacy.topics[0]!.readUpToTimelineTimestampMs = start + 2;
+      expect(coversFinishedAttention({ ...input, snapshot: legacy })).toBe(true);
+      expect(coversFinishedAttention({ ...input, epoch: "new-epoch", snapshot: legacy })).toBe(
+        true,
+      );
+      expect(
+        coversFinishedAttention({
+          ...input,
+          epoch: "new-epoch",
+          snapshot: snapshot({ [topic]: 100 }, 100),
+        }),
+      ).toBe(false);
+    },
+  );
+
   it("clears only when both cards cover their own conclusions after A reports during B's turn", () => {
     const input = {
       epoch,

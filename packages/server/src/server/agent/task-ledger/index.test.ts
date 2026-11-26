@@ -504,3 +504,28 @@ describe("renderWorkspaceTaskLedger", () => {
     expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(500);
   });
 });
+
+it("applies a blocked report only once across retries, including after the question was answered", async () => {
+  await store.upsert(workspaceId, { taskId: "release", title: "Release", status: "in_progress" });
+  const report = { status: "awaiting_decision", blockingQuestion: "Who should review?" } as const;
+  const first = await store.syncFromTurnOutcome(workspaceId, "release", report, {
+    reportId: "report-1",
+  });
+  expect(first?.blockingQuestionGeneration).toEqual(expect.any(String));
+  const reopened = new WorkspaceTaskLedgerStore(paseoHome);
+  expect(
+    await reopened.syncFromTurnOutcome(workspaceId, "release", report, { reportId: "report-1" }),
+  ).toEqual(first);
+  const answered = await reopened.syncFromTurnOutcome(workspaceId, "release", {
+    status: "in_progress",
+    blockingQuestion: null,
+  });
+  expect(
+    await store.syncFromTurnOutcome(workspaceId, "release", report, { reportId: "report-1" }),
+  ).toEqual(answered);
+  const newReport = await reopened.syncFromTurnOutcome(workspaceId, "release", report, {
+    reportId: "report-2",
+  });
+  expect(newReport).toMatchObject(report);
+  expect(newReport?.blockingQuestionGeneration).not.toBe(first?.blockingQuestionGeneration);
+});

@@ -1,3 +1,4 @@
+import { deliverQueuedTopicReply } from "@/agent-stream/topic-card/submit-topic-reply";
 import { createHostPluginClientBundleStore } from "@/plugins/client-bundles";
 import { watchdog } from "@/watchdog";
 import { createHostLogger } from "./host-logger";
@@ -2905,9 +2906,22 @@ export class HostRuntimeStore {
           useSessionStore.getState().sessions[serverId]?.queuedMessages.get(queuedAgentId) ?? [],
         write: (update) => useSessionStore.getState().setQueuedMessages(serverId, update),
       },
-      submitMessage: async ({ text, attachments }) => {
+      submitMessage: async ({ text, attachments, topicReply }) => {
         const supportsForgeAttachments =
           useSessionStore.getState().sessions[serverId]?.serverInfo?.features?.forgeSearch === true;
+        if (topicReply) {
+          await deliverQueuedTopicReply({
+            queryClient,
+            serverId,
+            agentId,
+            topicReply,
+            payload: { text, attachments, cwd: "" },
+            supportsTopicThreads: session.serverInfo?.features?.workspaceTopicThreads === true,
+            supportsButlerV1: session.serverInfo?.features?.workspaceButlerV1 === true,
+            supportsForgeAttachments,
+          });
+          return;
+        }
         const agent = useSessionStore.getState().sessions[serverId]?.agents.get(agentId);
         await dispatchComposerAgentMessage({
           client,

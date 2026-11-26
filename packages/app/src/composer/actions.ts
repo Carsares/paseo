@@ -1,3 +1,5 @@
+import { retainAttachmentForGarbageCollection } from "@/attachments/service";
+import type { ActiveTopicReplyTarget } from "@/stores/topic-stream-view-store";
 import {
   composePromptTextWithQuotes,
   hasSlashCommandWithQuotes,
@@ -29,10 +31,17 @@ import type { MessageSubmissionRejectionOutcome } from "@/composer/submission/mo
 import type { PickedImageAttachmentInput } from "@/hooks/image-attachment-picker";
 import { i18n } from "@/i18n/i18next";
 
+export interface QueuedTopicReply {
+  workspaceId: string;
+  target: ActiveTopicReplyTarget;
+  clientMessageId: string;
+}
+
 export interface QueuedComposerMessage {
   id: string;
   text: string;
   attachments: ComposerAttachment[];
+  topicReply?: QueuedTopicReply;
 }
 
 export interface AttachmentPersister {
@@ -265,6 +274,7 @@ export interface QueueComposerMessageInput {
   text: string;
   attachments: ComposerAttachment[];
   queue: QueueWriter;
+  topicReply?: QueuedTopicReply;
 }
 
 export interface QueueComposerMessageResult {
@@ -280,6 +290,7 @@ export function queueComposerMessage(input: QueueComposerMessageInput): QueueCom
     id: generateMessageId(),
     text: trimmed,
     attachments: input.attachments,
+    ...(input.topicReply ? { topicReply: input.topicReply } : {}),
   };
   input.queue.write((prev) => {
     const next = new Map(prev);
@@ -323,7 +334,7 @@ export interface SendQueuedComposerMessageNowInput {
   agentId: string;
   messageId: string;
   queue: QueueWriter;
-  submitMessage: (input: { text: string; attachments: ComposerAttachment[] }) => Promise<void>;
+  submitMessage: (input: Omit<QueuedComposerMessage, "id">) => Promise<void>;
   failedToSendMessage?: string;
 }
 
@@ -337,6 +348,11 @@ export async function sendQueuedComposerMessageNow(
 ): Promise<SendQueuedComposerMessageNowResult> {
   const item = input.queue.read(input.agentId).find((q) => q.id === input.messageId);
   if (!item) return { status: "missing" };
+  const releaseImages = item.topicReply
+    ? splitComposerAttachmentsForSubmit(item.attachments).images.map(({ id }) =>
+        retainAttachmentForGarbageCollection(id),
+      )
+    : [];
   input.queue.write((prev) => {
     const next = new Map(prev);
     next.set(
@@ -346,7 +362,11 @@ export async function sendQueuedComposerMessageNow(
     return next;
   });
   try {
-    await input.submitMessage({ text: item.text, attachments: item.attachments });
+    await input.submitMessage({
+      text: item.text,
+      attachments: item.attachments,
+      ...(item.topicReply ? { topicReply: item.topicReply } : {}),
+    });
     return { status: "submitted" };
   } catch (error) {
     input.queue.write((prev) => {
@@ -361,6 +381,8 @@ export async function sendQueuedComposerMessageNow(
           ? error.message
           : (input.failedToSendMessage ?? i18n.t("composer.errors.failedToSend")),
     };
+  } finally {
+    for (const release of releaseImages) release();
   }
 }
 

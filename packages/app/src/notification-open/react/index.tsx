@@ -12,9 +12,19 @@ import { createNotificationOpenSource } from "../source";
 
 let ready = false;
 const waiters = new Set<() => void>();
+function focusNotificationTopic(serverId: string, agentId: string, topicKey: string) {
+  const store = useTopicStreamViewStore.getState();
+  const agentKey = buildTopicAgentKey(serverId, agentId);
+  store.setViewMode(agentKey, "topics");
+  store.requestScrollToTopic(agentKey, topicKey, true);
+}
+
 const notificationRouter = createNotificationOpenRouter({
   source: createNotificationOpenSource(),
-  openAgent: (target) => navigateToAgent({ ...target, pin: true }),
+  openAgent: ({ serverId, agentId, workspaceId, topicKey }) => {
+    if (topicKey) focusNotificationTopic(serverId, agentId, topicKey);
+    navigateToAgent({ serverId, agentId, workspaceId, pin: true });
+  },
   openTerminal: ({ serverId, workspaceId, terminalId }) =>
     navigateToWorkspace({
       serverId,
@@ -22,12 +32,7 @@ const notificationRouter = createNotificationOpenRouter({
       target: { kind: "terminal", terminalId },
     }),
   openTodoDue: ({ serverId, workspaceId, agentId, topicKey }) => {
-    if (agentId && topicKey) {
-      const store = useTopicStreamViewStore.getState();
-      const agentKey = buildTopicAgentKey(serverId, agentId);
-      store.setViewMode(agentKey, "topics");
-      store.requestScrollToTopic(agentKey, topicKey, true);
-    }
+    if (agentId && topicKey) focusNotificationTopic(serverId, agentId, topicKey);
     if (agentId) {
       navigateToAgent({ serverId, agentId, workspaceId, pin: true });
     } else {

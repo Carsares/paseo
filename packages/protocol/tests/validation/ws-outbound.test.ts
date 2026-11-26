@@ -743,6 +743,7 @@ const SourceSchema = z.object({
               serverId: "server-1",
               workspaceId: "workspace-1",
               agentId: "agent-1",
+              topicKey: "task:one",
               reason: "finished",
             },
           },
@@ -769,6 +770,7 @@ const SourceSchema = z.object({
                 serverId: "server-1",
                 workspaceId: "workspace-1",
                 agentId: "agent-1",
+                topicKey: "task:two",
                 reason: "finished",
               },
             },
@@ -776,7 +778,7 @@ const SourceSchema = z.object({
         },
       },
     },
-  ])("preserves workspaceId in a $name", ({ message }) => {
+  ])("preserves the workspace and topic address in a $name", ({ message }) => {
     const envelope = { type: "session", message };
 
     expect(validateWSOutboundMessage(envelope)).toEqual({

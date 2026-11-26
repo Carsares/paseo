@@ -20,6 +20,7 @@ import { WebSocket, type RawData } from "ws";
 import type { AgentPromptInput } from "./agent/agent-sdk-types.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { ensureAgentLoaded } from "./agent/agent-loading.js";
+import { QueuedPromptLoadError } from "./agent/agent-prompt.js";
 import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
 import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { openDurableItemStore } from "./durable-items/requests.js";
@@ -1336,7 +1337,7 @@ test(
 
     const taskId = "direct-topic-decision";
     const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
-    await ledger.upsert(workspaceId, {
+    const observedTask = await ledger.upsert(workspaceId, {
       taskId,
       title: "Choose a deadline",
       status: "awaiting_decision",
@@ -1353,6 +1354,7 @@ test(
       clientMessageId: randomUUID(),
       resolutionKind: "task_blocking_question",
       note: "Friday",
+      expectedBlockingQuestionGeneration: observedTask.blockingQuestionGeneration,
       dispatchFollowup: false,
     };
     const denied = await request(legacy, decision, "workspace.topic.decide.response");
@@ -1394,7 +1396,7 @@ test(
     await openInteractiveAgent(socket, mainAgentId);
     const manager = daemon.daemon.agentManager;
     const mark = async (messageId: string, turnId: string, reportCallId?: string) => {
-      const { rows } = manager.fetchTimeline(mainAgentId, { limit: 0 });
+      const { rows, epoch } = manager.fetchTimeline(mainAgentId, { limit: 0 });
       const reply = rows.findLast((row) =>
         reportCallId
           ? row.item.type === "tool_call" && row.item.callId === reportCallId
@@ -1409,6 +1411,7 @@ test(
           mainAgentId,
           topicKey: `msg:${messageId}`,
           mode: "read",
+          epoch,
           seq: reply.seqEnd,
           timestampMs: Date.parse(reply.timestamp),
         },
@@ -1461,144 +1464,269 @@ test(
   TEST_TIMEOUT,
 );
 
-test.for([
+const completedReportCases = [
   "sole lead",
   "multiple tracks",
   "new blocker",
+  "existing blocker",
+  "pending acceptance",
+  "unbound follow-up",
+  "bound recovery",
   "interrupted card write",
   "terminal retention during interrupted card write",
   "interruption after the report receipt commits",
-] as const)(
+] as const;
+const wakeupCases = new Set<string>([
+  "multiple tracks",
+  "new blocker",
+  "existing blocker",
+  "pending acceptance",
+  "unbound follow-up",
+]);
+
+async function prepareCompletedReport(
+  scenario: (typeof completedReportCases)[number],
+  context: TestContext,
+) {
+  const multiTrack = scenario === "multiple tracks";
+  const newBlocker = scenario === "new blocker";
+  const existingBlocker = scenario === "existing blocker";
+  const pendingAcceptance = scenario === "pending acceptance";
+  const unbound = scenario === "unbound follow-up";
+  const boundRecovery = scenario === "bound recovery";
+  const needsWakeup = wakeupCases.has(scenario);
+  const childTurnEnd = Promise.withResolvers<void>();
+  context.onTestFinished(() => childTurnEnd.resolve());
+  const push = vi.fn(async () => {});
+  const daemon = await startDaemon(context, {
+    mcpEnabled: true,
+    pushNotificationSender: { send: push },
+    ...(unbound || boundRecovery
+      ? {
+          agentClients: createTestAgentClients({
+            beforeTurnComplete: async (prompt) => {
+              if (typeof prompt === "string" && prompt.includes("Continue the selected work"))
+                await childTurnEnd.promise;
+            },
+          }),
+        }
+      : {}),
+  });
+  const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+    [CLIENT_CAPS.workspaceButlerV1]: true,
+    [CLIENT_CAPS.workspaceTopicThreads]: true,
+  });
+  const config = { provider: "codex" as const, cwd: daemon.staticDir };
+  const topic = await createWorkspace(
+    socket,
+    directoryWorkspace(daemon, {
+      title: "Report progress",
+      topic: { summary: "Report progress" },
+      mainAgent: { config },
+    }),
+  );
+  const mainAgentId = topic.mainAgent?.id;
+  if (!mainAgentId) throw new Error("Expected a Main Control agent");
+  const workspaceId = topic.workspace.id;
+  const taskId = "sole-lead-report";
+  if (needsWakeup) {
+    await openInteractiveAgent(socket, mainAgentId);
+    const started = await request(
+      socket,
+      {
+        type: "send_agent_message_request",
+        agentId: mainAgentId,
+        text: "Coordinate both tracks.",
+        messageId: randomUUID(),
+      },
+      "send_agent_message_response",
+    );
+    expect(started.payload.accepted).toBe(true);
+    await vi.waitFor(() =>
+      expect(daemon.daemon.agentManager.getAgent(mainAgentId)?.lifecycle).toBe("idle"),
+    );
+  }
+  const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+  const child = await daemon.daemon.agentManager.createAgent(config, undefined, {
+    workspaceId,
+    labels: {
+      [PARENT_AGENT_ID_LABEL]: mainAgentId,
+      [PARENT_REPORTING_LABEL]: "explicit",
+      [TASK_ID_LABEL]: taskId,
+    },
+  });
+  const sibling = multiTrack
+    ? await daemon.daemon.agentManager.createAgent(config, undefined, {
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: mainAgentId, [TASK_ID_LABEL]: taskId },
+      })
+    : null;
+  await ledger.upsert(workspaceId, {
+    taskId,
+    title: "Publish the sole lead's report",
+    status: existingBlocker ? "awaiting_decision" : "in_progress",
+    blockingQuestion: existingBlocker ? "Review the existing risk?" : undefined,
+    leadAgentId: child.id,
+    participants: [
+      { agentId: child.id, boundBy: mainAgentId },
+      ...(sibling ? [{ agentId: sibling.id, boundBy: mainAgentId }] : []),
+    ],
+  });
+  if (pendingAcceptance) {
+    const serverId = daemon.daemon.getServerId();
+    const items = openDurableItemStore({
+      paseoHome: daemon.paseoHome,
+      serverId,
+      workspaceRegistry: new FileBackedWorkspaceRegistry(
+        join(daemon.paseoHome, "projects", "workspaces.json"),
+        createTestLogger(),
+      ),
+      agentStorage: daemon.daemon.agentStorage,
+    });
+    await items.create({
+      serverId,
+      workspaceId,
+      requestId: "awaiting-acceptance",
+      sourceAgentId: child.id,
+      sourceTurnId: "acceptance-source",
+      kind: "acceptance",
+      title: "Review output",
+      taskId,
+      topicKey: `task:${taskId}`,
+      evidence: [],
+    });
+  }
+  async function startChildTurn() {
+    const stream = daemon.daemon.agentManager.streamAgent(
+      child.id,
+      "Continue the selected work",
+      boundRecovery ? { recoveryIntent: "automatic" } : undefined,
+    );
+    const completed = (async () => {
+      for await (const event of stream) {
+        if (event.type === "turn_failed") throw new Error("Expected a child turn");
+      }
+    })();
+    context.onTestFinished(async () => {
+      childTurnEnd.resolve();
+      await completed;
+    });
+    await vi.waitFor(() =>
+      expect(daemon.daemon.agentManager.getAgent(child.id)?.activeForegroundTurnId).toBeTruthy(),
+    );
+    expect(daemon.daemon.agentManager.captureTaskReport(child.id)?.explicitlyUnbound === true).toBe(
+      unbound,
+    );
+  }
+  if (unbound || boundRecovery) await startChildTurn();
+  const tools = new Client({ name: "lead", version: "1" });
+  context.onTestFinished(() => tools.close());
+  await tools.connect(
+    new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${child.id}`),
+    ),
+  );
+  const summary = "Sole lead finished the requested work.";
+  const report = (status: "completed" | "blocked" = "completed", text = summary) =>
+    tools.callTool({ name: "report_to_parent", arguments: { status, summary: text } });
+  const manager = daemon.daemon.agentManager;
+  return {
+    daemon,
+    socket,
+    push,
+    mainAgentId,
+    workspaceId,
+    taskId,
+    ledger,
+    sibling,
+    manager,
+    report,
+    summary,
+    needsWakeup,
+    newBlocker,
+    existingBlocker,
+  };
+}
+
+async function expectCompletedReportWakeup(
+  setup: Awaited<ReturnType<typeof prepareCompletedReport>>,
+  context: TestContext,
+) {
+  const {
+    daemon,
+    mainAgentId,
+    workspaceId,
+    taskId,
+    ledger,
+    sibling,
+    manager,
+    report,
+    newBlocker,
+    existingBlocker,
+  } = setup;
+  if (sibling) expect(manager.hasInFlightRun(sibling.id)).toBe(false);
+  if (newBlocker) {
+    const original = WorkspaceTaskLedgerStore.prototype.syncFromTurnOutcome;
+    const beforeCommit = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "syncFromTurnOutcome");
+    context.onTestFinished(() => beforeCommit.mockRestore());
+    beforeCommit.mockImplementationOnce(
+      async function (this: WorkspaceTaskLedgerStore, id, task, patch, coordination) {
+        expect({ id, task }).toEqual({ id: workspaceId, task: taskId });
+        await original.call(this, id, task, {
+          status: "awaiting_decision",
+          blockingQuestion: "Who should review the newly discovered risk?",
+        });
+        return original.call(this, id, task, patch, coordination);
+      },
+    );
+  }
+  expect((await report()).isError).not.toBe(true);
+  await vi.waitFor(
+    async () => {
+      const stored = await daemon.daemon.agentStorage.get(mainAgentId);
+      const timeline = manager.getAgent(mainAgentId)
+        ? manager.getTimeline(mainAgentId)
+        : stored &&
+          (await manager.readStoredTimeline(stored, { limit: 0 })).rows.map(({ item }) => item);
+      expect(timeline).toContainEqual(
+        expect.objectContaining({
+          type: "tool_call",
+          agentMessage: expect.objectContaining({ reportStatus: "completed" }),
+        }),
+      );
+    },
+    { timeout: 8_000 },
+  );
+  let question: string | undefined;
+  if (newBlocker) question = "Who should review the newly discovered risk?";
+  if (existingBlocker) question = "Review the existing risk?";
+  const expected = question
+    ? { taskId, status: "awaiting_decision", blockingQuestion: question }
+    : { taskId, status: "in_progress" };
+  expect(await ledger.list(workspaceId)).toContainEqual(expect.objectContaining(expected));
+}
+
+test.for(completedReportCases)(
   "routes a completed topic report with %s",
   async (scenario, context) => {
-    const multiTrack = scenario === "multiple tracks";
-    const newBlocker = scenario === "new blocker";
+    const setup = await prepareCompletedReport(scenario, context);
+    if (setup.needsWakeup) return expectCompletedReportWakeup(setup, context);
+    const {
+      daemon,
+      socket,
+      push,
+      mainAgentId,
+      workspaceId,
+      taskId,
+      ledger,
+      manager,
+      report,
+      summary,
+    } = setup;
     const terminalChurn = scenario === "terminal retention during interrupted card write";
     const newBlockerAfterCompletion = scenario === "interrupted card write";
     const interruptedCardWrite = terminalChurn || newBlockerAfterCompletion;
     const interruptedAfterReceipt = scenario === "interruption after the report receipt commits";
-    const push = vi.fn(async () => {});
-    const daemon = await startDaemon(context, {
-      mcpEnabled: true,
-      pushNotificationSender: { send: push },
-    });
-    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
-      [CLIENT_CAPS.workspaceButlerV1]: true,
-      [CLIENT_CAPS.workspaceTopicThreads]: true,
-    });
-    const config = { provider: "codex" as const, cwd: daemon.staticDir };
-    const topic = await createWorkspace(
-      socket,
-      directoryWorkspace(daemon, {
-        title: "Report progress",
-        topic: { summary: "Report progress" },
-        mainAgent: { config },
-      }),
-    );
-    const mainAgentId = topic.mainAgent?.id;
-    if (!mainAgentId) throw new Error("Expected a Main Control agent");
-    const workspaceId = topic.workspace.id;
-    const taskId = "sole-lead-report";
-    if (multiTrack || newBlocker) {
-      await openInteractiveAgent(socket, mainAgentId);
-      const started = await request(
-        socket,
-        {
-          type: "send_agent_message_request",
-          agentId: mainAgentId,
-          text: "Coordinate both tracks.",
-          messageId: randomUUID(),
-        },
-        "send_agent_message_response",
-      );
-      expect(started.payload.accepted).toBe(true);
-      await vi.waitFor(() =>
-        expect(daemon.daemon.agentManager.getAgent(mainAgentId)?.lifecycle).toBe("idle"),
-      );
-    }
-    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
-    const child = await daemon.daemon.agentManager.createAgent(config, undefined, {
-      workspaceId,
-      labels: {
-        [PARENT_AGENT_ID_LABEL]: mainAgentId,
-        [PARENT_REPORTING_LABEL]: "explicit",
-        [TASK_ID_LABEL]: taskId,
-      },
-    });
-    const sibling = multiTrack
-      ? await daemon.daemon.agentManager.createAgent(config, undefined, {
-          workspaceId,
-          labels: { [PARENT_AGENT_ID_LABEL]: mainAgentId, [TASK_ID_LABEL]: taskId },
-        })
-      : null;
-    await ledger.upsert(workspaceId, {
-      taskId,
-      title: "Publish the sole lead's report",
-      status: "in_progress",
-      leadAgentId: child.id,
-      participants: [
-        { agentId: child.id, boundBy: mainAgentId },
-        ...(sibling ? [{ agentId: sibling.id, boundBy: mainAgentId }] : []),
-      ],
-    });
-    const tools = new Client({ name: "lead", version: "1" });
-    context.onTestFinished(() => tools.close());
-    await tools.connect(
-      new StreamableHTTPClientTransport(
-        new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${child.id}`),
-      ),
-    );
-    const summary = "Sole lead finished the requested work.";
-    const report = () =>
-      tools.callTool({ name: "report_to_parent", arguments: { status: "completed", summary } });
-    const manager = daemon.daemon.agentManager;
-    if (multiTrack || newBlocker) {
-      if (sibling) expect(manager.hasInFlightRun(sibling.id)).toBe(false);
-      if (newBlocker) {
-        const original = WorkspaceTaskLedgerStore.prototype.syncFromTurnOutcome;
-        const beforeCommit = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "syncFromTurnOutcome");
-        context.onTestFinished(() => beforeCommit.mockRestore());
-        beforeCommit.mockImplementationOnce(
-          async function (this: WorkspaceTaskLedgerStore, id, task, patch) {
-            expect({ id, task }).toEqual({ id: workspaceId, task: taskId });
-            await original.call(this, id, task, {
-              status: "awaiting_decision",
-              blockingQuestion: "Who should review the newly discovered risk?",
-            });
-            return original.call(this, id, task, patch);
-          },
-        );
-      }
-      expect((await report()).isError).not.toBe(true);
-      await vi.waitFor(
-        async () => {
-          const stored = await daemon.daemon.agentStorage.get(mainAgentId);
-          const timeline = manager.getAgent(mainAgentId)
-            ? manager.getTimeline(mainAgentId)
-            : stored &&
-              (await manager.readStoredTimeline(stored, { limit: 0 })).rows.map(({ item }) => item);
-          expect(timeline).toContainEqual(
-            expect.objectContaining({
-              type: "tool_call",
-              agentMessage: expect.objectContaining({ reportStatus: "completed" }),
-            }),
-          );
-        },
-        { timeout: 8_000 },
-      );
-      expect(await ledger.list(workspaceId)).toContainEqual(
-        expect.objectContaining(
-          newBlocker
-            ? {
-                taskId,
-                status: "awaiting_decision",
-                blockingQuestion: "Who should review the newly discovered risk?",
-              }
-            : { taskId, status: "in_progress" },
-        ),
-      );
-      return;
-    }
     if (terminalChurn) {
       const acknowledge = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "acknowledgeSilentReport");
       context.onTestFinished(() => acknowledge.mockRestore());
@@ -1692,6 +1820,7 @@ test.for([
               agentId: mainAgentId,
               workspaceId,
               reason: "finished",
+              topicKey: `task:${taskId}`,
             }),
           }),
         ),
@@ -1728,6 +1857,62 @@ test.for([
       { timeout: 8_000 },
     );
     expect(push).toHaveBeenCalledTimes(1);
+  },
+  TEST_TIMEOUT,
+);
+
+test(
+  "retries delivery of a blocked report without reapplying an answered question",
+  async (context) => {
+    const { ledger, manager, mainAgentId, workspaceId, taskId, report } =
+      await prepareCompletedReport("existing blocker", context);
+    const applied = Promise.withResolvers<string>();
+    const release = Promise.withResolvers<void>();
+    const original = WorkspaceTaskLedgerStore.prototype.syncFromTurnOutcome;
+    const sync = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "syncFromTurnOutcome");
+    context.onTestFinished(() => {
+      release.resolve();
+      sync.mockRestore();
+    });
+    let failed = false;
+    sync.mockImplementation(
+      async function (this: WorkspaceTaskLedgerStore, id, task, patch, coordination) {
+        const updated = await original.call(this, id, task, patch, coordination);
+        if (!failed && coordination?.reportId && updated?.blockingQuestionGeneration) {
+          failed = true;
+          applied.resolve(updated.blockingQuestionGeneration);
+          await release.promise;
+          throw new QueuedPromptLoadError("Main Control could not open before handoff");
+        }
+        return updated;
+      },
+    );
+    const question = "Which rollout should we use?";
+    expect((await report("blocked", question)).isError).not.toBe(true);
+    const generation = await applied.promise;
+    const cleared = await ledger.syncFromTurnOutcome(workspaceId, taskId, {
+      status: "in_progress",
+      blockingQuestion: null,
+    });
+    release.resolve();
+    await vi.waitFor(
+      () =>
+        expect(manager.getTimeline(mainAgentId)).toContainEqual(
+          expect.objectContaining({
+            type: "tool_call",
+            agentMessage: expect.objectContaining({
+              reportStatus: "blocked",
+              text: expect.stringContaining(question),
+            }),
+          }),
+        ),
+      { timeout: 12_000 },
+    );
+    const [saved] = await ledger.list(workspaceId);
+    expect(saved.status).toBe("in_progress");
+    expect(saved.blockingQuestion).toBeUndefined();
+    expect(saved.blockingQuestionGeneration).toBe(cleared?.blockingQuestionGeneration);
+    expect(saved.blockingQuestionGeneration).not.toBe(generation);
   },
   TEST_TIMEOUT,
 );

@@ -240,6 +240,11 @@ const en = {
     confirmSwitch: "Switch provider",
   },
   topicStream: {
+    removeReplyAttachment: "Remove {{name}}",
+    imageEncodingFailed:
+      "Could not read all the attached images. Remove or replace the unavailable images and try again.",
+    decisionAttachmentsUnsupported:
+      "Decision replies can include text and quotes. Remove other attachments to send the decision.",
     modeTopics: "Topic stream",
     modeTimeline: "Full timeline",
     unreadOnly: "Unread only",
@@ -295,6 +300,10 @@ const en = {
     decisionBlockingPlaceholder: "Enter your decision or instructions to continue…",
     decisionCompactPlaceholder: "Write a decision reply…",
     decisionSubmitAndContinue: "Decide & continue",
+    decisionResume: "Resume approval",
+    decisionResumeRequired: "The approval was saved. Resume to finish this request.",
+    decisionDeliveryUnconfirmed:
+      "The host has not confirmed this approval. Retry the original request.",
     decisionEvidenceStale: "Related files have changed. Refresh and review before approving.",
     decisionBlockingQuestionStale:
       "The blocking question has updated. Review the new question before submitting.",
@@ -592,6 +601,9 @@ const zhCN = {
     confirmSwitch: "确认切换",
   },
   topicStream: {
+    removeReplyAttachment: "移除 {{name}}",
+    imageEncodingFailed: "有图片无法读取。请移除或替换无法读取的图片后重试。",
+    decisionAttachmentsUnsupported: "拍板回复支持文字和引用。请移除其他附件后发送。",
     modeTopics: "任务话题流",
     modeTimeline: "完整时间线",
     unreadOnly: "仅看未读",
@@ -646,6 +658,9 @@ const zhCN = {
     decisionBlockingPlaceholder: "输入你的拍板决定或继续执行的指示…",
     decisionCompactPlaceholder: "输入自定义批复意见…",
     decisionSubmitAndContinue: "拍板并继续执行",
+    decisionResume: "续接原审批",
+    decisionResumeRequired: "审批已保存，可续接以完成这次请求。",
+    decisionDeliveryUnconfirmed: "宿主尚未确认这次审批，可重试原请求。",
     decisionEvidenceStale: "关联代码已变更，请刷新核对后再拍板。",
     decisionBlockingQuestionStale: "阻塞问题已更新，请核对新问题后再提交。",
     decisionStandaloneRequiredHint: "此待处理项未绑定具体任务，请前往独立审批入口核对处理。",

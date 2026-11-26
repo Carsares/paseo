@@ -20,9 +20,11 @@ import { defaultHostAppearance } from "@/hosts/appearance";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
+import { queueComposerMessage } from "@/composer/actions";
 import { queryClient } from "@/data/query-client";
 import { checkoutStatusQueryKey } from "@/git/query-keys";
 import {
+  getHostRuntimeStore,
   HostRuntimeController,
   HostRuntimeStore,
   readInitialDaemonConnectionHint,
@@ -4669,6 +4671,60 @@ describe("HostRuntimeStore", () => {
       ).toEqual([]);
     });
     useSessionStore.getState().clearSession(host.serverId);
+  });
+
+  it("automatically drains a bound follow-up through the topic reply RPC", async () => {
+    const serverId = "srv_topic_queue";
+    const agentId = "main";
+    const fakeClient = new FakeDaemonClient();
+    const replyWorkspaceTopic = vi.fn().mockResolvedValue({ error: null, entry: null });
+    const client = Object.assign(fakeClient, { replyWorkspaceTopic }) as unknown as DaemonClient;
+    const runtime = getHostRuntimeStore();
+    const hostSnapshot = vi.spyOn(runtime, "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client,
+    } as never);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(serverId, client, 1);
+    sessionStore.updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: null,
+      features: { workspaceTopicThreads: true },
+    });
+    queueComposerMessage({
+      agentId,
+      text: "Send to A",
+      attachments: [],
+      queue: {
+        read: (id) => useSessionStore.getState().sessions[serverId]?.queuedMessages.get(id) ?? [],
+        write: (update) => useSessionStore.getState().setQueuedMessages(serverId, update),
+      },
+      topicReply: {
+        workspaceId: "workspace",
+        clientMessageId: "queued-a",
+        target: { topicKey: "msg:a", rootMessageId: "a", routeMode: "main", promptPreview: "A" },
+      },
+    });
+    runtime.drainQueuedAgentMessage(serverId, agentId);
+
+    await vi.waitFor(() => {
+      expect(runtime.isDrainingQueuedAgentMessage(serverId, agentId)).toBe(false);
+      expect(replyWorkspaceTopic).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          workspaceId: "workspace",
+          mainAgentId: agentId,
+          topicKey: "msg:a",
+          rootMessageId: "a",
+          clientMessageId: "queued-a",
+          routeMode: "main",
+          text: "Send to A",
+        }),
+      );
+    });
+    expect(fakeClient.sentAgentMessages).toEqual([]);
+    sessionStore.clearSession(serverId);
+    hostSnapshot.mockRestore();
   });
 
   it("drains a queued message as a steer so a turn the agent just started is not interrupted", async () => {

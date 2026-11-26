@@ -1002,6 +1002,7 @@ interface TaskReportAttribution {
   order: number;
   previousTasks?: Promise<ReadonlySet<string>>;
   topicTask?: TopicTaskScope;
+  explicitlyUnbound?: true;
   pending?: PendingForegroundRun;
   touchedFiles: readonly string[];
 }
@@ -1834,6 +1835,10 @@ export class AgentManager {
   private readonly topicTaskRuns = new WeakMap<
     PendingForegroundRun,
     { session: AgentSession; scope: TopicTaskScope }
+  >();
+  private readonly foregroundTaskIntent = new WeakMap<
+    PendingForegroundRun,
+    "unbound" | "binding" | "recovery"
   >();
   private readonly humanPromptRuns = new WeakMap<PendingForegroundRun, AgentSession>();
   private readonly resumedProviderSessions = new WeakSet<AgentSession>();
@@ -8137,6 +8142,8 @@ export class AgentManager {
     const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
     const topicTask = this.topicTaskForForegroundTurn(agent, turnId, true);
     const ownRun = this.taskRunForReport(agentId, agent.session, turnId);
+    const unbound = this.captureUnboundTaskReport(agent, turnId, ownRun, topicTask);
+    if (unbound) return unbound;
     // Queue this read at report invocation. A slow report can only update tasks
     // already bound here, or a new binding that confirmed this very submission.
     const previousTasks =
@@ -8158,6 +8165,29 @@ export class AgentManager {
       pending: ownRun,
       touchedFiles: turnId ? this.getTurnTouchedFiles(agentId, turnId) : [],
     };
+  }
+
+  private captureUnboundTaskReport(
+    agent: ActiveManagedAgent,
+    turnId: string | undefined,
+    ownRun: PendingForegroundRun | undefined,
+    topicTask: TopicTaskScope | undefined,
+  ): TaskReportAttribution | undefined {
+    if (topicTask) return;
+    const foreground = this.runs.getPendingRun(agent.id);
+    const intent =
+      foreground && !foreground.settled ? this.foregroundTaskIntent.get(foreground) : undefined;
+    const explicitlyUnbound = intent === "unbound" || (intent === "binding" && !ownRun);
+    if (explicitlyUnbound) {
+      return {
+        agent: { ...agent },
+        deliveryTurnId: turnId ?? foreground?.token,
+        correlation: { turnId, session: agent.session },
+        order: nextTaskEventOrder(),
+        explicitlyUnbound: true,
+        touchedFiles: [],
+      };
+    }
   }
 
   private topicTaskForForegroundTurn(
@@ -8396,6 +8426,7 @@ export class AgentManager {
       messageId,
       attribution?.order,
     );
+    if (attribution?.explicitlyUnbound) return;
     if (attribution?.topicTask)
       return this.recordScopedTopicReport(agent, event, attribution.topicTask);
     const pending = attribution?.pending;
@@ -9512,6 +9543,10 @@ export class AgentManager {
   ): void {
     const topicTask = options?.[topicFollowup];
     if (topicTask) this.topicTaskRuns.set(pendingRun, { session, scope: topicTask });
+    let intent: "unbound" | "binding" | "recovery" = "unbound";
+    if (options?.recoveryIntent) intent = "recovery";
+    else if (currentTaskDispatchAdmission(options?.clientMessageId)) intent = "binding";
+    this.foregroundTaskIntent.set(pendingRun, intent);
     if (isDirectHumanPrompt(options, promptStart, prompt))
       this.humanPromptRuns.set(pendingRun, session);
   }

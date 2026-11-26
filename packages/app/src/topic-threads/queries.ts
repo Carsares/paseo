@@ -5,6 +5,7 @@ import type {
   TopicBlockingResolutionKind,
   TopicReplyRouteMode,
   TopicThreadEntry,
+  WorkspaceTaskSummary,
   WorkspaceTopicAnchorUpdatedMessage,
   WorkspaceTopicDecideRequest,
   WorkspaceTopicDecideResponse,
@@ -13,7 +14,10 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { useMemo } from "react";
 import { useRetainedPanelActive } from "@/components/retained-panel";
-import { applySingleWorkspaceTaskToCache } from "@/composer/workspace-task-ledger/query";
+import {
+  applySingleWorkspaceTaskToCache,
+  workspaceTasksQueryPrefix,
+} from "@/composer/workspace-task-ledger/query";
 import { useFetchQuery, useReplicaQuery } from "@/data/query";
 import { applyDurableItemUpdateToCache } from "@/durable-items/queries";
 import { useAppVisible } from "@/hooks/use-app-visible";
@@ -305,6 +309,9 @@ export function useWorkspaceTopicEntries(
   };
 }
 
+/** A reply response explicitly declined the request. Transport failures leave its result unknown. */
+export class TopicReplyRejectedError extends Error {}
+
 export async function replyToWorkspaceTopic(input: {
   queryClient: QueryClient;
   serverId: string;
@@ -315,6 +322,7 @@ export async function replyToWorkspaceTopic(input: {
   rootMessageId?: string;
   rootPromptPreview?: string;
   clientMessageId?: string;
+  retryOfEntryId?: string;
   text: string;
   routeMode?: TopicReplyRouteMode;
   attachments?: AgentAttachment[];
@@ -331,14 +339,12 @@ export async function replyToWorkspaceTopic(input: {
     ...(trimmedPreview ? { rootPromptPreview: trimmedPreview } : {}),
     clientMessageId: input.clientMessageId?.trim() || generateMessageId(),
     text: input.text,
+    ...(input.retryOfEntryId ? { retryOfEntryId: input.retryOfEntryId } : {}),
     ...(input.routeMode ? { routeMode: input.routeMode } : {}),
     ...(input.attachments && input.attachments.length > 0
       ? { attachments: input.attachments }
       : {}),
   });
-  if (response.error) {
-    throw new Error(response.error);
-  }
   if (response.entry) {
     applyTopicThreadEntryToCache(input.queryClient, input.serverId, {
       workspaceId: input.workspaceId,
@@ -346,7 +352,35 @@ export async function replyToWorkspaceTopic(input: {
       entry: response.entry,
     });
   }
+  if (response.error) throw new TopicReplyRejectedError(response.error);
   return response;
+}
+
+function applyDurableDecisionTask(
+  queryClient: QueryClient,
+  serverId: string,
+  workspaceId: string,
+  task: WorkspaceTaskSummary,
+) {
+  queryClient.setQueriesData<WorkspaceTaskSummary[]>(
+    { queryKey: workspaceTasksQueryPrefix(serverId, workspaceId) },
+    (previous = []) => {
+      const existing = previous.find((current) => current.taskId === task.taskId);
+      if (!existing) return [...previous, task];
+      const existingUpdatedAt = Date.parse(existing.updatedAt);
+      const responseUpdatedAt = Date.parse(task.updatedAt);
+      // An approval may finish after a task update with a newer blocking question arrives.
+      if (
+        existingUpdatedAt > responseUpdatedAt ||
+        (existingUpdatedAt === responseUpdatedAt &&
+          existing.blockingQuestionGeneration &&
+          existing.blockingQuestionGeneration !== task.blockingQuestionGeneration)
+      ) {
+        return previous;
+      }
+      return previous.map((current) => (current === existing ? task : current));
+    },
+  );
 }
 
 export async function decideWorkspaceTopicOnHost(input: {
@@ -394,12 +428,11 @@ export async function decideWorkspaceTopicOnHost(input: {
     });
   }
   if (response.task) {
-    applySingleWorkspaceTaskToCache(
-      input.queryClient,
-      input.serverId,
-      input.workspaceId,
-      response.task,
-    );
+    const applyTask =
+      input.resolutionKind === "durable_item"
+        ? applyDurableDecisionTask
+        : applySingleWorkspaceTaskToCache;
+    applyTask(input.queryClient, input.serverId, input.workspaceId, response.task);
   }
   if (response.entry) {
     applyTopicThreadEntryToCache(input.queryClient, input.serverId, {

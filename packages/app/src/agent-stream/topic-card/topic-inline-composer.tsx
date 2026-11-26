@@ -1,5 +1,5 @@
 import type { TopicReplyRouteMode } from "@getpaseo/protocol/messages";
-import { MessageSquareReply, Send } from "lucide-react-native";
+import { MessageSquareReply, Paperclip, Send, X } from "lucide-react-native";
 import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
@@ -9,13 +9,64 @@ import { Button } from "@/components/ui/button";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import type { Theme } from "@/styles/theme";
-import { generateMessageId } from "@/types/stream";
+import { persistAttachmentFromBytes } from "@/attachments/service";
+import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
+import type { UserComposerAttachment } from "@/attachments/types";
+import { uploadFileAttachments } from "@/composer/actions";
+import { useFilePicker } from "@/hooks/use-file-picker";
+import { useHostRuntimeClient } from "@/runtime/host-runtime";
+import {
+  buildTopicReplyDraftKey,
+  EMPTY_TOPIC_REPLY_DRAFT,
+  useTopicStreamViewStore,
+} from "@/stores/topic-stream-view-store";
+import { finishTopicSubmission, rememberTopicSubmission } from "./submit-topic-reply";
 
 const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const ThemedReplyIcon = withUnistyles(MessageSquareReply, mutedIconMapping);
+const ThemedPaperclip = withUnistyles(Paperclip, mutedIconMapping);
+const ThemedRemove = withUnistyles(X, mutedIconMapping);
+type InlineReplyAttachment = Extract<UserComposerAttachment, { kind: "image" | "file" }>;
+
+function InlineAttachmentRow({
+  attachment,
+  disabled,
+  onRemove,
+}: {
+  attachment: InlineReplyAttachment;
+  disabled: boolean;
+  onRemove: (attachment: InlineReplyAttachment) => void;
+}) {
+  const { t } = useTranslation();
+  const name =
+    attachment.kind === "image"
+      ? attachment.metadata.fileName || attachment.metadata.id
+      : attachment.attachment.fileName;
+  const handleRemove = useCallback(() => onRemove(attachment), [attachment, onRemove]);
+  return (
+    <View style={styles.editorHeader}>
+      <Text style={styles.targetChip} numberOfLines={1}>
+        {name}
+      </Text>
+      <Button
+        size="sm"
+        variant="ghost"
+        accessibilityLabel={t("topicWorkbench.topicStream.removeReplyAttachment", { name })}
+        disabled={disabled}
+        onPress={handleRemove}
+      >
+        <ThemedRemove size={13} />
+      </Button>
+    </View>
+  );
+}
+
 const ThemedSend = withUnistyles(Send, mutedIconMapping);
 
 export interface TopicInlineComposerProps {
+  agentKey: string;
+  serverId?: string;
+  workspaceId?: string;
   topicKey: string;
   leadTitle?: string;
   hasLeadAgent: boolean;
@@ -25,11 +76,15 @@ export interface TopicInlineComposerProps {
     text: string,
     routeMode: TopicReplyRouteMode,
     clientMessageId: string,
+    attachments?: UserComposerAttachment[],
   ) => Promise<boolean> | boolean;
   onActivateCompactReply: (routeMode: TopicReplyRouteMode) => void;
 }
 
 export const TopicInlineComposer = memo(function TopicInlineComposer({
+  agentKey,
+  serverId,
+  workspaceId,
   topicKey,
   leadTitle,
   hasLeadAgent,
@@ -40,11 +95,24 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const [expanded, setExpanded] = useState(false);
-  const [text, setText] = useState("");
+  const draftKey = buildTopicReplyDraftKey({
+    serverId: serverId ?? "",
+    workspaceId: workspaceId ?? "",
+    agentId: agentKey,
+    topicKey,
+  });
+  const draft = useTopicStreamViewStore(
+    (state) => state.inlineReplyDrafts[draftKey] ?? EMPTY_TOPIC_REPLY_DRAFT,
+  );
+  const updateDraft = useTopicStreamViewStore((state) => state.updateInlineReplyDraft);
+  const { text, routeMode, attachments } = draft;
   const [inputResetKey, setInputResetKey] = useState(0);
-  const [routeMode, setRouteMode] = useState<TopicReplyRouteMode>("auto");
-  const pendingClientMessageIdRef = useRef<string | null>(null);
-  const pendingSubmissionKeyRef = useRef<string | null>(null);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [isPicking, setIsPicking] = useState(false);
+  const submitting = useRef(false);
+  const { pickFiles } = useFilePicker();
+  const client = useHostRuntimeClient(serverId ?? "");
+  const hasContent = text.trim().length > 0 || attachments.length > 0;
 
   const effectiveTargetLabel =
     routeMode === "main" || !hasLeadAgent
@@ -53,22 +121,61 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           name: leadTitle?.trim() || t("topicWorkbench.topicStream.leadFallbackName"),
         });
 
-  const handleChangeText = useCallback((next: string) => {
-    setText(next);
-    if (pendingSubmissionKeyRef.current !== null) {
-      const currentTrimmed = next.trim();
-      if (!pendingSubmissionKeyRef.current.startsWith(`${currentTrimmed}\0`)) {
-        pendingClientMessageIdRef.current = null;
-        pendingSubmissionKeyRef.current = null;
-      }
-    }
-  }, []);
+  const handleChangeText = useCallback(
+    (next: string) => {
+      updateDraft(draftKey, (current) => ({ ...current, text: next }));
+    },
+    [draftKey, updateDraft],
+  );
 
   const toggleRouteMode = useCallback(() => {
-    pendingClientMessageIdRef.current = null;
-    pendingSubmissionKeyRef.current = null;
-    setRouteMode((current) => (current === "main" ? "auto" : "main"));
-  }, []);
+    updateDraft(draftKey, (current) => ({
+      ...current,
+      routeMode: current.routeMode === "main" ? "auto" : "main",
+    }));
+  }, [draftKey, updateDraft]);
+
+  const addAttachments = useCallback(async () => {
+    if (isSubmitting || isPicking) return;
+    setIsPicking(true);
+    setAttachmentError(null);
+    try {
+      const files = await pickFiles();
+      if (!files?.length) return;
+      for (const file of files) {
+        let attachment: UserComposerAttachment;
+        if (file.mimeType.startsWith("image/")) {
+          const bytes = await file.readBytes();
+          if (bytes.byteLength > FILE_UPLOAD_MAX_BYTES) {
+            throw new Error(
+              t("composer.errors.fileTooLarge", { size: "50MB", fileName: file.fileName }),
+            );
+          }
+          const metadata = await persistAttachmentFromBytes({
+            bytes,
+            mimeType: file.mimeType,
+            fileName: file.fileName,
+          });
+          attachment = { kind: "image", metadata };
+        } else {
+          if (!client) throw new Error(t("workspace.terminal.hostDisconnected"));
+          const [uploaded] = await uploadFileAttachments({ client, files: [file] });
+          if (!uploaded) continue;
+          attachment = uploaded;
+        }
+        updateDraft(draftKey, (current) => ({
+          ...current,
+          attachments: [...current.attachments, attachment],
+        }));
+      }
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
+      );
+    } finally {
+      setIsPicking(false);
+    }
+  }, [client, draftKey, isPicking, isSubmitting, pickFiles, t, updateDraft]);
 
   const handleOpenCompact = useCallback(() => {
     onActivateCompactReply(routeMode);
@@ -79,29 +186,59 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   }, []);
 
   const handleSend = useCallback(async () => {
+    if (!hasContent || isSubmitting || isPicking || submitting.current) return;
     const trimmed = text.trim();
-    if (!trimmed || isSubmitting) return;
     const explicitMain = trimmed.startsWith("@主控") || trimmed.startsWith("@main");
     const effectiveMode: TopicReplyRouteMode = explicitMain ? "main" : routeMode;
-    const submissionKey = `${trimmed}\0${effectiveMode}`;
-    if (!pendingClientMessageIdRef.current || pendingSubmissionKeyRef.current !== submissionKey) {
-      pendingClientMessageIdRef.current = generateMessageId();
-      pendingSubmissionKeyRef.current = submissionKey;
-    }
-    const clientMessageId = pendingClientMessageIdRef.current;
-    let succeeded = false;
+    const clientMessageId = rememberTopicSubmission(
+      draftKey,
+      { topicKey, routeMode: effectiveMode, promptPreview: "" },
+      { text: trimmed, attachments, cwd: "" },
+    );
+    submitting.current = true;
     try {
-      succeeded = (await onSubmitDesktopReply(trimmed, effectiveMode, clientMessageId)) === true;
+      const succeeded = await onSubmitDesktopReply(
+        trimmed,
+        effectiveMode,
+        clientMessageId,
+        attachments,
+      );
+      if (succeeded) {
+        finishTopicSubmission(draftKey, clientMessageId);
+        updateDraft(draftKey, (current) =>
+          current === draft ? { ...current, text: "", attachments: [] } : current,
+        );
+        setInputResetKey((key) => key + 1);
+      }
     } catch {
-      succeeded = false;
+      // The submit owner reports the failure. Keep the original draft and submission ID.
+    } finally {
+      submitting.current = false;
     }
-    if (succeeded) {
-      pendingClientMessageIdRef.current = null;
-      pendingSubmissionKeyRef.current = null;
-      setText("");
-      setInputResetKey((k) => k + 1);
-    }
-  }, [isSubmitting, onSubmitDesktopReply, routeMode, text]);
+  }, [
+    attachments,
+    draft,
+    draftKey,
+    hasContent,
+    isPicking,
+    isSubmitting,
+    onSubmitDesktopReply,
+    routeMode,
+    text,
+    topicKey,
+    updateDraft,
+  ]);
+
+  const removeAttachment = useCallback(
+    (attachment: InlineReplyAttachment) => {
+      const keepAttachment = (item: UserComposerAttachment) => item !== attachment;
+      updateDraft(draftKey, (current) => ({
+        ...current,
+        attachments: current.attachments.filter(keepAttachment),
+      }));
+    },
+    [draftKey, updateDraft],
+  );
 
   const handleTriggerSend = useCallback(() => {
     void handleSend();
@@ -126,7 +263,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
     );
   }
 
-  if (!expanded) {
+  if (!expanded && !hasContent) {
     return (
       <View style={styles.collapsedRow}>
         <PressHighlight
@@ -166,9 +303,26 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           </PressHighlight>
         ) : null}
       </View>
+      {attachments.map((attachment) => {
+        if (attachment.kind !== "image" && attachment.kind !== "file") return null;
+        const id = attachment.kind === "image" ? attachment.metadata.id : attachment.attachment.id;
+        return (
+          <InlineAttachmentRow
+            key={id}
+            attachment={attachment}
+            disabled={isSubmitting || isPicking}
+            onRemove={removeAttachment}
+          />
+        );
+      })}
+      {attachmentError ? (
+        <Text accessibilityRole="alert" style={styles.targetChip}>
+          {attachmentError}
+        </Text>
+      ) : null}
       <View style={styles.inputRow}>
         <AdaptiveTextInput
-          initialValue=""
+          initialValue={text}
           resetKey={inputResetKey}
           onChangeText={handleChangeText}
           placeholder={t("topicWorkbench.topicStream.replyPlaceholder")}
@@ -180,8 +334,18 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
         />
         <Button
           size="sm"
+          variant="ghost"
+          accessibilityLabel={t("composer.attachments.addFile")}
+          disabled={isSubmitting || isPicking}
+          onPress={addAttachments}
+          testID={`topic-inline-reply-attach-${topicKey}`}
+        >
+          <ThemedPaperclip size={15} />
+        </Button>
+        <Button
+          size="sm"
           variant="default"
-          disabled={isSubmitting || text.trim().length === 0}
+          disabled={isSubmitting || isPicking || !hasContent}
           onPress={handleTriggerSend}
           testID={`topic-inline-reply-send-${topicKey}`}
         >

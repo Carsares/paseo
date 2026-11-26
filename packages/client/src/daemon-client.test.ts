@@ -518,6 +518,37 @@ describe("workspace topics and todos", () => {
     },
   );
 
+  test("only sends retry IDs after the host advertises retry support", async () => {
+    const older = await connect({ workspaceTopicThreads: true });
+    expect(() =>
+      older.client.replyWorkspaceTopic({ ...reply, retryOfEntryId: "original" }),
+    ).toThrow("Update the host to use workspaceTopicReplyRetry.");
+    expect(older.mock.sent).toHaveLength(0);
+
+    const { client, mock } = await connect({
+      workspaceTopicThreads: true,
+      workspaceTopicReplyRetry: true,
+    });
+    const pending = client.replyWorkspaceTopic({ ...reply, retryOfEntryId: "original" });
+    const sent = parseSentFrame(mock.sent[0]);
+    expect(sent).toMatchObject({
+      ...reply,
+      type: "workspace.topic.reply.request",
+      retryOfEntryId: "original",
+    });
+    const payload = {
+      requestId: sent.requestId,
+      workspaceId,
+      topicKey,
+      routedTo: "main" as const,
+      targetAgentId: mainAgentId,
+      entry: null,
+      error: null,
+    };
+    mock.triggerMessage(wrapSessionMessage({ type: "workspace.topic.reply.response", payload }));
+    await expect(pending).resolves.toEqual(payload);
+  });
+
   test("passes through an older host's list response without anchors", async () => {
     const { client, mock } = await connect({ workspaceTopicThreads: true });
     const pending = client.listWorkspaceTopicEntries(topic);

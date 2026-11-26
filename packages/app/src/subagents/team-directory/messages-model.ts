@@ -1,6 +1,11 @@
 import { getResidentRoleFromLabels, isResidentAgent } from "@getpaseo/protocol/agent-labels";
-import type { WorkspaceDurableItem } from "@getpaseo/protocol/messages";
+import type { WorkspaceDurableItem, WorkspaceTopicReadSnapshot } from "@getpaseo/protocol/messages";
 import { getAgentMessage, resolveAgentSourceStatus } from "@/agent-stream/agent-interactions";
+import {
+  projectTopicUnits,
+  type ProjectTopicUnitsInput,
+  type TopicUnit,
+} from "@/agent-stream/topic-card/model";
 import { startsNewTurn } from "@/agent-stream/turn-membership";
 import type { Agent } from "@/stores/session-store";
 import {
@@ -43,6 +48,7 @@ export interface TeamInboxMessageItem {
   durableItem?: WorkspaceDurableItem;
   canFlushPendingInbox?: boolean;
   readCandidate?: TopicInboxReadCandidate;
+  topicReadTarget?: TeamTopicReadTarget;
   mainConclusionSnapshot?: RetainedMainConclusionSnapshot;
   conclusionAttentionTimestamp?: string;
 }
@@ -52,6 +58,96 @@ export interface TeamDirectoryMessagesProjection {
   read: TeamInboxMessageItem[];
   hasPendingInboxToFlush: boolean;
   markAllSnapshot: MarkAllInboxReadSnapshot;
+  usesHostTopicRead: boolean;
+}
+
+interface TeamTopicReadTarget {
+  topicKey: string;
+  epoch: string | null;
+  seq: number | null;
+  timestampMs: number;
+  isRead: boolean;
+}
+
+export interface TeamTopicReadContext extends Pick<
+  ProjectTopicUnitsInput,
+  "tasks" | "threadEntries" | "topicAnchors"
+> {
+  snapshot: WorkspaceTopicReadSnapshot | null;
+}
+
+function topicRootAliases(topic: TopicUnit): Set<string> {
+  return new Set(
+    [
+      topic.rootItemId,
+      topic.rootMessageId,
+      topic.rootPrompt.item?.clientMessageId,
+      topic.rootPrompt.item?.messageId,
+    ].filter((id): id is string => Boolean(id)),
+  );
+}
+
+function indexHostTopicReadTargets(
+  context: TeamTopicReadContext,
+  workspaceId: string,
+  mainAgentId: string,
+  items: readonly StreamItem[],
+): ReadonlyMap<string, TeamTopicReadTarget> {
+  const { snapshot, tasks, threadEntries, topicAnchors } = context;
+  const scopedSnapshot =
+    snapshot?.workspaceId === workspaceId && snapshot.mainAgentId === mainAgentId ? snapshot : null;
+  const { topics } = projectTopicUnits({
+    items,
+    tasks,
+    threadEntries: threadEntries?.filter(
+      (entry) => entry.workspaceId === workspaceId && entry.mainAgentId === mainAgentId,
+    ),
+    topicAnchors: topicAnchors?.filter(
+      (anchor) => anchor.workspaceId === workspaceId && anchor.mainAgentId === mainAgentId,
+    ),
+    readSnapshot: scopedSnapshot,
+  });
+  const aliasesByTopic = new Map(topics.map((topic) => [topic.topicKey, topicRootAliases(topic)]));
+  const countsByAlias = new Map<string, number>();
+  for (const aliases of aliasesByTopic.values()) {
+    for (const alias of aliases) countsByAlias.set(alias, (countsByAlias.get(alias) ?? 0) + 1);
+  }
+  const targets = new Map<string, TeamTopicReadTarget>();
+  for (const topic of topics) {
+    for (const reply of topic.replies) {
+      const target = {
+        topicKey: topic.topicKey,
+        epoch: reply.kind === "thread_entry" ? null : reply.epoch,
+        seq: reply.seq,
+        timestampMs: reply.timestampMs,
+        isRead: Boolean(scopedSnapshot && !reply.isUnread),
+      };
+      if (reply.kind === "thread_entry") {
+        if (reply.entry.role !== "user_followup" && reply.entry.sourceMessageId) {
+          targets.set(`mirror:${reply.entry.sourceMessageId}`, target);
+        }
+      } else if (
+        reply.kind === "subagent_report"
+          ? canReadBoundReport(reply, topic, aliasesByTopic.get(topic.topicKey), countsByAlias)
+          : Boolean(topic.rootPrompt.item || topic.taskId || topic.rootPrompt.text)
+      ) {
+        targets.set(`row:${reply.id}`, target);
+      }
+    }
+  }
+  return targets;
+}
+
+function canReadBoundReport(
+  report: Extract<TopicUnit["replies"][number], { kind: "subagent_report" }>,
+  topic: TopicUnit,
+  rootAliases: ReadonlySet<string> | undefined,
+  countsByAlias: ReadonlyMap<string, number>,
+): boolean {
+  if (report.status === "permission-required") return false;
+  if (report.rootMessageId && !rootAliases?.has(report.rootMessageId)) return false;
+  if (report.taskId) return report.taskId === topic.taskId;
+  return Boolean(report.rootMessageId && countsByAlias.get(report.rootMessageId) === 1);
 }
 
 type InboxSourceAgent = Pick<
@@ -300,15 +396,44 @@ function recordStreamWatermark(
   }
 }
 
+function findTopicReadTarget(
+  targets: ReadonlyMap<string, TeamTopicReadTarget> | undefined,
+  item: StreamItem,
+): TeamTopicReadTarget | undefined {
+  return targets?.get(`row:${item.id}`) ?? targets?.get(`mirror:${getStreamItemMessageId(item)}`);
+}
+
+function buildReportReadState(
+  acc: InboxAggregationAccumulator,
+  item: StreamItem,
+  status: ReturnType<typeof resolveAgentSourceStatus>,
+  readScope: TopicInboxReadScope | undefined,
+  topicTargets: ReadonlyMap<string, TeamTopicReadTarget> | undefined,
+) {
+  if (status === "permission-required") return { isRead: false };
+  const topicReadTarget = findTopicReadTarget(topicTargets, item);
+  const { epoch = null, seq = null } = item.timelineCursor ?? {};
+  const timestampMs = item.timestamp.getTime();
+  if (!topicReadTarget) recordStreamWatermark(acc, epoch, seq, timestampMs);
+  const readCandidate = { id: `msg:${item.id}`, epoch, seq, timestampMs };
+  return {
+    readCandidate,
+    topicReadTarget,
+    isRead: topicReadTarget?.isRead ?? isTopicInboxItemRead(readScope, readCandidate),
+  };
+}
+
 function collectTimelineReportMessages(input: {
   acc: InboxAggregationAccumulator;
   mainAgentId: string | null;
   combinedStream: readonly StreamItem[];
   agents: ReadonlyMap<string, InboxSourceAgent> | undefined;
   readScope: TopicInboxReadScope | undefined;
+  topicTargets: ReadonlyMap<string, TeamTopicReadTarget> | undefined;
   fallbackAgentTitle: string;
 }): void {
-  const { acc, mainAgentId, combinedStream, agents, readScope, fallbackAgentTitle } = input;
+  const { acc, mainAgentId, combinedStream, agents, readScope, topicTargets, fallbackAgentTitle } =
+    input;
   if (!mainAgentId) return;
 
   const seenStreamIds = new Set<string>();
@@ -322,14 +447,10 @@ function collectTimelineReportMessages(input: {
     const preview = cleanMessagePreview(agentMessage.text);
     if (status === "closed" && !preview) continue;
 
-    const epoch = streamItem.timelineCursor?.epoch ?? null;
-    const seq = streamItem.timelineCursor?.seq ?? null;
-    const timestampMs = streamItem.timestamp.getTime();
-    recordStreamWatermark(acc, epoch, seq, timestampMs);
-
+    const { epoch = null, seq = null } = streamItem.timelineCursor ?? {};
     const candidateId = `msg:${streamItem.id}`;
-    const readCandidate: TopicInboxReadCandidate = { id: candidateId, epoch, seq, timestampMs };
-    const isRead = isTopicInboxItemRead(readScope, readCandidate);
+    const readState = buildReportReadState(acc, streamItem, status, readScope, topicTargets);
+    const { isRead } = readState;
     const senderTitle = resolveAgentDisplayName(
       agents?.get(agentMessage.sender.id),
       agentMessage.sender.title?.trim() || fallbackAgentTitle,
@@ -339,9 +460,9 @@ function collectTimelineReportMessages(input: {
     const entry: TeamInboxMessageItem = {
       id: candidateId,
       kind: "subagent_report",
-      isRead,
+      ...readState,
       urgencyRank,
-      timestampMs,
+      timestampMs: streamItem.timestamp.getTime(),
       senderTitle,
       tagI18nKey,
       tone,
@@ -354,14 +475,13 @@ function collectTimelineReportMessages(input: {
         epoch,
         seq,
       },
-      readCandidate,
     };
 
     if (isRead) {
       acc.read.push(entry);
     } else {
       acc.unread.push(entry);
-      acc.markableUnreadIds.push(candidateId);
+      if (entry.readCandidate) acc.markableUnreadIds.push(candidateId);
     }
   }
 }
@@ -603,6 +723,7 @@ function collectMainConclusionMessage(input: {
   mainTimelineHasNewer: boolean;
   isMainTimelineStale: boolean;
   readScope: TopicInboxReadScope | undefined;
+  topicTargets: ReadonlyMap<string, TeamTopicReadTarget> | undefined;
   fallbackAgentTitle: string;
 }): void {
   const {
@@ -612,6 +733,7 @@ function collectMainConclusionMessage(input: {
     mainTimelineHasNewer,
     isMainTimelineStale,
     readScope,
+    topicTargets,
     fallbackAgentTitle,
   } = input;
   if (!mainAgent || mainAgent.archivedAt || isAgentActivelyBusy(mainAgent)) return;
@@ -646,14 +768,48 @@ function collectMainConclusionMessage(input: {
     return;
   }
 
+  appendLiveMainConclusion({
+    acc,
+    mainAgent,
+    hasUnreadAttention,
+    attentionTs,
+    turnSlice,
+    isError,
+    readScope,
+    topicTargets,
+    fallbackAgentTitle,
+  });
+}
+
+function appendLiveMainConclusion(input: {
+  acc: InboxAggregationAccumulator;
+  mainAgent: InboxSourceAgent;
+  hasUnreadAttention: boolean;
+  attentionTs: number;
+  turnSlice: LatestTurnSlice;
+  isError: boolean;
+  readScope: TopicInboxReadScope | undefined;
+  topicTargets: ReadonlyMap<string, TeamTopicReadTarget> | undefined;
+  fallbackAgentTitle: string;
+}): void {
+  const {
+    acc,
+    mainAgent,
+    hasUnreadAttention,
+    attentionTs,
+    turnSlice,
+    isError,
+    readScope,
+    topicTargets,
+    fallbackAgentTitle,
+  } = input;
   const { conclusionId, conclusionTs, epoch, seq, readCandidate } =
     buildLiveMainConclusionCandidate(mainAgent, hasUnreadAttention, attentionTs, turnSlice);
-  const isRead = isLiveMainConclusionRead(
-    hasUnreadAttention,
-    readScope,
-    readCandidate,
-    conclusionTs,
-  );
+  const assistant = turnSlice.latestAssistant;
+  const topicReadTarget = assistant ? findTopicReadTarget(topicTargets, assistant) : undefined;
+  const isRead =
+    topicReadTarget?.isRead ??
+    isLiveMainConclusionRead(hasUnreadAttention, readScope, readCandidate, conclusionTs);
   const senderTitle = resolveAgentDisplayName(mainAgent, fallbackAgentTitle);
   const preview = buildMainConclusionPreview(
     mainAgent,
@@ -678,7 +834,7 @@ function collectMainConclusionMessage(input: {
   };
 
   if (!isRead) {
-    recordStreamWatermark(acc, epoch, seq, conclusionTs);
+    if (!topicReadTarget) recordStreamWatermark(acc, epoch, seq, conclusionTs);
     acc.markableUnreadIds.push(conclusionId);
     acc.unreadMainConclusion = mainConclusionSnapshot;
   }
@@ -698,6 +854,7 @@ function collectMainConclusionMessage(input: {
     targetAgentId: mainAgent.id,
     jumpTarget,
     readCandidate,
+    topicReadTarget,
     mainConclusionSnapshot,
     conclusionAttentionTimestamp: isRead ? undefined : mainAgent.attentionTimestamp?.toISOString(),
   };
@@ -734,6 +891,7 @@ export function selectTeamDirectoryMessages(input: {
   currentMainEpoch?: string | null;
   durableItems?: readonly WorkspaceDurableItem[];
   readScope: TopicInboxReadScope | undefined;
+  topicRead?: TeamTopicReadContext;
   fallbackAgentTitle: string;
 }): TeamDirectoryMessagesProjection {
   const {
@@ -747,12 +905,17 @@ export function selectTeamDirectoryMessages(input: {
     currentMainEpoch = null,
     durableItems = [],
     readScope,
+    topicRead,
     fallbackAgentTitle,
   } = input;
 
   const mainAgent = mainAgentId ? agents?.get(mainAgentId) : undefined;
   const pendingInboxItems = mainAgent?.pendingSubagentInbox?.items ?? [];
   const combinedStream = [...mainStreamTail, ...mainStreamHead];
+  const topicTargets =
+    topicRead && mainAgentId
+      ? indexHostTopicReadTargets(topicRead, workspaceId, mainAgentId, combinedStream)
+      : undefined;
   const acc: InboxAggregationAccumulator = {
     unread: [],
     read: [],
@@ -779,6 +942,7 @@ export function selectTeamDirectoryMessages(input: {
     combinedStream,
     agents,
     readScope,
+    topicTargets,
     fallbackAgentTitle,
   });
   collectMainConclusionMessage({
@@ -788,6 +952,7 @@ export function selectTeamDirectoryMessages(input: {
     mainTimelineHasNewer,
     isMainTimelineStale,
     readScope,
+    topicTargets,
     fallbackAgentTitle,
   });
 
@@ -798,6 +963,7 @@ export function selectTeamDirectoryMessages(input: {
     unread: acc.unread,
     read: acc.read,
     hasPendingInboxToFlush: Boolean(mainAgentId && pendingInboxItems.length > 0),
+    usesHostTopicRead: Boolean(topicTargets),
     markAllSnapshot: {
       epoch: acc.targetEpoch,
       maxSeq: acc.maxSeq,

@@ -1,3 +1,4 @@
+import { useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -204,6 +205,11 @@ async function runAttachmentGc(): Promise<void> {
   const referencedIds = new Set<string>();
   for (const id of useDraftStore.getState().collectActiveAttachmentIds()) {
     referencedIds.add(id);
+  }
+  for (const draft of Object.values(useTopicStreamViewStore.getState().inlineReplyDrafts)) {
+    for (const attachment of draft.attachments) {
+      if (attachment.kind === "image") referencedIds.add(attachment.metadata.id);
+    }
   }
   for (const id of collectRetainedAttachmentIds()) {
     referencedIds.add(id);

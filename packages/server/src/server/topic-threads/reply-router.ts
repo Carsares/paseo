@@ -35,7 +35,13 @@ import type {
 } from "../agent/task-ledger/index.js";
 import { isLocalTaskChild } from "../agent/task-ledger/reuse.js";
 import { checkTopicAddress, requireMatchingAnchor, topicAnchorInput } from "./anchors.js";
-import type { TopicAgentReply, TopicThreadStore } from "./store.js";
+import {
+  canDeliverDurableDecision,
+  type StoredTopicDecision,
+  type TopicAgentReply,
+  type TopicDelivery,
+  type TopicThreadStore,
+} from "./store.js";
 
 type ReplyPayload = WorkspaceTopicReplyResponse["payload"];
 type Route = Required<Pick<ReplyPayload, "routedTo" | "fallbackReason">> & {
@@ -76,6 +82,12 @@ class TopicRouteChangedError extends TopicLeadUnavailableError {
 
 export class TopicDecisionError extends Error {}
 
+export class SupersededDurableDecisionError extends TopicDecisionError {
+  constructor() {
+    super("The task changed since this topic decision was recorded.");
+  }
+}
+
 export interface TopicDecisionGuard {
   commit: <T>(write: () => Promise<T>) => Promise<T>;
   assertCurrent?: () => void;
@@ -94,7 +106,8 @@ export interface TopicDecisionDispatch {
 interface RouterDependencies {
   serverId: string;
   store: TopicThreadStore;
-  taskLedger: Pick<WorkspaceTaskLedgerStore, "list" | "syncFromTurnOutcome">;
+  taskLedger: Pick<WorkspaceTaskLedgerStore, "list" | "syncFromTurnOutcome"> &
+    Partial<Pick<WorkspaceTaskLedgerStore, "withTaskSnapshot">>;
   readAgent: (agentId: string) => Promise<TopicAgent | null>;
   dispatch: DispatchTopicPrompt;
   /** The WebSocket owner filters this event by capability and workspace access. */
@@ -247,6 +260,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     route: Route,
     humanInitiated: boolean,
     decision?: TopicDecisionDispatch,
+    originalTaskCreatedAt?: string,
   ) {
     const { workspaceId, entryId, taskId, rootMessageId } = entry;
     let failedLeadId: string | undefined;
@@ -263,6 +277,8 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         ? tasks.find((item) => item.taskId === taskId)
         : tasks.findLast((item) => item.rootMessageId === rootMessageId);
       requireReplyTask(task, rootMessageId, decision);
+      if (originalTaskCreatedAt && task?.createdAt !== originalTaskCreatedAt)
+        throw new Error("The original task for this reply is unavailable.");
       return task;
     };
     const readRoute = async () => {
@@ -311,6 +327,17 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         },
         onHandoff: async (pending) => {
           submittedTask = pending ? await readTask() : undefined;
+          if (pending && decision?.durableItemRequestId && taskLedger.withTaskSnapshot) {
+            // Keep the last version check and the handoff marker ordered with task writes.
+            await taskLedger.withTaskSnapshot(workspaceId, async (tasks) => {
+              decision.guard?.validateTask(tasks);
+              const delivery = await store.getDelivery(entry, { entryId });
+              if (delivery?.decision?.followupSuperseded)
+                throw new SupersededDurableDecisionError();
+              await store.setHandoffPending(workspaceId, entryId, true);
+            });
+            return;
+          }
           await store.setHandoffPending(workspaceId, entryId, pending);
         },
         onStarted: async () => {
@@ -346,7 +373,9 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     } catch (error) {
       if (shutdown.signal.aborted) return;
       logger.warn({ err: error, entryId }, "Could not deliver topic follow-up");
-      for (const update of await store.update(workspaceId, entryId, "error")) publish(update);
+      const suppressed = error instanceof SupersededDurableDecisionError;
+      for (const update of await store.update(workspaceId, entryId, "error", undefined, suppressed))
+        publish(update);
       return;
     }
     for (const update of await store.update(workspaceId, entryId, "completed", outcome?.reply))
@@ -413,6 +442,144 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     return { anchor, changed: true };
   }
 
+  function resumeDecision(
+    workspaceId: string,
+    record: StoredTopicDecision,
+    entry: TopicThreadEntry,
+    delivery: TopicDelivery,
+  ): TopicDecisionDispatch {
+    const versioned =
+      record.input.expectedBlockingQuestionGeneration !== undefined ||
+      record.input.resolutionKind === "task_blocking_question";
+    const validateTask: TopicDecisionGuard["validateTask"] = (items) => {
+      const current = items.find((item) => item.taskId === record.taskId);
+      if (
+        record.input.resolutionKind === "durable_item" &&
+        !canDeliverDurableDecision(record, current)
+      )
+        throw new SupersededDurableDecisionError();
+      if (
+        !record.task ||
+        current?.createdAt !== record.taskCreatedAt ||
+        current.rootMessageId !== record.rootMessageId ||
+        current.status === "canceled" ||
+        current.status === "deferred" ||
+        (versioned &&
+          (current.blockingQuestion || current.blockingQuestionGeneration !== record.operationId))
+      )
+        throw new Error("The task changed since this topic decision was recorded.");
+    };
+    const ledger = taskLedger.withTaskSnapshot?.bind(taskLedger);
+    if (!delivery.decisionPrompt || !ledger)
+      throw new Error("The original decision cannot be safely delivered.");
+    return {
+      origin: record.origin,
+      decision: entry.decision,
+      durableItemRequestId: entry.durableItemRequestId,
+      taskCreatedAt: record.taskCreatedAt,
+      promptText: delivery.decisionPrompt,
+      guard: {
+        validateTask,
+        commit: (write) =>
+          ledger(workspaceId, async (items) => {
+            validateTask(items);
+            return write();
+          }),
+      },
+    };
+  }
+
+  type ReplyAddress = Awaited<ReturnType<typeof resolveReplyAddress>>["address"];
+  type SavedDelivery = Awaited<ReturnType<TopicThreadStore["getDelivery"]>>;
+
+  async function readRetryDelivery(
+    source: SavedDelivery,
+    retryOfEntryId: string,
+    topicKey: string,
+    address: ReplyAddress,
+    tasks: readonly WorkspaceTask[],
+  ) {
+    if (source) return source;
+    if (
+      topicKey.startsWith("msg:") &&
+      tasks.filter((item) => item.rootMessageId === address.rootMessageId).length === 1
+    )
+      return store.getDelivery(address, { entryId: retryOfEntryId });
+  }
+
+  function verifyDelivery(
+    request: WorkspaceTopicReplyRequest,
+    decision: TopicDecisionDispatch | undefined,
+    retryOfEntryId: string | undefined,
+    previous: TopicThreadEntry,
+    stored: TopicDelivery,
+    task: WorkspaceTask | undefined,
+    address: ReplyAddress,
+  ) {
+    if (
+      (!retryOfEntryId &&
+        (previous.text !== request.text ||
+          (previous.origin ?? "topic_reply") !== (decision?.origin ?? "topic_reply"))) ||
+      (stored.taskCreatedAt && task?.createdAt !== stored.taskCreatedAt) ||
+      previous.taskId !== address.taskId ||
+      previous.rootMessageId !== address.rootMessageId
+    )
+      throw new Error("The reply no longer belongs to this topic operation.");
+  }
+
+  async function prepareDelivery(
+    request: WorkspaceTopicReplyRequest,
+    decision?: TopicDecisionDispatch,
+  ) {
+    const { requestId, workspaceId, topicKey } = request;
+    // COMPAT(topicReplyLegacyRetry): v0.18.0 clients used a deterministic retry:<entryId> ID.
+    // Remove after the client floor sends retryOfEntryId.
+    const legacyRetry = /^retry:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i;
+    const retryOfEntryId = request.retryOfEntryId ?? legacyRetry.exec(request.clientMessageId)?.[1];
+    let retrySource: Awaited<ReturnType<TopicThreadStore["getDelivery"]>>;
+    if (retryOfEntryId) {
+      if (decision) throw new Error("A repeat delivery requires an existing topic follow-up.");
+      retrySource = await store.getDelivery(request, { entryId: retryOfEntryId });
+      // Only the requested thread address and the attempt ID come from the retry request.
+      request = {
+        type: request.type,
+        requestId,
+        workspaceId,
+        topicKey,
+        mainAgentId: request.mainAgentId,
+        clientMessageId: request.clientMessageId,
+        text: "",
+        taskId: retrySource?.entry.taskId,
+        rootMessageId: retrySource?.entry.rootMessageId,
+      };
+    }
+    const { address, task, tasks } = await resolveReplyAddress(request, decision);
+    const replay = retryOfEntryId
+      ? await readRetryDelivery(retrySource, retryOfEntryId, topicKey, address, tasks)
+      : await store.getDelivery(address, { sourceMessageId: request.clientMessageId });
+    if (retryOfEntryId && !replay) throw new Error("The original topic follow-up is unavailable.");
+    if (replay) {
+      const { entry: previous, delivery: stored, decision: record } = replay;
+      verifyDelivery(request, decision, retryOfEntryId, previous, stored, task, address);
+      request = {
+        ...request,
+        text: previous.text,
+        attachments: stored.attachments,
+        routeMode: stored.routeMode,
+      };
+      if (retryOfEntryId && record)
+        decision = resumeDecision(workspaceId, record, previous, stored);
+    }
+    if (!request.text.trim()) throw new Error("Topic follow-up text is required.");
+    const delivery = replay?.delivery ?? {
+      routeMode: request.routeMode,
+      attachments: request.attachments,
+      decisionPrompt: decision?.promptText,
+      taskCreatedAt: task?.createdAt,
+    };
+    return { request, decision, delivery, address, task, tasks, retryOfEntryId };
+  }
+
   return {
     requireMain,
     async list(
@@ -440,6 +607,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       humanInitiated = false,
     ): Promise<WorkspaceTopicReplyResponse> {
       const { requestId, workspaceId, topicKey } = request;
+      const structured = decision !== undefined;
       const respond = (
         result: Omit<ReplyPayload, "requestId" | "workspaceId" | "topicKey">,
       ): WorkspaceTopicReplyResponse => ({
@@ -449,8 +617,17 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       try {
         shutdown.signal.throwIfAborted();
         await requireMain(request);
-        if (!request.text.trim()) throw new Error("Topic follow-up text is required.");
-        const { address, task, tasks } = await resolveReplyAddress(request, decision);
+        const {
+          request: preparedRequest,
+          decision: preparedDecision,
+          delivery,
+          address,
+          task,
+          tasks,
+          retryOfEntryId,
+        } = await prepareDelivery(request, decision);
+        request = preparedRequest;
+        decision = preparedDecision;
         const route = await selectRoute(request, task, deps);
         const write = async () => {
           const anchorWrite = await ensureReplyAnchor(
@@ -473,15 +650,25 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
             },
             deps.dispatch.wasAccepted,
             decision?.guard?.assertCurrent,
+            delivery,
+            retryOfEntryId,
           );
           return { ...result, anchorWrite };
         };
-        const { entry, changed, release, anchorWrite } = await (decision?.guard
+        const { entry, changed, release, anchorWrite, sourceUpdate } = await (decision?.guard
           ? decision.guard.commit(write)
           : write());
+        if (sourceUpdate) publish(sourceUpdate);
         if (changed || anchorWrite.changed) publish(entry, anchorWrite.anchor);
         if (release) {
-          const work = dispatch(request, entry, route, humanInitiated, decision).catch((error) => {
+          const work = dispatch(
+            request,
+            entry,
+            route,
+            humanInitiated,
+            decision,
+            delivery.taskCreatedAt,
+          ).catch((error) => {
             logger.warn({ err: error, entryId: entry.entryId }, "Could not persist topic result");
           });
           inFlight.add(work);
@@ -501,7 +688,14 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           error: null,
         });
       } catch (error) {
-        if (error instanceof TopicDecisionError) throw error;
+        if (error instanceof TopicDecisionError && structured) throw error;
+        if (error instanceof SupersededDurableDecisionError)
+          return respond({
+            routedTo: "main",
+            targetAgentId: null,
+            entry: null,
+            error: error.message,
+          });
         logger.warn({ err: error, workspaceId }, "Could not queue topic reply");
         return respond({
           routedTo: "main",

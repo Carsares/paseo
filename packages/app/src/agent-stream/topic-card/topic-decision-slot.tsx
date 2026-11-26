@@ -27,8 +27,11 @@ import { useActiveWorkspaceSheetOpener } from "@/screens/workspace/sheet-pane/ac
 import type { WorkspaceSheetPage } from "@/screens/workspace/sheet-pane/stack";
 import { useWorkspaceSheetPages } from "@/screens/workspace/sheet-pane/stack-context";
 import {
+  buildDurableDecisionDraftKey,
+  buildDurableDecisionKey,
   buildTopicDisclosureKey,
   useTopicStreamViewStore,
+  type DurableDecisionIntent,
   type TopicDecisionDraftMeta,
 } from "@/stores/topic-stream-view-store";
 import type { Theme } from "@/styles/theme";
@@ -62,7 +65,8 @@ export interface TopicDecisionSubmitInput {
 }
 
 export type TopicDecisionSubmitResult =
-  | { outcome: "saved" }
+  | { outcome: "saved"; message?: string }
+  | { outcome: "resumeRequired"; message?: string }
   | { outcome: "evidenceStale"; message?: string }
   | {
       outcome: "staleBlockingQuestion";
@@ -82,6 +86,7 @@ export interface TopicDecisionSlotProps {
   supportsButlerV1?: boolean;
   durableItemsOnline?: boolean;
   durableItemsConfirmed?: boolean;
+  hasPendingDurableDecision?: boolean;
   onRefreshDurableItems?: () => void;
   onOpenStandaloneDurableItem?: (item: WorkspaceDurableItem) => void;
   onSubmitDecision?: (input: TopicDecisionSubmitInput) => Promise<TopicDecisionSubmitResult>;
@@ -91,6 +96,50 @@ export interface TopicDecisionSlotProps {
     blockingQuestionGeneration?: string,
   ) => void;
 }
+
+export const TopicDecisionResume = memo(function TopicDecisionResume({
+  intent,
+  online,
+  onResume,
+}: {
+  intent: DurableDecisionIntent;
+  online: boolean;
+  onResume: (topicKey: string) => void;
+}) {
+  const { t } = useTranslation();
+  const { topicKey } = intent.request;
+  const sending = intent.status === "sending";
+  const handlePress = useCallback(() => onResume(topicKey), [onResume, topicKey]);
+  const feedback =
+    intent.status === "resumeRequired"
+      ? t("topicWorkbench.topicStream.decisionResumeRequired")
+      : t("topicWorkbench.topicStream.decisionDeliveryUnconfirmed");
+  return (
+    <View style={styles.container}>
+      {!sending ? (
+        <Text
+          style={styles.feedbackText}
+          accessibilityLiveRegion="polite"
+          testID={`topic-decision-resume-feedback-${topicKey}`}
+        >
+          {feedback}
+        </Text>
+      ) : null}
+      <View style={styles.actionsRow}>
+        <Button
+          size="sm"
+          variant="secondary"
+          loading={sending}
+          disabled={!online || sending}
+          onPress={handlePress}
+          testID={`topic-decision-resume-${topicKey}`}
+        >
+          {t("topicWorkbench.topicStream.decisionResume")}
+        </Button>
+      </View>
+    </View>
+  );
+});
 
 function evidenceKey(evidence: WorkspaceDurableItemEvidence): string {
   return JSON.stringify([
@@ -308,6 +357,7 @@ const DurableItemDecisionSection = memo(function DurableItemDecisionSection({
   durableItemsConfirmed,
   staleEvidenceRevision,
   submittingAction,
+  hasPendingDurableDecision,
   feedback,
   onChangeDraft,
   onRefreshDurableItems,
@@ -323,6 +373,7 @@ const DurableItemDecisionSection = memo(function DurableItemDecisionSection({
   durableItemsConfirmed: boolean;
   staleEvidenceRevision?: number;
   submittingAction: string | null;
+  hasPendingDurableDecision: boolean;
   feedback: string | null;
   onChangeDraft: (next: string) => void;
   onRefreshDurableItems?: () => void;
@@ -439,7 +490,7 @@ const DurableItemDecisionSection = memo(function DurableItemDecisionSection({
         onChangeText={onChangeDraft}
         placeholder={t("topicWorkbench.topicStream.decisionNotePlaceholder")}
         style={styles.textInput}
-        editable={submittingAction === null}
+        editable={submittingAction === null && !hasPendingDurableDecision}
         testID={`topic-decision-note-input-${topic.topicKey}`}
       />
 
@@ -459,7 +510,9 @@ const DurableItemDecisionSection = memo(function DurableItemDecisionSection({
               decision={decision}
               isAcceptance={item.kind === "acceptance"}
               loading={submittingAction === decision}
-              disabled={submittingAction !== null || Boolean(decisionBlock)}
+              disabled={
+                submittingAction !== null || hasPendingDurableDecision || Boolean(decisionBlock)
+              }
               onPress={onSubmitDurable}
             />
           );
@@ -596,6 +649,7 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
   supportsButlerV1 = false,
   durableItemsOnline = true,
   durableItemsConfirmed = true,
+  hasPendingDurableDecision = false,
   onRefreshDurableItems,
   onOpenStandaloneDurableItem,
   onSubmitDecision,
@@ -604,7 +658,13 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
 
-  const disclosureKey = buildTopicDisclosureKey(agentKey, topic.topicKey);
+  const disclosureKey =
+    prompt.kind === "durable_item" && supportsButlerV1
+      ? buildDurableDecisionDraftKey(
+          buildDurableDecisionKey(serverId, workspaceId, agentKey, topic.topicKey),
+          prompt.item.requestId,
+        )
+      : buildTopicDisclosureKey(agentKey, topic.topicKey);
   const draftText = useTopicStreamViewStore(
     (state) => state.decisionDraftByTopicKey[disclosureKey] ?? "",
   );
@@ -695,7 +755,9 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
 
   const handleSubmitDurable = useCallback(
     (decision: DurableItemDecision) => {
-      if (!durableItem || !onSubmitDecision || submittingRef.current) return;
+      if (!durableItem || !onSubmitDecision || submittingRef.current || hasPendingDurableDecision) {
+        return;
+      }
       const block = getDurableItemDecisionBlock({
         item: durableItem,
         online: durableItemsOnline,
@@ -722,7 +784,11 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
       })
         .then((result) => {
           if (result.outcome === "saved") {
-            clearDraftAfterSave();
+            const remaining =
+              useTopicStreamViewStore.getState().decisionDraftByTopicKey[disclosureKey];
+            if ((remaining ?? "").trim() === trimmedNote) clearDraftAfterSave();
+          } else if (result.outcome === "resumeRequired") {
+            return;
           } else if (result.outcome === "evidenceStale") {
             setStaleEvidenceRevision(durableItem.revision);
             setFeedback(result.message || t("topicWorkbench.topicStream.decisionEvidenceStale"));
@@ -746,10 +812,12 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
     [
       allocateClientMessageId,
       clearDraftAfterSave,
+      disclosureKey,
       draftText,
       durableItem,
       durableItemsConfirmed,
       durableItemsOnline,
+      hasPendingDurableDecision,
       onSubmitDecision,
       staleEvidenceRevision,
       t,
@@ -865,6 +933,7 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
         durableItemsConfirmed={durableItemsConfirmed}
         staleEvidenceRevision={staleEvidenceRevision}
         submittingAction={submittingAction}
+        hasPendingDurableDecision={hasPendingDurableDecision}
         feedback={feedback}
         onChangeDraft={handleChangeDraft}
         onRefreshDurableItems={onRefreshDurableItems}

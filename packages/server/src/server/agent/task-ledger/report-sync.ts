@@ -35,6 +35,12 @@ export function shouldBypassMainControlWakeup(check: MainControlWakeupCheck): bo
   if (!task || !isActiveWorkspaceTask(task) || task.leadAgentId !== check.childAgentId)
     return false;
   if ((task.leadServerId ?? check.localServerId) !== check.childServerId) return false;
+  if (
+    task.status === "awaiting_decision" ||
+    task.status === "verifying" ||
+    task.blockingQuestion?.trim()
+  )
+    return false;
   if (check.shouldHoldInbox || check.hasBufferedTaskReports) return false;
   if (hasResidentInboxBypass(check.childLabels) || /@主控|@main\b/iu.test(check.summary))
     return false;

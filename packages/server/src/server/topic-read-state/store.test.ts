@@ -1,6 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  TopicReadEntrySchema,
+  WorkspaceTopicReadSnapshotSchema,
+  WSOutboundMessageSchema,
+} from "@getpaseo/protocol/messages";
+import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DurableItemStore } from "../durable-items/store.js";
 import { WorkspaceTodoStore } from "../todos/store.js";
@@ -9,7 +15,7 @@ import { handleTopicReadRequest } from "./requests.js";
 import { TopicReadStateStore } from "./store.js";
 
 const scope = { workspaceId: "ws-1", mainAgentId: "main-1", epoch: "epoch-1", headSeq: 30 };
-const key = { workspaceId: scope.workspaceId, mainAgentId: scope.mainAgentId };
+const key = { workspaceId: scope.workspaceId, mainAgentId: scope.mainAgentId, epoch: scope.epoch };
 const now = Date.parse("2026-11-26T12:00:00.000Z");
 let dir: string;
 let store: TopicReadStateStore;
@@ -103,6 +109,97 @@ describe("TopicReadStateStore", () => {
     });
   });
 
+  it("ignores delayed card marks from a replaced timeline and accepts legacy timestamps only", async () => {
+    const old = await store.mark(scope, { ...key, topicKey: "topic", mode: "read", seq: 25 });
+    const rebased = { ...scope, epoch: "epoch-2", headSeq: 4 };
+    for (const epoch of [scope.epoch, undefined, null]) {
+      const result = await store.mark(rebased, {
+        ...key,
+        epoch,
+        topicKey: "topic",
+        mode: "read",
+        seq: 30,
+      });
+      expect(result).toEqual({ snapshot: old.snapshot, changed: false, applied: false });
+    }
+    const legacy = await store.mark(rebased, {
+      ...key,
+      epoch: undefined,
+      topicKey: "topic",
+      mode: "read",
+      seq: 30,
+      timestampMs: 250,
+    });
+    expect(legacy.snapshot).toMatchObject({
+      watermarkEpoch: "epoch-2",
+      topics: [{ readUpToSeq: -1, readUpToTimestampMs: 250, readUpToTimelineTimestampMs: 250 }],
+    });
+    const current = await store.mark(rebased, {
+      ...key,
+      epoch: "epoch-2",
+      topicKey: "topic",
+      mode: "read",
+      seq: 20,
+    });
+    expect(current.snapshot.topics[0]).toMatchObject({ readUpToSeq: 4 });
+  });
+
+  it("stores explicit time independently of sequence and thread timestamps", async () => {
+    const topic = { ...key, topicKey: "topic", mode: "read" as const };
+    await store.mark(scope, { ...topic, seq: 10, timestampMs: 200 });
+    await store.markAll(scope, { epoch: scope.epoch, maxSeq: 8, maxTimestampMs: 200 });
+    await store.mark(scope, { ...topic, epoch: null, timestampMs: 300 });
+    const sequenced = await store.getState(scope);
+    expect(sequenced.watermarkTimelineTimestampMs).toBeUndefined();
+    expect(sequenced.topics[0]?.readUpToTimelineTimestampMs).toBeUndefined();
+    expect(sequenced.topics[0]?.readUpToTimestampMs).toBe(300);
+
+    await store.mark(scope, { ...topic, epoch: undefined, seq: 11, timestampMs: 150 });
+    await store.markAll(scope, { maxTimestampMs: 120 });
+    await store.mark(scope, { ...topic, seq: 12, timestampMs: 400 });
+    await store.markAll(scope, { epoch: scope.epoch, maxSeq: 9, maxTimestampMs: 400 });
+    const mixed = await new TopicReadStateStore(join(dir, "topic-read")).getState(scope);
+    expect(mixed).toMatchObject({
+      watermarkSeq: 9,
+      watermarkTimestampMs: 400,
+      watermarkTimelineTimestampMs: 120,
+      topics: [
+        {
+          readUpToSeq: 12,
+          readUpToTimestampMs: 400,
+          readUpToTimelineTimestampMs: 150,
+        },
+      ],
+    });
+
+    const message = {
+      type: "session",
+      message: {
+        type: "workspace.topic_read.updated",
+        payload: { snapshot: mixed },
+      },
+    };
+    expect(WSOutboundMessageSchema.parse(message)).toEqual(message);
+    expect(validateWSOutboundMessage(message)).toEqual({ success: true, data: message });
+    const oldSchema = WorkspaceTopicReadSnapshotSchema.omit({
+      watermarkTimelineTimestampMs: true,
+    }).extend({ topics: TopicReadEntrySchema.omit({ readUpToTimelineTimestampMs: true }).array() });
+    expect(WorkspaceTopicReadSnapshotSchema.parse(oldSchema.parse(mixed))).toEqual(
+      oldSchema.parse(mixed),
+    );
+
+    const rebased = { ...scope, epoch: "epoch-2", headSeq: 12 };
+    const stale = await store.mark(rebased, { ...topic, seq: 12, timestampMs: 900 });
+    expect(stale).toEqual({ snapshot: mixed, applied: false, changed: false });
+    const next = await store.markAll(rebased, { epoch: rebased.epoch, maxSeq: 2 });
+    expect(next.snapshot).toMatchObject({
+      watermarkEpoch: rebased.epoch,
+      watermarkSeq: 2,
+      watermarkTimelineTimestampMs: 120,
+      topics: [{ readUpToSeq: -1, readUpToTimelineTimestampMs: 150 }],
+    });
+  });
+
   it("keeps sequence zero beyond an empty snapshot and uses timestamps without a shared epoch", async () => {
     await store.mark(scope, { ...key, topicKey: "first", mode: "unread", seq: 0, timestampMs: 20 });
     await store.mark(scope, { ...key, topicKey: "seen", mode: "unread", seq: 1, timestampMs: 10 });
@@ -117,6 +214,20 @@ describe("TopicReadStateStore", () => {
         { topicKey: "seen", markedUnreadAtMs: null },
       ],
     });
+  });
+
+  it("keeps a time-only unread override when a bulk mark observes only sequences", async () => {
+    await store.mark(scope, {
+      ...key,
+      epoch: null,
+      topicKey: "time-only",
+      mode: "unread",
+      timestampMs: 100,
+    });
+    const result = await store.markAll(scope, { epoch: scope.epoch, maxSeq: 10 });
+    expect(result.snapshot.topics[0]?.markedUnreadAtMs).toBe(now);
+    const covered = await store.markAll(scope, { maxTimestampMs: 100 });
+    expect(covered.snapshot.topics[0]?.markedUnreadAtMs).toBeNull();
   });
 
   it("loads empty and prior flat files and evicts the least recently marked card", async () => {

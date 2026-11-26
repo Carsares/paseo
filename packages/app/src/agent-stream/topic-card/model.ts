@@ -1,7 +1,6 @@
 import type {
   PendingSubagentInboxItem,
   TopicAnchorSummary,
-  TopicReplyRouteMode,
   TopicThreadEntry,
   WorkspaceDurableItem,
   WorkspaceTaskFileConflict,
@@ -96,8 +95,7 @@ export type TopicReplyItem =
 
 export interface TopicRetryCandidate {
   text: string;
-  routeMode: TopicReplyRouteMode;
-  clientMessageId?: string;
+  entryId: string;
 }
 
 export interface TopicUnmatchedRef {
@@ -544,6 +542,7 @@ function findMirroredUserFollowup(
   for (const candidate of state.unmatchedUserFollowups) {
     if (state.consumedFollowupEntryIds.has(candidate.entryId)) continue;
     if (candidate.routedAgentId !== candidate.mainAgentId) continue;
+    if (candidate.sourceMessageId && (item.messageId || item.clientMessageId)) continue;
     if (normalizeDedupeText(candidate.text) !== normalizedPrompt) continue;
     const entryTs = parseIsoMs(candidate.createdAt, itemTs);
     if (Math.abs(itemTs - entryTs) > FALLBACK_MIRROR_WINDOW_MS) continue;
@@ -1216,6 +1215,20 @@ function attachExternalCollections(state: TopicBuilderState, input: ProjectTopic
   }
 }
 
+function isManuallyUnreadReply(
+  topicRead: WorkspaceTopicReadSnapshot["topics"][number],
+  markedUnreadAtMs: number,
+  seq: number | null,
+  sameEpoch: boolean,
+  timestampMs: number,
+): boolean {
+  if (seq === null) {
+    return timestampMs > topicRead.readUpToTimestampMs || timestampMs >= markedUnreadAtMs;
+  }
+  if (sameEpoch && topicRead.readUpToSeq >= 0) return seq > topicRead.readUpToSeq;
+  return timestampMs >= topicRead.readUpToTimestampMs;
+}
+
 /**
  * Evaluates unread status for a single reply while keeping the main-timeline `seq` domain strictly
  * isolated from mirrored `thread_entry` items (which always carry `seq: null` and compare by
@@ -1235,25 +1248,31 @@ function computeReplyUnread(input: {
   const { readSnapshot, legacyReadScope, topicKey, seq, timestampMs, epoch, id } = input;
   if (readSnapshot) {
     const topicRead = readSnapshot.topics.find((entry) => entry.topicKey === topicKey);
+    const sameEpoch = epoch !== null && readSnapshot.watermarkEpoch === epoch;
     if (topicRead && topicRead.markedUnreadAtMs !== null) {
-      if (seq !== null) {
-        return seq > topicRead.readUpToSeq;
-      }
-      return (
-        timestampMs > topicRead.readUpToTimestampMs || timestampMs >= topicRead.markedUnreadAtMs
+      return isManuallyUnreadReply(
+        topicRead,
+        topicRead.markedUnreadAtMs,
+        seq,
+        sameEpoch,
+        timestampMs,
       );
     }
-    const effectiveReadSeq = Math.max(readSnapshot.watermarkSeq, topicRead?.readUpToSeq ?? -1);
+    if (seq !== null) {
+      const effectiveReadSeq = Math.max(readSnapshot.watermarkSeq, topicRead?.readUpToSeq ?? -1);
+      const timelineReadAt = Math.max(
+        readSnapshot.watermarkTimelineTimestampMs ?? 0,
+        topicRead?.readUpToTimelineTimestampMs ?? 0,
+      );
+      return (
+        !(sameEpoch && seq <= effectiveReadSeq) &&
+        !(timelineReadAt > 0 && timestampMs <= timelineReadAt)
+      );
+    }
     const effectiveReadTs = Math.max(
       readSnapshot.watermarkTimestampMs,
       topicRead?.readUpToTimestampMs ?? 0,
     );
-    if (seq !== null) {
-      if (readSnapshot.watermarkEpoch && epoch && readSnapshot.watermarkEpoch !== epoch) {
-        return topicRead ? seq > topicRead.readUpToSeq : true;
-      }
-      return seq > effectiveReadSeq;
-    }
     return effectiveReadTs > 0 ? timestampMs > effectiveReadTs : true;
   }
 
@@ -1443,36 +1462,17 @@ function resolveTopicLifecycleStatus(input: {
 }
 
 function resolveRetryCandidate(
-  unit: MutableTopicUnit,
   replies: readonly TopicReplyItem[],
   lifecycleStatus: TopicLifecycleStatus,
 ): TopicRetryCandidate | null {
-  if (lifecycleStatus !== "error" && lifecycleStatus !== "interrupted") {
+  if (lifecycleStatus !== "error" && lifecycleStatus !== "interrupted") return null;
+  const latestFollowup = replies.findLast(
+    (reply) => reply.kind === "thread_entry" && reply.entry.role === "user_followup",
+  );
+  if (latestFollowup?.kind !== "thread_entry" || latestFollowup.entry.retryable !== true) {
     return null;
   }
-  // Prefer the latest user_followup inside the topic thread if one exists; otherwise retry root prompt.
-  const latestFollowup = replies
-    .toReversed()
-    .find(
-      (reply): reply is Extract<TopicReplyItem, { kind: "thread_entry" }> =>
-        reply.kind === "thread_entry" &&
-        reply.entry.role === "user_followup" &&
-        reply.entry.text.trim().length > 0,
-    );
-  if (latestFollowup) {
-    return {
-      text: latestFollowup.entry.text,
-      routeMode: latestFollowup.entry.routedAgentId === unit.leadAgentId ? "auto" : "main",
-      clientMessageId: `retry:${latestFollowup.entry.entryId}`,
-    };
-  }
-  const rootText = unit.rootPrompt.text.trim();
-  if (!rootText) return null;
-  return {
-    text: rootText,
-    routeMode: unit.leadAgentId ? "auto" : "main",
-    clientMessageId: `retry:${unit.topicKey}:${unit.rootItemId}`,
-  };
+  return { entryId: latestFollowup.entry.entryId, text: latestFollowup.entry.text };
 }
 
 function maxSeqValue(current: number | null, candidate: number | null): number | null {
@@ -1567,7 +1567,7 @@ function finalizeTopicUnit(input: {
     isLatestTopic,
     isTurnActive: Boolean(projectionInput.isTurnActive),
   });
-  const retryCandidate = resolveRetryCandidate(unit, replies, lifecycleStatus);
+  const retryCandidate = resolveRetryCandidate(replies, lifecycleStatus);
 
   return {
     ...unit,

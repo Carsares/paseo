@@ -1,3 +1,4 @@
+import type { QueuedTopicReply } from "@/composer/actions";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
@@ -14,11 +15,15 @@ import {
 } from "@/agent-stream/topic-card/topic-stream-list";
 import {
   buildTopicAgentKey,
+  buildTopicReplyDraftKey,
+  type ActiveTopicReplyTarget,
   useTopicStreamViewStore,
   type TopicStreamViewMode,
 } from "@/stores/topic-stream-view-store";
-import { TodoEditorSheet } from "@/todos/todo-editor-sheet";
 import {
+  deliverQueuedTopicReply,
+  finishTopicSubmission,
+  rememberTopicSubmission,
   submitActiveTopicReply,
   TopicDecisionStaleQuestionError,
 } from "@/agent-stream/topic-card/submit-topic-reply";
@@ -41,7 +46,11 @@ import invariant from "tiny-invariant";
 import { shallow, useShallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { useAgentStreamTail } from "@/agent-stream/use-agent-stream-tail";
-import { AgentStreamView, type AgentStreamViewHandle } from "@/agent-stream/view";
+import {
+  AgentStreamView,
+  renderPendingPermissionsNode,
+  type AgentStreamViewHandle,
+} from "@/agent-stream/view";
 import { AgentDurableItems } from "@/durable-items/card";
 import { CHAT_COLUMN_RAIL_DATASET, ChatColumnRailSurface } from "@/chat-rail";
 import { ArchivedAgentCallout } from "@/components/archived-agent-callout";
@@ -1642,7 +1651,6 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         />
       ) : null}
       {chat}
-      <TodoEditorSheet serverId={serverId} workspaceId={workspaceId} />
     </ChatAgentReadyFrame>
   );
   return wrapAgentCommandProvider({
@@ -1871,6 +1879,9 @@ const AgentStreamSection = memo(function AgentStreamSection({
     ),
   );
   const streamItems = streamItemsRaw ?? EMPTY_STREAM_ITEMS;
+  const permissionClient = useSessionStore((state) =>
+    useTopicCards ? (state.sessions[serverId]?.client ?? null) : null,
+  );
   const pendingPermissionList = useStoreWithEqualityFn(
     useSessionStore,
     (state) => {
@@ -1932,6 +1943,10 @@ const AgentStreamSection = memo(function AgentStreamSection({
           streamItems={streamItems}
           streamHead={streamHeadRaw ?? EMPTY_STREAM_ITEMS}
           pendingPermissions={pendingPermissionList}
+          pendingPermissionsNode={renderPendingPermissionsNode({
+            pendingPermissions: pendingPermissionList,
+            client: permissionClient,
+          })}
           isTurnActive={turnPresentation.isActive}
           isPaneFocused={isPaneFocused}
           bottomClearance={bottomOverlayTailClearance}
@@ -2213,111 +2228,24 @@ function ActiveAgentComposer({
     ],
   );
 
-  const queryClient = useQueryClient();
-  const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
-  // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
-  const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
-  const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
-  const topicAgentKey = buildTopicAgentKey(serverId, agentId);
-  const activeReplyTopic = useTopicStreamViewStore(
-    (state) => state.activeReplyTopicByAgentKey[topicAgentKey] ?? null,
-  );
-  const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
-  const clearActiveReplyTopicIfMatches = useTopicStreamViewStore(
-    (state) => state.clearActiveReplyTopicIfMatches,
-  );
-  const setActiveReplyRouteMode = useTopicStreamViewStore((state) => state.setActiveReplyRouteMode);
-  const setActiveReplySubmissionIntent = useTopicStreamViewStore(
-    (state) => state.setActiveReplySubmissionIntent,
-  );
-  const refreshActiveDecisionContext = useTopicStreamViewStore(
-    (state) => state.refreshActiveDecisionContext,
-  );
-  const handleCancelReplyTopic = useCallback(() => {
-    setActiveReplyTopic(topicAgentKey, null);
-  }, [setActiveReplyTopic, topicAgentKey]);
-  const handleToggleReplyRouteMode = useCallback(() => {
-    if (!activeReplyTopic) return;
-    setActiveReplyRouteMode(topicAgentKey, activeReplyTopic.routeMode === "main" ? "auto" : "main");
-  }, [activeReplyTopic, setActiveReplyRouteMode, topicAgentKey]);
-  const handleSubmitTopicReply = useCallback(
-    async (payload: MessagePayload) => {
-      const submittedTarget = activeReplyTopic;
-      if (!submittedTarget) return;
-      try {
-        const sent = await submitActiveTopicReply({
-          queryClient,
-          serverId,
-          workspaceId,
-          agentId,
-          activeReplyTopic: submittedTarget,
-          payload,
-          supportsTopicThreads,
-          supportsButlerV1,
-          supportsForgeAttachments,
-          disconnectedMessage: t("workspace.terminal.hostDisconnected"),
-          onPersistSubmissionIntent: (signature, clientMessageId) => {
-            setActiveReplySubmissionIntent(
-              topicAgentKey,
-              signature,
-              clientMessageId,
-              submittedTarget.topicKey,
-            );
-          },
-        });
-        if (sent) {
-          clearActiveReplyTopicIfMatches(topicAgentKey, {
-            topicKey: submittedTarget.topicKey,
-            taskId: submittedTarget.taskId,
-            decisionKind: submittedTarget.decisionContext?.kind,
-            decisionTaskId: submittedTarget.decisionContext?.taskId,
-            blockingQuestionGeneration: submittedTarget.decisionContext?.blockingQuestionGeneration,
-          });
-          onMessageSent();
-        }
-      } catch (err) {
-        if (err instanceof TopicDecisionStaleQuestionError) {
-          const staleMessage = t("topicWorkbench.topicStream.decisionBlockingQuestionStale");
-          if (submittedTarget.decisionContext) {
-            refreshActiveDecisionContext(topicAgentKey, {
-              expectedTarget: {
-                topicKey: submittedTarget.topicKey,
-                taskId: submittedTarget.taskId,
-                decisionKind: submittedTarget.decisionContext.kind,
-                decisionTaskId: submittedTarget.decisionContext.taskId,
-                blockingQuestionGeneration:
-                  submittedTarget.decisionContext.blockingQuestionGeneration,
-              },
-              question: err.latestTask?.blockingQuestion,
-              blockingQuestionGeneration: err.latestTask?.blockingQuestionGeneration,
-              staleNotice: staleMessage,
-            });
-          }
-          onErrorToast?.(staleMessage);
-          throw err;
-        }
-        onErrorToast?.(err instanceof Error ? err.message : String(err));
-        throw err;
-      }
-    },
-    [
-      activeReplyTopic,
-      agentId,
-      clearActiveReplyTopicIfMatches,
-      onErrorToast,
-      onMessageSent,
-      queryClient,
-      refreshActiveDecisionContext,
-      serverId,
-      setActiveReplySubmissionIntent,
-      supportsButlerV1,
-      supportsForgeAttachments,
-      supportsTopicThreads,
-      t,
-      topicAgentKey,
-      workspaceId,
-    ],
-  );
+  const {
+    activeReplyTopic,
+    topicDraftKey,
+    submittingTopicDraftKey,
+    topicQueue,
+    handleToggleReplyRouteMode,
+    handleCancelReplyTopic,
+    handleSubmitTopicReply,
+    sendQueuedTopicReply,
+  } = useActiveTopicComposer({
+    serverId,
+    workspaceId,
+    agentId,
+    agentInputDraft,
+    onErrorToast,
+    onMessageSent,
+  });
+  const DraftComposer = topicDraftKey ? ScopedTopicDraftComposer : Composer;
 
   return (
     <View style={animatedStaticStyles.inputAreaWrapper} onLayout={onInputAreaLayout}>
@@ -2328,59 +2256,17 @@ function ActiveAgentComposer({
         hidden={isComposerFullscreen || hidePendingInboxBar}
       />
       {activeReplyTopic && !isComposerFullscreen ? (
-        <View style={styles.topicReplyContextRail} testID="compact-topic-reply-context">
-          <View style={styles.topicReplyContextBar}>
-            <Text style={styles.topicReplyContextText} numberOfLines={1}>
-              {activeReplyTopic.decisionContext
-                ? t("topicWorkbench.topicStream.decidingContextBanner", {
-                    preview:
-                      activeReplyTopic.decisionContext.question.slice(0, 60) ||
-                      activeReplyTopic.promptPreview ||
-                      activeReplyTopic.topicKey,
-                  })
-                : t("topicWorkbench.topicStream.replyingContextBanner", {
-                    preview: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
-                  })}
-            </Text>
-            {activeReplyTopic.leadAgentId && !activeReplyTopic.decisionContext ? (
-              <PressHighlight
-                accessibilityRole="button"
-                onPress={handleToggleReplyRouteMode}
-                style={styles.topicReplyRoutePill}
-                testID="compact-topic-reply-route-toggle"
-              >
-                <Text style={styles.topicReplyRouteText}>
-                  {activeReplyTopic.routeMode === "main"
-                    ? t("topicWorkbench.topicStream.replyToMain")
-                    : t("topicWorkbench.topicStream.replyToLead", {
-                        name:
-                          activeReplyTopic.leadTitle ||
-                          t("topicWorkbench.topicStream.leadFallbackName"),
-                      })}
-                </Text>
-              </PressHighlight>
-            ) : null}
-            <PressHighlight
-              accessibilityRole="button"
-              accessibilityLabel={t("topicWorkbench.topicStream.cancelReplyContext")}
-              onPress={handleCancelReplyTopic}
-              style={styles.topicReplyCloseButton}
-              testID="compact-topic-reply-cancel"
-            >
-              <ThemedCloseIcon size={14} />
-            </PressHighlight>
-          </View>
-          {activeReplyTopic.decisionContext?.staleNotice ? (
-            <Text
-              style={styles.topicDecisionStaleNotice}
-              testID="compact-topic-decision-stale-notice"
-            >
-              {activeReplyTopic.decisionContext.staleNotice}
-            </Text>
-          ) : null}
-        </View>
+        <CompactTopicReplyContext
+          activeReplyTopic={activeReplyTopic}
+          onToggleRoute={handleToggleReplyRouteMode}
+          onCancel={handleCancelReplyTopic}
+        />
       ) : null}
-      <Composer
+      <DraftComposer
+        key={topicDraftKey ?? agentId}
+        topicDraftKey={topicDraftKey}
+        topicQueue={topicQueue}
+        onDeliverQueuedTopic={sendQueuedTopicReply}
         agentId={agentId}
         serverId={serverId}
         workspaceId={workspaceId}
@@ -2398,7 +2284,9 @@ function ActiveAgentComposer({
         editingSession={editingSession}
         autoFocus
         autoFocusKey={String(agentInputDraft.attachmentFocusRequestId)}
-        isSubmitLoading={isSubmitLoading}
+        isSubmitLoading={
+          isSubmitLoading || Boolean(topicDraftKey && submittingTopicDraftKey === topicDraftKey)
+        }
         onAttentionInputFocus={onAttentionInputFocus}
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={onComposerHeightChange}
@@ -2409,6 +2297,280 @@ function ActiveAgentComposer({
         isCompactLayout={isCompactComposerLayout}
       />
     </View>
+  );
+}
+
+function CompactTopicReplyContext({
+  activeReplyTopic,
+  onToggleRoute,
+  onCancel,
+}: {
+  activeReplyTopic: ActiveTopicReplyTarget;
+  onToggleRoute: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <View style={styles.topicReplyContextRail} testID="compact-topic-reply-context">
+      <View style={styles.topicReplyContextBar}>
+        <Text style={styles.topicReplyContextText} numberOfLines={1}>
+          {activeReplyTopic.decisionContext
+            ? t("topicWorkbench.topicStream.decidingContextBanner", {
+                preview:
+                  activeReplyTopic.decisionContext.question.slice(0, 60) ||
+                  activeReplyTopic.promptPreview ||
+                  activeReplyTopic.topicKey,
+              })
+            : t("topicWorkbench.topicStream.replyingContextBanner", {
+                preview: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
+              })}
+        </Text>
+        {activeReplyTopic.leadAgentId && !activeReplyTopic.decisionContext ? (
+          <PressHighlight
+            accessibilityRole="button"
+            onPress={onToggleRoute}
+            style={styles.topicReplyRoutePill}
+            testID="compact-topic-reply-route-toggle"
+          >
+            <Text style={styles.topicReplyRouteText}>
+              {activeReplyTopic.routeMode === "main"
+                ? t("topicWorkbench.topicStream.replyToMain")
+                : t("topicWorkbench.topicStream.replyToLead", {
+                    name:
+                      activeReplyTopic.leadTitle ||
+                      t("topicWorkbench.topicStream.leadFallbackName"),
+                  })}
+            </Text>
+          </PressHighlight>
+        ) : null}
+        <PressHighlight
+          accessibilityRole="button"
+          accessibilityLabel={t("topicWorkbench.topicStream.cancelReplyContext")}
+          onPress={onCancel}
+          style={styles.topicReplyCloseButton}
+          testID="compact-topic-reply-cancel"
+        >
+          <ThemedCloseIcon size={14} />
+        </PressHighlight>
+      </View>
+      {activeReplyTopic.decisionContext?.staleNotice ? (
+        <Text style={styles.topicDecisionStaleNotice} testID="compact-topic-decision-stale-notice">
+          {activeReplyTopic.decisionContext.staleNotice}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function useActiveTopicComposer({
+  serverId,
+  workspaceId,
+  agentId,
+  agentInputDraft,
+  onErrorToast,
+  onMessageSent,
+}: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  agentInputDraft: AgentInputDraft;
+  onErrorToast?: (message: string) => void;
+  onMessageSent: () => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
+  // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
+  const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
+  const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
+  const topicAgentKey = buildTopicAgentKey(serverId, agentId);
+  const activeReplyTopic = useTopicStreamViewStore(
+    (state) => state.activeReplyTopicByAgentKey[topicAgentKey] ?? null,
+  );
+  const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
+  const clearActiveReplyTopicIfMatches = useTopicStreamViewStore(
+    (state) => state.clearActiveReplyTopicIfMatches,
+  );
+  const setActiveReplyRouteMode = useTopicStreamViewStore((state) => state.setActiveReplyRouteMode);
+  const topicDraftKey = activeReplyTopic
+    ? buildTopicReplyDraftKey({
+        serverId,
+        workspaceId,
+        agentId,
+        topicKey: activeReplyTopic.topicKey,
+        decision: Boolean(activeReplyTopic.decisionContext),
+      })
+    : undefined;
+  const [submittingTopicDraftKey, setSubmittingTopicDraftKey] = useState<string>();
+  const refreshActiveDecisionContext = useTopicStreamViewStore(
+    (state) => state.refreshActiveDecisionContext,
+  );
+  const handleCancelReplyTopic = useCallback(() => {
+    setActiveReplyTopic(topicAgentKey, null);
+  }, [setActiveReplyTopic, topicAgentKey]);
+  const handleToggleReplyRouteMode = useCallback(() => {
+    if (!activeReplyTopic) return;
+    setActiveReplyRouteMode(topicAgentKey, activeReplyTopic.routeMode === "main" ? "auto" : "main");
+  }, [activeReplyTopic, setActiveReplyRouteMode, topicAgentKey]);
+  const clearSubmittedTarget = useCallback(
+    (clientMessageId: string) => {
+      if (!activeReplyTopic || !topicDraftKey) return;
+      finishTopicSubmission(topicDraftKey, clientMessageId);
+      clearActiveReplyTopicIfMatches(topicAgentKey, {
+        topicKey: activeReplyTopic.topicKey,
+        taskId: activeReplyTopic.taskId,
+        decisionKind: activeReplyTopic.decisionContext?.kind,
+        decisionTaskId: activeReplyTopic.decisionContext?.taskId,
+        blockingQuestionGeneration: activeReplyTopic.decisionContext?.blockingQuestionGeneration,
+        selection: activeReplyTopic,
+      });
+    },
+    [activeReplyTopic, clearActiveReplyTopicIfMatches, topicAgentKey, topicDraftKey],
+  );
+
+  const sendQueuedTopicReply = useCallback(
+    async (topicReply: QueuedTopicReply, payload: MessagePayload) => {
+      await deliverQueuedTopicReply({
+        queryClient,
+        serverId,
+        agentId,
+        topicReply,
+        payload,
+        supportsTopicThreads,
+        supportsButlerV1,
+        supportsForgeAttachments,
+      });
+      onMessageSent();
+    },
+    [
+      agentId,
+      onMessageSent,
+      queryClient,
+      serverId,
+      supportsButlerV1,
+      supportsForgeAttachments,
+      supportsTopicThreads,
+    ],
+  );
+
+  const handleSubmitTopicReply = useCallback(
+    async (payload: MessagePayload) => {
+      const submittedTarget = activeReplyTopic;
+      if (!submittedTarget || !topicDraftKey) throw new Error(t("composer.errors.failedToSend"));
+      const clientMessageId = rememberTopicSubmission(topicDraftKey, submittedTarget, payload);
+      setSubmittingTopicDraftKey(topicDraftKey);
+      try {
+        const sent = await submitActiveTopicReply({
+          queryClient,
+          serverId,
+          workspaceId,
+          agentId,
+          activeReplyTopic: submittedTarget,
+          payload,
+          supportsTopicThreads,
+          supportsButlerV1,
+          supportsForgeAttachments,
+          clientMessageId,
+          disconnectedMessage: t("workspace.terminal.hostDisconnected"),
+        });
+        if (!sent) throw new Error(t("composer.errors.failedToSend"));
+        clearSubmittedTarget(clientMessageId);
+      } catch (err) {
+        if (err instanceof TopicDecisionStaleQuestionError && submittedTarget.decisionContext) {
+          const staleMessage = t("topicWorkbench.topicStream.decisionBlockingQuestionStale");
+          refreshActiveDecisionContext(topicAgentKey, {
+            expectedTarget: {
+              topicKey: submittedTarget.topicKey,
+              taskId: submittedTarget.taskId,
+              decisionKind: submittedTarget.decisionContext.kind,
+              decisionTaskId: submittedTarget.decisionContext.taskId,
+              blockingQuestionGeneration:
+                submittedTarget.decisionContext.blockingQuestionGeneration,
+              selection: submittedTarget,
+            },
+            question: err.latestTask?.blockingQuestion,
+            blockingQuestionGeneration: err.latestTask?.blockingQuestionGeneration,
+            staleNotice: staleMessage,
+          });
+          onErrorToast?.(staleMessage);
+        } else {
+          onErrorToast?.(err instanceof Error ? err.message : String(err));
+        }
+        throw err;
+      } finally {
+        setSubmittingTopicDraftKey((key) => (key === topicDraftKey ? undefined : key));
+      }
+    },
+    [
+      activeReplyTopic,
+      agentId,
+      clearSubmittedTarget,
+      onErrorToast,
+      queryClient,
+      refreshActiveDecisionContext,
+      serverId,
+      supportsButlerV1,
+      supportsForgeAttachments,
+      supportsTopicThreads,
+      t,
+      topicAgentKey,
+      topicDraftKey,
+      workspaceId,
+    ],
+  );
+
+  const topicQueue = useMemo(
+    () =>
+      activeReplyTopic && topicDraftKey
+        ? {
+            draftKey: topicDraftKey,
+            target: activeReplyTopic,
+            onQueued: clearSubmittedTarget,
+            onEditOrdinary: (text: string, attachments: AgentInputDraft["attachments"]) => {
+              agentInputDraft.replaceText(text);
+              agentInputDraft.setAttachments(attachments);
+              handleCancelReplyTopic();
+            },
+          }
+        : undefined,
+    [
+      activeReplyTopic,
+      agentInputDraft,
+      clearSubmittedTarget,
+      handleCancelReplyTopic,
+      topicDraftKey,
+    ],
+  );
+  return {
+    activeReplyTopic,
+    topicDraftKey,
+    submittingTopicDraftKey,
+    topicQueue,
+    handleToggleReplyRouteMode,
+    handleCancelReplyTopic,
+    handleSubmitTopicReply,
+    sendQueuedTopicReply,
+  };
+}
+
+function ScopedTopicDraftComposer({
+  topicDraftKey,
+  ...props
+}: React.ComponentProps<typeof Composer> & { topicDraftKey?: string }) {
+  invariant(topicDraftKey, "A topic composer requires a draft key");
+  const draft = useAgentInputDraft({ draftKey: topicDraftKey });
+  return (
+    <Composer
+      {...props}
+      textSource={draft.textSource}
+      onChangeText={draft.editText}
+      textReplacement={draft.textReplacement}
+      attachments={draft.attachments}
+      onChangeAttachments={draft.setAttachments}
+      clearDraft={draft.clear}
+      autoFocusKey={String(draft.attachmentFocusRequestId)}
+      submitBehavior="preserve-and-lock"
+    />
   );
 }
 

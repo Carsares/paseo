@@ -3508,12 +3508,25 @@ export class Session {
       const mainAgentId = (await this.describeWorkspaceMain(workspace)).topic?.mainAgentId;
       if (!mainAgentId) continue;
       if (selector.mainAgentId !== undefined && mainAgentId !== selector.mainAgentId) continue;
-      const head = this.agentManager.getLoadedTimelineHead(mainAgentId);
       scopes.push({
         workspaceId: workspace.workspaceId,
         mainAgentId,
-        epoch: head?.epoch ?? null,
-        ...(head ? { headSeq: head.seq } : {}),
+        readCoordinates: async () => {
+          const head = this.agentManager.getLoadedTimelineHead(mainAgentId);
+          if (head) return { epoch: head.epoch, headSeq: head.seq };
+          const record = await this.agentStorage.get(mainAgentId);
+          if (record?.workspaceId !== workspace.workspaceId || record.internal || record.archivedAt)
+            return { epoch: null };
+          // Use the same persisted projection as history fetch, without loading a provider.
+          const timeline = await this.agentManager.readStoredTimeline(record, {
+            direction: "tail",
+            limit: 1,
+          });
+          const loaded = this.agentManager.getLoadedTimelineHead(mainAgentId);
+          return loaded
+            ? { epoch: loaded.epoch, headSeq: loaded.seq }
+            : { epoch: timeline.epoch, headSeq: timeline.window.maxSeq };
+        },
       });
     }
     return scopes;

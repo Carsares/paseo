@@ -451,7 +451,7 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   const isLong = isSilentReport && entry.text.length > COLLAPSE_THRESHOLD_CHARS;
   const displayText =
     isLong && !expanded ? `${entry.text.slice(0, COLLAPSE_THRESHOLD_CHARS)}…` : entry.text;
-  const canRetry = Boolean(onRetry && entry.status === "error");
+  const canRetry = Boolean(onRetry && entry.retryable === true);
 
   return (
     <HoverEnvelope

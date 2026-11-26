@@ -1218,6 +1218,7 @@ type WorkbenchFeature =
   | "workspaceTopicReadState"
   | "workspaceTodos"
   | "workspaceButlerV1"
+  | "workspaceTopicReplyRetry"
   | "checkoutGitStagingV1"
   | "checkoutGitGraphV1"
   | "checkoutGitRebaseV1"
@@ -6164,6 +6165,8 @@ export class DaemonClient {
     ...input
   }: Omit<WorkspaceTopicReplyRequest, "type" | "requestId">) {
     this.requireWorkbenchFeature("workspaceTopicThreads");
+    // COMPAT(workspaceTopicReplyRetry): added in v0.18.0, remove gate after 2027-06-01.
+    if (input.retryOfEntryId) this.requireWorkbenchFeature("workspaceTopicReplyRetry");
     // COMPAT(topicReplyRootPromptPreview): added in v0.18.0, remove gate after 2027-06-01.
     const supportsRootPromptPreview =
       this.lastServerInfoMessage?.features?.workspaceButlerV1 === true;

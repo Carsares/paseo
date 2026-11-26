@@ -1,3 +1,5 @@
+import type { ComposerAttachment } from "@/attachments/types";
+import type { TopicRetryCandidate } from "./model";
 import type {
   TopicReplyRouteMode,
   WorkspaceDurableItem,
@@ -29,7 +31,11 @@ import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
-import { buildTopicDisclosureKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import {
+  buildDurableDecisionKey,
+  buildTopicDisclosureKey,
+  useTopicStreamViewStore,
+} from "@/stores/topic-stream-view-store";
 import type { Theme } from "@/styles/theme";
 import { formatTodoDueTimestamp, isTodoOverdue } from "@/todos/model";
 import { useDisclosureHold } from "../disclosure";
@@ -38,6 +44,7 @@ import type { TopicLifecycleStatus, TopicReplyItem, TopicUnit } from "./model";
 import { TopicConflictBanner } from "./topic-conflict-banner";
 import {
   TopicDecisionSlot,
+  TopicDecisionResume,
   type TopicDecisionSubmitInput,
   type TopicDecisionSubmitResult,
 } from "./topic-decision-slot";
@@ -120,6 +127,7 @@ function isRectMeaningfullySeen(
 function computeSeenReplyPrefix(
   replies: TopicUnit["replies"],
   isVisible: (id: string) => boolean,
+  epoch?: string | null,
 ): SeenTopicWatermark | null {
   let seenSeq: number | null = null;
   let seenTimestampMs = 0;
@@ -131,7 +139,10 @@ function computeSeenReplyPrefix(
   for (const reply of replies) {
     if (!reply.isUnread) continue;
     const isSeen = !reachedUnseenReply && isVisible(reply.id);
-    const seq = reply.kind === "thread_entry" ? null : reply.seq;
+    const seq =
+      reply.kind === "thread_entry" || (epoch !== undefined && (!epoch || reply.epoch !== epoch))
+        ? null
+        : reply.seq;
     if (!isSeen) {
       reachedUnseenReply = true;
       if (seq !== null) unseenSeq = Math.min(unseenSeq, seq);
@@ -153,6 +164,17 @@ function computeSeenReplyPrefix(
   };
 }
 
+export function computeTopicReadSequence(topic: TopicUnit, epoch: string | null) {
+  if (!epoch) return null;
+  let seq = topic.rootPrompt.epoch === epoch ? topic.rootPrompt.seq : null;
+  for (const reply of topic.replies) {
+    if (reply.kind !== "thread_entry" && reply.epoch === epoch && reply.seq !== null) {
+      seq = Math.max(seq ?? -1, reply.seq);
+    }
+  }
+  return seq;
+}
+
 export function computeSeenTopicWatermark(input: {
   topic: TopicUnit;
   viewportBounds?: TopicViewportBounds;
@@ -160,9 +182,17 @@ export function computeSeenTopicWatermark(input: {
   railBodyOffsetY: number;
   replyLayouts: ReadonlyMap<string, TopicLayoutRect>;
   isVisibleInViewport?: boolean;
+  epoch?: string | null;
 }): SeenTopicWatermark | null {
-  const { topic, viewportBounds, cardLayout, railBodyOffsetY, replyLayouts, isVisibleInViewport } =
-    input;
+  const {
+    topic,
+    viewportBounds,
+    cardLayout,
+    railBodyOffsetY,
+    replyLayouts,
+    isVisibleInViewport,
+    epoch,
+  } = input;
   if (!topic.hasUnread) return null;
 
   if (viewportBounds) {
@@ -178,24 +208,28 @@ export function computeSeenTopicWatermark(input: {
     const viewBottom = viewportBounds.scrollY + viewportBounds.height;
 
     if (topic.unreadReplyCount > 0) {
-      return computeSeenReplyPrefix(topic.replies, (id) => {
-        const rowLayout = replyLayouts.get(id);
-        return Boolean(
-          rowLayout &&
-          isRectMeaningfullySeen(
-            cardLayout.y + railBodyOffsetY + rowLayout.y,
-            rowLayout.height,
-            viewTop,
-            viewBottom,
-            48,
-          ),
-        );
-      });
+      return computeSeenReplyPrefix(
+        topic.replies,
+        (id) => {
+          const rowLayout = replyLayouts.get(id);
+          return Boolean(
+            rowLayout &&
+            isRectMeaningfullySeen(
+              cardLayout.y + railBodyOffsetY + rowLayout.y,
+              rowLayout.height,
+              viewTop,
+              viewBottom,
+              48,
+            ),
+          );
+        },
+        epoch,
+      );
     }
 
     if (isRectMeaningfullySeen(cardLayout.y, cardLayout.height, viewTop, viewBottom, 80)) {
       return {
-        seq: topic.latestSeq,
+        seq: epoch === undefined ? topic.latestSeq : computeTopicReadSequence(topic, epoch),
         timestampMs: topic.latestTimestampMs,
         fallbackItemIds: topic.replies.map((reply) => reply.id),
       };
@@ -206,7 +240,7 @@ export function computeSeenTopicWatermark(input: {
   // Fallback for direct component tests that pass explicit visibility without scroll viewport metrics.
   if (isVisibleInViewport === true) {
     return {
-      seq: topic.latestSeq,
+      seq: epoch === undefined ? topic.latestSeq : computeTopicReadSequence(topic, epoch),
       timestampMs: topic.latestTimestampMs,
       fallbackItemIds: topic.replies.filter((reply) => reply.isUnread).map((reply) => reply.id),
     };
@@ -465,14 +499,17 @@ export interface TopicThreadCardProps {
   onOpenStandaloneDurableItem?: (item: WorkspaceDurableItem) => void;
   onJumpToPeerTopic?: (peerTaskId: string) => void;
   onSubmitTopicDecision?: (input: TopicDecisionSubmitInput) => Promise<TopicDecisionSubmitResult>;
+  onResumeTopicDecision?: (topicKey: string) => void;
   onActivateCompactDecision?: (
     topic: TopicUnit,
     question: string,
     blockingQuestionGeneration?: string,
   ) => void;
+  readEpoch?: string | null;
   onAutoMarkRead: (input: {
     topicKey: string;
     seq: number | null;
+    epoch?: string | null;
     timestampMs: number;
     fallbackItemIds: string[];
   }) => void;
@@ -488,7 +525,9 @@ export interface TopicThreadCardProps {
     text: string,
     routeMode: TopicReplyRouteMode,
     clientMessageId?: string,
+    attachments?: ComposerAttachment[],
   ) => Promise<boolean> | boolean;
+  onRetryTopic?: (topic: TopicUnit, retry: TopicRetryCandidate) => void;
   onActivateCompactReply: (topic: TopicUnit, routeMode: TopicReplyRouteMode) => void;
   onConvertToTodo: (input: {
     topic: TopicUnit;
@@ -500,6 +539,70 @@ export interface TopicThreadCardProps {
   onToggleTodoStatus: (todo: WorkspaceTodoItem) => void;
   onEditTodo: (todo: WorkspaceTodoItem) => void;
 }
+
+const TopicCardDecision = memo(function TopicCardDecision({
+  agentKey,
+  serverId,
+  workspaceId,
+  topic,
+  supportsButlerV1 = false,
+  durableItemsOnline = true,
+  durableItemsConfirmed,
+  onRefreshDurableItems,
+  onOpenStandaloneDurableItem,
+  onSubmitTopicDecision,
+  onResumeTopicDecision,
+  onActivateCompactDecision,
+}: Pick<
+  TopicThreadCardProps,
+  | "agentKey"
+  | "serverId"
+  | "workspaceId"
+  | "topic"
+  | "supportsButlerV1"
+  | "durableItemsOnline"
+  | "durableItemsConfirmed"
+  | "onRefreshDurableItems"
+  | "onOpenStandaloneDurableItem"
+  | "onSubmitTopicDecision"
+  | "onResumeTopicDecision"
+  | "onActivateCompactDecision"
+>) {
+  const decisionKey = buildDurableDecisionKey(serverId, workspaceId, agentKey, topic.topicKey);
+  const decisionIntent = useTopicStreamViewStore(
+    (state) => state.durableDecisionIntents[decisionKey],
+  );
+  const prompt = topic.activeBlockingPrompt;
+  return (
+    <>
+      {supportsButlerV1 && decisionIntent && onResumeTopicDecision ? (
+        <TopicDecisionResume
+          intent={decisionIntent}
+          online={durableItemsOnline}
+          onResume={onResumeTopicDecision}
+        />
+      ) : null}
+      {prompt ? (
+        <TopicDecisionSlot
+          key={prompt.kind === "durable_item" ? `durable:${prompt.item.requestId}` : "blocking"}
+          agentKey={agentKey}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          topic={topic}
+          prompt={prompt}
+          supportsButlerV1={supportsButlerV1}
+          durableItemsOnline={durableItemsOnline}
+          durableItemsConfirmed={durableItemsConfirmed}
+          hasPendingDurableDecision={supportsButlerV1 && Boolean(decisionIntent)}
+          onRefreshDurableItems={onRefreshDurableItems}
+          onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
+          onSubmitDecision={onSubmitTopicDecision}
+          onActivateCompactDecision={onActivateCompactDecision}
+        />
+      ) : null}
+    </>
+  );
+});
 
 export const TopicThreadCard = memo(function TopicThreadCard({
   agentKey,
@@ -513,19 +616,22 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   isHighlighted = false,
   isReplying = false,
   isFlushingInbox = false,
-  supportsButlerV1 = false,
-  durableItemsOnline = true,
-  durableItemsConfirmed = true,
+  supportsButlerV1,
+  durableItemsOnline,
+  durableItemsConfirmed,
   onRefreshDurableItems,
   onOpenStandaloneDurableItem,
   onJumpToPeerTopic,
   onSubmitTopicDecision,
+  onResumeTopicDecision,
   onActivateCompactDecision,
+  readEpoch,
   onAutoMarkRead,
   onMarkTopicMode,
   onFlushTopicInbox,
   onOpenAgentBeside,
   onSubmitDesktopReply,
+  onRetryTopic,
   onActivateCompactReply,
   onConvertToTodo,
   onToggleTodoStatus,
@@ -566,10 +672,19 @@ export const TopicThreadCard = memo(function TopicThreadCard({
         railBodyOffsetY,
         replyLayouts: replyLayoutsRef.current,
         isVisibleInViewport,
+        epoch: readEpoch,
       }),
     // replyLayoutVersion intentionally triggers re-computation when reply rows finish measuring
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cardLayout, isVisibleInViewport, railBodyOffsetY, replyLayoutVersion, topic, viewportBounds],
+    [
+      cardLayout,
+      isVisibleInViewport,
+      railBodyOffsetY,
+      readEpoch,
+      replyLayoutVersion,
+      topic,
+      viewportBounds,
+    ],
   );
 
   useTopicViewportRead({
@@ -578,6 +693,7 @@ export const TopicThreadCard = memo(function TopicThreadCard({
     hasUnread: topic.hasUnread,
     topicKey: topic.topicKey,
     seenWatermark,
+    epoch: readEpoch,
     onAutoMarkRead,
   });
 
@@ -623,41 +739,26 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   );
 
   const handleSubmitDesktop = useCallback(
-    (text: string, routeMode: TopicReplyRouteMode, clientMessageId?: string) =>
-      onSubmitDesktopReply(topic, text, routeMode, clientMessageId),
+    (
+      text: string,
+      routeMode: TopicReplyRouteMode,
+      clientMessageId: string,
+      attachments?: ComposerAttachment[],
+    ) => onSubmitDesktopReply(topic, text, routeMode, clientMessageId, attachments),
     [onSubmitDesktopReply, topic],
   );
 
   const handleRetryTopic = useCallback(() => {
     if (!topic.retryCandidate || isReplying) return;
-    void onSubmitDesktopReply(
-      topic,
-      topic.retryCandidate.text,
-      topic.retryCandidate.routeMode,
-      topic.retryCandidate.clientMessageId,
-    );
-  }, [isReplying, onSubmitDesktopReply, topic]);
+    onRetryTopic?.(topic, topic.retryCandidate);
+  }, [isReplying, onRetryTopic, topic]);
 
   const handleRetryReply = useCallback(
     (reply: TopicReplyItem) => {
-      if (isReplying) return;
-      if (reply.kind === "thread_entry" && reply.entry.role === "user_followup") {
-        const mode: TopicReplyRouteMode =
-          reply.entry.routedAgentId === topic.leadAgentId ? "auto" : "main";
-        const clientMessageId = `retry:${reply.entry.entryId}`;
-        void onSubmitDesktopReply(topic, reply.entry.text, mode, clientMessageId);
-        return;
-      }
-      if (topic.retryCandidate) {
-        void onSubmitDesktopReply(
-          topic,
-          topic.retryCandidate.text,
-          topic.retryCandidate.routeMode,
-          topic.retryCandidate.clientMessageId,
-        );
-      }
+      if (isReplying || reply.kind !== "thread_entry" || reply.entry.retryable !== true) return;
+      onRetryTopic?.(topic, { entryId: reply.entry.entryId, text: reply.entry.text });
     },
-    [isReplying, onSubmitDesktopReply, topic],
+    [isReplying, onRetryTopic, topic],
   );
 
   const handleActivateCompact = useCallback(
@@ -674,7 +775,8 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   const accentBarStyle = resolveAccentBarStyle(topic);
   const showRetryBanner =
     (topic.lifecycleStatus === "error" || topic.lifecycleStatus === "interrupted") &&
-    topic.retryCandidate !== null;
+    topic.retryCandidate !== null &&
+    Boolean(onRetryTopic);
 
   return (
     <View
@@ -724,7 +826,11 @@ export const TopicThreadCard = memo(function TopicThreadCard({
               isRetrying={isReplying}
               onOpenAgentBeside={handleOpenReplyAgentBeside}
               onConvertToTodo={handleConvertReplyToTodo}
-              onRetryReply={showRetryBanner ? handleRetryReply : undefined}
+              onRetryReply={
+                onRetryTopic && reply.kind === "thread_entry" && reply.entry.retryable === true
+                  ? handleRetryReply
+                  : undefined
+              }
             />
           </ReplyLayoutSlot>
         ))}
@@ -782,24 +888,25 @@ export const TopicThreadCard = memo(function TopicThreadCard({
           </View>
         ) : null}
 
-        {topic.activeBlockingPrompt ? (
-          <TopicDecisionSlot
-            agentKey={agentKey}
-            serverId={serverId}
-            workspaceId={workspaceId}
-            topic={topic}
-            prompt={topic.activeBlockingPrompt}
-            supportsButlerV1={supportsButlerV1}
-            durableItemsOnline={durableItemsOnline}
-            durableItemsConfirmed={durableItemsConfirmed}
-            onRefreshDurableItems={onRefreshDurableItems}
-            onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
-            onSubmitDecision={onSubmitTopicDecision}
-            onActivateCompactDecision={onActivateCompactDecision}
-          />
-        ) : null}
+        <TopicCardDecision
+          agentKey={agentKey}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          topic={topic}
+          supportsButlerV1={supportsButlerV1}
+          durableItemsOnline={durableItemsOnline}
+          durableItemsConfirmed={durableItemsConfirmed}
+          onRefreshDurableItems={onRefreshDurableItems}
+          onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
+          onSubmitTopicDecision={onSubmitTopicDecision}
+          onResumeTopicDecision={onResumeTopicDecision}
+          onActivateCompactDecision={onActivateCompactDecision}
+        />
 
         <TopicInlineComposer
+          agentKey={agentKey}
+          serverId={serverId}
+          workspaceId={workspaceId}
           topicKey={topic.topicKey}
           leadTitle={topic.leadTitle}
           hasLeadAgent={Boolean(topic.leadAgentId)}

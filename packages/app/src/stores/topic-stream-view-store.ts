@@ -1,6 +1,8 @@
+import type { UserComposerAttachment } from "@/attachments/types";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import type {
   TopicReplyRouteMode,
+  WorkspaceTopicDecideRequest,
   WorkspaceTodoItem,
   WorkspaceTodoSourceRef,
 } from "@getpaseo/protocol/messages";
@@ -46,6 +48,34 @@ export interface ActiveTopicReplyTarget {
   pendingSubmissionSignature?: string;
 }
 
+export interface TopicReplyDraft {
+  text: string;
+  attachments: UserComposerAttachment[];
+  routeMode: TopicReplyRouteMode;
+}
+
+export const EMPTY_TOPIC_REPLY_DRAFT: TopicReplyDraft = {
+  text: "",
+  attachments: [],
+  routeMode: "auto",
+};
+
+export function buildTopicReplyDraftKey(input: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  topicKey: string;
+  decision?: boolean;
+}) {
+  return `topic:${JSON.stringify([
+    input.serverId,
+    input.workspaceId,
+    input.agentId,
+    input.topicKey,
+    Boolean(input.decision),
+  ])}`;
+}
+
 export interface PendingTopicScrollTarget {
   topicKey: string;
   taskId?: string;
@@ -82,6 +112,33 @@ export function buildTopicDisclosureKey(agentKey: string, topicKey: string): str
   return `${agentKey}\0${topicKey}`;
 }
 
+export function buildDurableDecisionKey(
+  serverId: string | undefined,
+  workspaceId: string | undefined,
+  agentKey: string,
+  topicKey: string,
+) {
+  return JSON.stringify([serverId, workspaceId, agentKey, topicKey]);
+}
+
+export function buildDurableDecisionDraftKey(scopeKey: string, requestId: string) {
+  return JSON.stringify(["durable-decision-draft", scopeKey, requestId]);
+}
+
+export type DurableTopicDecisionRequest = Omit<
+  WorkspaceTopicDecideRequest,
+  "type" | "requestId" | "resolutionKind" | "durableItemRequestId" | "expectedRevision"
+> & {
+  resolutionKind: "durable_item";
+  durableItemRequestId: string;
+  expectedRevision: number;
+};
+
+export interface DurableDecisionIntent {
+  request: DurableTopicDecisionRequest;
+  status: "sending" | "unconfirmed" | "resumeRequired";
+}
+
 function boundRecord<T>(
   record: Record<string, T>,
   maxKeys = MAX_PERSISTED_AGENT_KEYS,
@@ -115,6 +172,7 @@ export interface ActiveTopicDecisionTargetMatch {
   decisionKind: ActiveTopicDecisionContext["kind"];
   decisionTaskId?: string;
   blockingQuestionGeneration?: string;
+  selection?: ActiveTopicReplyTarget;
 }
 
 export interface RefreshActiveDecisionContextUpdate {
@@ -132,6 +190,7 @@ export interface TopicStreamViewState {
   expandedConflictsByTopicKey: Record<string, boolean>;
   decisionDraftByTopicKey: Record<string, string>;
   decisionDraftMetaByTopicKey: Record<string, TopicDecisionDraftMeta>;
+  durableDecisionIntents: Record<string, DurableDecisionIntent>;
   returnTopicAnchorByAgentKey: Record<string, ReturnTopicAnchor>;
   activeReplyTopicByAgentKey: Record<string, ActiveTopicReplyTarget | null>;
   pendingScrollTopicByAgentKey: Record<string, PendingTopicScrollTarget | null>;
@@ -140,6 +199,7 @@ export interface TopicStreamViewState {
   setViewMode: (agentKey: string, mode: TopicStreamViewMode) => void;
   setUnreadOnly: (agentKey: string, unreadOnly: boolean) => void;
   toggleUnreadOnly: (agentKey: string) => void;
+  setDurableDecisionIntent: (key: string, intent: DurableDecisionIntent | null) => void;
   setProcessExpanded: (disclosureKey: string, expanded: boolean) => void;
   setHistoryExpanded: (disclosureKey: string, expanded: boolean) => void;
   setConflictsExpanded: (disclosureKey: string, expanded: boolean) => void;
@@ -169,6 +229,11 @@ export interface TopicStreamViewState {
     },
   ) => void;
   setReturnTopicAnchor: (subagentKey: string, anchor: ReturnTopicAnchor | null) => void;
+  inlineReplyDrafts: Record<string, TopicReplyDraft>;
+  updateInlineReplyDraft: (
+    key: string,
+    update: (draft: TopicReplyDraft) => TopicReplyDraft,
+  ) => void;
   setActiveReplyTopic: (agentKey: string, target: ActiveTopicReplyTarget | null) => void;
   clearActiveReplyTopicIfMatches: (
     agentKey: string,
@@ -178,6 +243,7 @@ export interface TopicStreamViewState {
       decisionKind?: ActiveTopicDecisionContext["kind"];
       decisionTaskId?: string;
       blockingQuestionGeneration?: string;
+      selection?: ActiveTopicReplyTarget;
     },
   ) => void;
   setActiveReplyRouteMode: (agentKey: string, routeMode: TopicReplyRouteMode) => void;
@@ -210,9 +276,10 @@ function matchesActiveReplyTarget(
     decisionKind?: ActiveTopicDecisionContext["kind"];
     decisionTaskId?: string;
     blockingQuestionGeneration?: string;
+    selection?: ActiveTopicReplyTarget;
   },
 ): current is ActiveTopicReplyTarget {
-  if (!current) return false;
+  if (!current || (expected.selection && current !== expected.selection)) return false;
   if (current.topicKey !== expected.topicKey || current.taskId !== expected.taskId) return false;
   if (expected.decisionKind === undefined) {
     return current.decisionContext === undefined;
@@ -361,10 +428,20 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
         expandedConflictsByTopicKey: {},
         decisionDraftByTopicKey: {},
         decisionDraftMetaByTopicKey: {},
+        durableDecisionIntents: {},
         returnTopicAnchorByAgentKey: {},
         activeReplyTopicByAgentKey: {},
         pendingScrollTopicByAgentKey: {},
         todoEditorRequest: null,
+
+        // This state survives card and view remounts and stays out of persisted preferences.
+        setDurableDecisionIntent: (key, intent) =>
+          set((state) => {
+            const next = { ...state.durableDecisionIntents };
+            if (intent) next[key] = intent;
+            else delete next[key];
+            return { durableDecisionIntents: next };
+          }),
 
         setViewMode: (agentKey, mode) =>
           set((state) => {
@@ -508,6 +585,19 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
               delete next[subagentKey];
             }
             return { returnTopicAnchorByAgentKey: next };
+          }),
+
+        inlineReplyDrafts: {},
+        updateInlineReplyDraft: (key, update) =>
+          set((state) => {
+            const draft = update(state.inlineReplyDrafts[key] ?? EMPTY_TOPIC_REPLY_DRAFT);
+            const next = { ...state.inlineReplyDrafts };
+            if (draft.text || draft.attachments.length || draft.routeMode !== "auto") {
+              next[key] = draft;
+            } else {
+              delete next[key];
+            }
+            return { inlineReplyDrafts: next };
           }),
 
         setActiveReplyTopic: (agentKey, target) =>

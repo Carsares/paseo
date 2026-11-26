@@ -200,10 +200,15 @@ export function coversFinishedAttention(input: {
     const mark = topicKey ? readByKey.get(topicKey) : undefined;
     const readAt = Math.max(snapshot.watermarkTimestampMs, mark?.readUpToTimestampMs ?? 0);
     const readSeq = Math.max(snapshot.watermarkSeq, mark?.readUpToSeq ?? -1);
+    const timelineReadAt = Math.max(
+      snapshot.watermarkTimelineTimestampMs ?? 0,
+      mark?.readUpToTimelineTimestampMs ?? 0,
+    );
     const covered =
-      snapshot.watermarkEpoch === epoch && seq !== undefined
-        ? seq <= readSeq
-        : Date.parse(timestamp) <= readAt;
+      seq === undefined
+        ? Date.parse(timestamp) <= readAt
+        : (snapshot.watermarkEpoch === epoch && seq <= readSeq) ||
+          Date.parse(timestamp) <= timelineReadAt;
     if (!covered) return false;
     if (readAt >= attentionAt || (completedTurnId && turnId === completedTurnId)) {
       finishCovered = true;

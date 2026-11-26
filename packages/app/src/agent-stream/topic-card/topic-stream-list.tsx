@@ -16,7 +16,8 @@ import {
   type NativeSyntheticEvent,
 } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { composePromptTextWithQuotes, createQuoteAttachment } from "@/attachments/quote";
+import type { ComposerAttachment } from "@/attachments/types";
+import { submitActiveTopicReply } from "./submit-topic-reply";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
@@ -40,8 +41,11 @@ import {
 } from "@/stores/topic-inbox-read-store";
 import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import {
+  buildDurableDecisionDraftKey,
+  buildDurableDecisionKey,
   buildTopicAgentKey,
   useTopicStreamViewStore,
+  type DurableTopicDecisionRequest,
   type PendingTopicScrollTarget,
   type TopicStreamViewMode,
 } from "@/stores/topic-stream-view-store";
@@ -63,6 +67,7 @@ import {
 import {
   decideWorkspaceTopicOnHost,
   replyToWorkspaceTopic,
+  TopicReplyRejectedError,
   useWorkspaceTopicEntries,
 } from "@/topic-threads/queries";
 import type { PendingPermission } from "@/types/shared";
@@ -73,6 +78,7 @@ import { canDecideDurableItemInTopic, projectTopicUnits, type TopicUnit } from "
 import type { TopicDecisionSubmitInput, TopicDecisionSubmitResult } from "./topic-decision-slot";
 import {
   resolveFlushableTaskId,
+  computeTopicReadSequence,
   TopicThreadCard,
   type TopicLayoutRect,
   type TopicViewportBounds,
@@ -85,6 +91,8 @@ const ThemedFilter = withUnistyles(Filter, mutedIconMapping);
 const SELECTED_STATE = { selected: true } as const;
 const UNSELECTED_STATE = { selected: false } as const;
 const MAX_JUMP_HISTORY_FETCHES = 4;
+// Keep the request ID if the topic view closes before the host acknowledges a retry.
+const retryIntents = new Map<string, string>();
 
 interface ActiveDisclosureHold {
   rowId: string;
@@ -287,6 +295,7 @@ export interface TopicStreamListProps {
   streamItems: readonly StreamItem[];
   streamHead: readonly StreamItem[];
   pendingPermissions: readonly PendingPermission[];
+  pendingPermissionsNode?: React.ReactNode;
   isTurnActive: boolean;
   isPaneFocused: boolean;
   bottomClearance?: number;
@@ -527,6 +536,11 @@ function mapTopicDurableDecideResponse(
   conflictMessage: string,
   unconfirmedMessage: string,
 ): TopicDecisionSubmitResult {
+  if (response.errorCode === "topic_decision_resume_required") {
+    return { outcome: "resumeRequired", message: response.error ?? undefined };
+  }
+  // A recorded decision can carry a warning when a changed task prevented follow-up.
+  if (response.entry) return { outcome: "saved", message: response.error ?? undefined };
   if (
     response.errorCode === "durable_item_evidence_stale" ||
     response.errorCode === "DURABLE_ITEM_STALE_EVIDENCE"
@@ -540,6 +554,49 @@ function mapTopicDurableDecideResponse(
     return { outcome: "error", message: response.error ?? unconfirmedMessage };
   }
   return { outcome: "saved" };
+}
+
+async function sendDurableTopicDecision(input: {
+  queryClient: ReturnType<typeof useQueryClient>;
+  serverId: string;
+  scopeKey: string;
+  request: DurableTopicDecisionRequest;
+  conflictMessage: string;
+  unconfirmedMessage: string;
+}): Promise<TopicDecisionSubmitResult> {
+  const { serverId, scopeKey, request, queryClient } = input;
+  const { durableDecisionIntents, setDurableDecisionIntent } = useTopicStreamViewStore.getState();
+  const previouslyConfirmed = durableDecisionIntents[scopeKey]?.status === "resumeRequired";
+  setDurableDecisionIntent(scopeKey, { request, status: "sending" });
+  let response;
+  try {
+    response = await decideWorkspaceTopicOnHost({ ...request, queryClient, serverId });
+  } catch {
+    setDurableDecisionIntent(scopeKey, {
+      request,
+      status: previouslyConfirmed ? "resumeRequired" : "unconfirmed",
+    });
+    return { outcome: "resumeRequired" };
+  }
+  const result = mapTopicDurableDecideResponse(
+    response,
+    request.expectedRevision,
+    input.conflictMessage,
+    input.unconfirmedMessage,
+  );
+  if (result.outcome === "resumeRequired") {
+    setDurableDecisionIntent(scopeKey, { request, status: "resumeRequired" });
+  } else {
+    setDurableDecisionIntent(scopeKey, null);
+    if (result.outcome === "saved") {
+      const drafts = useTopicStreamViewStore.getState();
+      const draftKey = buildDurableDecisionDraftKey(scopeKey, request.durableItemRequestId);
+      if (drafts.decisionDraftByTopicKey[draftKey]?.trim() === (request.note ?? "")) {
+        drafts.setDecisionDraft(draftKey, "");
+      }
+    }
+  }
+  return result;
 }
 
 function mapTopicBlockingDecideResponse(
@@ -567,6 +624,7 @@ export const TopicStreamList = memo(function TopicStreamList({
   streamItems,
   streamHead,
   pendingPermissions,
+  pendingPermissionsNode,
   isTurnActive,
   isPaneFocused,
   bottomClearance = 0,
@@ -585,12 +643,14 @@ export const TopicStreamList = memo(function TopicStreamList({
   const unreadOnly = useTopicStreamViewStore(
     (state) => state.unreadOnlyByAgentKey[agentKey] ?? false,
   );
+  const durableDecisionIntents = useTopicStreamViewStore((state) => state.durableDecisionIntents);
   const setUnreadOnly = useTopicStreamViewStore((state) => state.setUnreadOnly);
   const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
   const requestScrollToTopic = useTopicStreamViewStore((state) => state.requestScrollToTopic);
   const openTodoEditor = useTopicStreamViewStore((state) => state.openTodoEditor);
 
   const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
+  const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
   const supportsTaskLedger = useHostFeature(serverId, "workspaceTaskLedger");
   // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
   const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
@@ -698,8 +758,26 @@ export const TopicStreamList = memo(function TopicStreamList({
   );
 
   const visibleTopics = useMemo(
-    () => (unreadOnly ? projection.topics.filter((topic) => topic.hasUnread) : projection.topics),
-    [projection.topics, unreadOnly],
+    () =>
+      unreadOnly
+        ? projection.topics.filter(
+            (topic) =>
+              topic.hasUnread ||
+              (supportsButlerV1 &&
+                durableDecisionIntents[
+                  buildDurableDecisionKey(serverId, workspaceId, agentKey, topic.topicKey)
+                ]),
+          )
+        : projection.topics,
+    [
+      agentKey,
+      durableDecisionIntents,
+      projection.topics,
+      serverId,
+      supportsButlerV1,
+      unreadOnly,
+      workspaceId,
+    ],
   );
 
   const scrollViewRef = useRef<ScrollView>(null);
@@ -718,7 +796,7 @@ export const TopicStreamList = memo(function TopicStreamList({
     const timer = setTimeout(() => setHighlightedTopicKey(null), 2400);
     return () => clearTimeout(timer);
   }, [highlightedTopicKey]);
-  const [replyingTopicKey, setReplyingTopicKey] = useState<string | null>(null);
+  const [replyingTopics, setReplyingTopics] = useState<ReadonlySet<string>>(() => new Set());
   const [flushingTopicKey, setFlushingTopicKey] = useState<string | null>(null);
 
   const disclosureViewportRef = useRef<StreamViewportHandle | null>(null);
@@ -811,6 +889,7 @@ export const TopicStreamList = memo(function TopicStreamList({
     (input: {
       topicKey: string;
       seq: number | null;
+      epoch?: string | null;
       timestampMs: number;
       fallbackItemIds: string[];
     }) => {
@@ -821,7 +900,8 @@ export const TopicStreamList = memo(function TopicStreamList({
         mainAgentId,
         topicKey: input.topicKey,
         mode: "read",
-        seq: input.seq ?? undefined,
+        epoch: input.epoch,
+        seq: input.epoch ? (input.seq ?? undefined) : undefined,
         timestampMs: input.timestampMs,
         fallbackItemIds: input.fallbackItemIds,
       }).catch(() => undefined);
@@ -838,14 +918,15 @@ export const TopicStreamList = memo(function TopicStreamList({
         mainAgentId,
         topicKey: topic.topicKey,
         mode,
-        seq: topic.latestSeq ?? undefined,
+        epoch: projection.watermark.epoch,
+        seq: computeTopicReadSequence(topic, projection.watermark.epoch) ?? undefined,
         timestampMs: topic.latestTimestampMs,
         fallbackItemIds: topic.replies.map((reply) => reply.id),
       }).catch((err) => {
         onErrorToast?.(err instanceof Error ? err.message : String(err));
       });
     },
-    [mainAgentId, onErrorToast, queryClient, serverId, workspaceId],
+    [mainAgentId, onErrorToast, projection.watermark.epoch, queryClient, serverId, workspaceId],
   );
 
   const handleFlushTopicInbox = useCallback(
@@ -884,39 +965,73 @@ export const TopicStreamList = memo(function TopicStreamList({
     [mainAgentId, serverId, tabId, workspaceId],
   );
 
+  const submitLocks = useRef(new Set<string>());
   const handleSubmitDesktopReply = useCallback(
     async (
       topic: TopicUnit,
       text: string,
       routeMode: TopicReplyRouteMode,
       clientMessageId?: string,
+      attachments: ComposerAttachment[] = [],
     ): Promise<boolean> => {
-      const effectiveMessageId = clientMessageId?.trim() || generateMessageId();
-      if (!supportsTopicThreads) {
-        if (!client) {
-          onErrorToast?.(t("workspace.terminal.hostDisconnected"));
-          return false;
-        }
-        setReplyingTopicKey(topic.topicKey);
-        try {
-          const preview = topic.rootPrompt.text.slice(0, 120) || topic.topicKey;
-          const quote = createQuoteAttachment({
-            text: preview,
-            label: topic.leadTitle || topic.topicKey,
-          });
-          const quotedText = composePromptTextWithQuotes(text, quote.text ? [quote] : []);
-          await client.sendAgentMessage(mainAgentId, quotedText, {
-            messageId: effectiveMessageId,
-          });
-          return true;
-        } catch (err) {
-          onErrorToast?.(err instanceof Error ? err.message : String(err));
-          return false;
-        } finally {
-          setReplyingTopicKey((current) => (current === topic.topicKey ? null : current));
-        }
+      if (submitLocks.current.has(topic.topicKey)) return false;
+      submitLocks.current.add(topic.topicKey);
+      setReplyingTopics(new Set(submitLocks.current));
+      try {
+        return await submitActiveTopicReply({
+          queryClient,
+          serverId,
+          workspaceId,
+          agentId: mainAgentId,
+          activeReplyTopic: {
+            topicKey: topic.topicKey,
+            taskId: topic.taskId,
+            rootMessageId: topic.rootMessageId,
+            promptPreview: topic.rootPrompt.text.slice(0, 240),
+            leadTitle: topic.leadTitle,
+            routeMode,
+          },
+          payload: { text, attachments, cwd: "" },
+          clientMessageId,
+          supportsTopicThreads,
+          supportsForgeAttachments,
+          disconnectedMessage: t("workspace.terminal.hostDisconnected"),
+        });
+      } catch (err) {
+        onErrorToast?.(err instanceof Error ? err.message : String(err));
+        return false;
+      } finally {
+        submitLocks.current.delete(topic.topicKey);
+        setReplyingTopics(new Set(submitLocks.current));
       }
-      setReplyingTopicKey(topic.topicKey);
+    },
+    [
+      mainAgentId,
+      onErrorToast,
+      queryClient,
+      serverId,
+      supportsForgeAttachments,
+      supportsTopicThreads,
+      t,
+      workspaceId,
+    ],
+  );
+
+  const handleRetryTopic = useCallback(
+    async (topic: TopicUnit, retry: { entryId: string; text: string }) => {
+      if (!supportsTopicThreads || submitLocks.current.has(topic.topicKey)) return;
+      const key = JSON.stringify([
+        serverId,
+        workspaceId,
+        mainAgentId,
+        topic.topicKey,
+        retry.entryId,
+      ]);
+      const clientMessageId = retryIntents.get(key) ?? generateMessageId();
+      retryIntents.set(key, clientMessageId);
+      submitLocks.current.add(topic.topicKey);
+      setReplyingTopics(new Set(submitLocks.current));
+      let acknowledged = false;
       try {
         await replyToWorkspaceTopic({
           queryClient,
@@ -924,31 +1039,21 @@ export const TopicStreamList = memo(function TopicStreamList({
           workspaceId,
           mainAgentId,
           topicKey: topic.topicKey,
-          taskId: topic.taskId,
-          rootMessageId: topic.rootMessageId,
-          rootPromptPreview: topic.rootPrompt.text.slice(0, 240) || undefined,
-          clientMessageId: effectiveMessageId,
-          text,
-          routeMode,
+          retryOfEntryId: retry.entryId,
+          text: retry.text.trim() || "[attachment]",
+          clientMessageId,
         });
-        return true;
+        acknowledged = true;
       } catch (err) {
+        acknowledged = err instanceof TopicReplyRejectedError;
         onErrorToast?.(err instanceof Error ? err.message : String(err));
-        return false;
       } finally {
-        setReplyingTopicKey((current) => (current === topic.topicKey ? null : current));
+        if (acknowledged && retryIntents.get(key) === clientMessageId) retryIntents.delete(key);
+        submitLocks.current.delete(topic.topicKey);
+        setReplyingTopics(new Set(submitLocks.current));
       }
     },
-    [
-      client,
-      mainAgentId,
-      onErrorToast,
-      queryClient,
-      serverId,
-      supportsTopicThreads,
-      t,
-      workspaceId,
-    ],
+    [mainAgentId, onErrorToast, queryClient, serverId, supportsTopicThreads, workspaceId],
   );
 
   const handleActivateCompactReply = useCallback(
@@ -1036,6 +1141,32 @@ export const TopicStreamList = memo(function TopicStreamList({
     void durableResult.refetch?.();
   }, [durableResult]);
 
+  const sendDurableDecision = useCallback(
+    (scopeKey: string, request: DurableTopicDecisionRequest) =>
+      sendDurableTopicDecision({
+        queryClient,
+        serverId,
+        scopeKey,
+        request,
+        conflictMessage: t("topicWorkbench.durableItems.conflict"),
+        unconfirmedMessage: t("topicWorkbench.durableItems.unconfirmed"),
+      }),
+    [queryClient, serverId, t],
+  );
+
+  const handleResumeTopicDecision = useCallback(
+    (topicKey: string) => {
+      const scopeKey = buildDurableDecisionKey(serverId, workspaceId, agentKey, topicKey);
+      const intent = useTopicStreamViewStore.getState().durableDecisionIntents[scopeKey];
+      if (!supportsButlerV1 || !intent || intent.status === "sending") return;
+      void sendDurableDecision(scopeKey, intent.request).then((result) => {
+        if (result.outcome !== "resumeRequired" && result.message) onErrorToast?.(result.message);
+        return undefined;
+      });
+    },
+    [agentKey, onErrorToast, sendDurableDecision, serverId, supportsButlerV1, workspaceId],
+  );
+
   const handleSubmitTopicDecision = useCallback(
     async (input: TopicDecisionSubmitInput): Promise<TopicDecisionSubmitResult> => {
       const unconfirmedMessage = t("topicWorkbench.durableItems.unconfirmed");
@@ -1054,9 +1185,16 @@ export const TopicStreamList = memo(function TopicStreamList({
             unconfirmedMessage,
           });
         }
-        const response = await decideWorkspaceTopicOnHost({
-          queryClient,
+        const scopeKey = buildDurableDecisionKey(
           serverId,
+          workspaceId,
+          agentKey,
+          input.topic.topicKey,
+        );
+        if (useTopicStreamViewStore.getState().durableDecisionIntents[scopeKey]) {
+          return { outcome: "resumeRequired" };
+        }
+        const result = await sendDurableDecision(scopeKey, {
           workspaceId,
           mainAgentId,
           topicKey: input.topic.topicKey,
@@ -1069,12 +1207,8 @@ export const TopicStreamList = memo(function TopicStreamList({
           decision: input.decision,
           note: input.note,
         });
-        return mapTopicDurableDecideResponse(
-          response,
-          input.durableItem.revision,
-          t("topicWorkbench.durableItems.conflict"),
-          unconfirmedMessage,
-        );
+        if (result.outcome === "saved" && result.message) onErrorToast?.(result.message);
+        return result;
       }
 
       if (!supportsButlerV1) {
@@ -1099,7 +1233,17 @@ export const TopicStreamList = memo(function TopicStreamList({
       });
       return mapTopicBlockingDecideResponse(response, unconfirmedMessage);
     },
-    [mainAgentId, queryClient, serverId, supportsButlerV1, t, workspaceId],
+    [
+      agentKey,
+      mainAgentId,
+      onErrorToast,
+      queryClient,
+      sendDurableDecision,
+      serverId,
+      supportsButlerV1,
+      t,
+      workspaceId,
+    ],
   );
 
   const handleConvertToTodo = useCallback(
@@ -1240,7 +1384,7 @@ export const TopicStreamList = memo(function TopicStreamList({
                   viewportBounds={viewportBounds}
                   cardLayout={measuredLayoutSnapshot.get(topic.topicKey) ?? null}
                   isHighlighted={highlightedTopicKey === topic.topicKey}
-                  isReplying={replyingTopicKey === topic.topicKey}
+                  isReplying={replyingTopics.has(topic.topicKey)}
                   isFlushingInbox={flushingTopicKey === topic.topicKey}
                   supportsButlerV1={supportsButlerV1}
                   durableItemsOnline={durableItemsOnline}
@@ -1249,12 +1393,15 @@ export const TopicStreamList = memo(function TopicStreamList({
                   onOpenStandaloneDurableItem={handleOpenStandaloneDurableItem}
                   onJumpToPeerTopic={handleJumpToPeerTopic}
                   onSubmitTopicDecision={handleSubmitTopicDecision}
+                  onResumeTopicDecision={handleResumeTopicDecision}
                   onActivateCompactDecision={handleActivateCompactDecision}
+                  readEpoch={projection.watermark.epoch}
                   onAutoMarkRead={handleAutoMarkRead}
                   onMarkTopicMode={handleMarkTopicMode}
                   onFlushTopicInbox={handleFlushTopicInbox}
                   onOpenAgentBeside={handleOpenAgentBeside}
                   onSubmitDesktopReply={handleSubmitDesktopReply}
+                  onRetryTopic={supportsTopicThreads ? handleRetryTopic : undefined}
                   onActivateCompactReply={handleActivateCompactReply}
                   onConvertToTodo={handleConvertToTodo}
                   onToggleTodoStatus={handleToggleTodoStatus}
@@ -1264,6 +1411,7 @@ export const TopicStreamList = memo(function TopicStreamList({
             </DisclosureRow>
           ))
         )}
+        {pendingPermissionsNode}
       </ScrollView>
     </View>
   );

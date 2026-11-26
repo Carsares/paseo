@@ -93,6 +93,7 @@ describe("workspace situation", () => {
       rootMessageId: "start",
       status: "awaiting_decision",
       blockingQuestion: "Which option?",
+      blockingQuestionGeneration: "d0851c66-59b4-4f59-9f03-49178ea64424",
       touchedFiles: ["file.ts"],
     });
     const b = task("b", { status: "verifying", touchedFiles: ["file.ts"] });
@@ -138,7 +139,13 @@ describe("workspace situation", () => {
     });
     expect(result.pendingHumanActions).toMatchObject({
       durableItems: [{ requestId: "d" }],
-      blockingQuestions: [{ taskId: "a", blockingQuestion: "Which option?" }],
+      blockingQuestions: [
+        {
+          taskId: "a",
+          blockingQuestion: "Which option?",
+          blockingQuestionGeneration: "d0851c66-59b4-4f59-9f03-49178ea64424",
+        },
+      ],
       todos: [
         { todoId: "overdue", isOverdue: true, completedChecklistCount: 1, totalChecklistCount: 1 },
       ],

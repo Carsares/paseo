@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { DisclosureRow } from "@/agent-stream/disclosure";
 import type { StreamViewportHandle } from "@/agent-stream/strategy";
+import { type HostRuntimeSnapshot, getHostRuntimeStore } from "@/runtime/host-runtime";
 import { i18n } from "@/i18n/i18next";
 import { useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
 import type { TopicUnit } from "./model";
@@ -21,6 +22,7 @@ beforeEach(async () => {
     expandedHistoryByTopicKey: {},
     expandedConflictsByTopicKey: {},
     decisionDraftByTopicKey: {},
+    inlineReplyDrafts: {},
   });
   container = document.body.appendChild(document.createElement("div"));
   container.style.width = "900px";
@@ -263,4 +265,111 @@ it("renders conflict banner and blocking decision slot in browser layout", () =>
     view.getByTestId("topic-conflict-jump-T-200").click();
   });
   expect(onJumpToPeerTopic).toHaveBeenCalledWith("T-200");
+});
+
+it("attaches a local image and file in the wide reply editor and preserves an attachment-only draft on failure", async () => {
+  const uploadFile = vi.fn(
+    async ({
+      fileName,
+      mimeType,
+      bytes,
+    }: {
+      fileName: string;
+      mimeType: string;
+      bytes: Uint8Array;
+    }) => ({
+      error: null,
+      file: {
+        type: "uploaded_file",
+        id: fileName,
+        mimeType,
+        fileName,
+        size: bytes.length,
+        path: `/tmp/${fileName}`,
+      },
+    }),
+  );
+  const runtime = getHostRuntimeStore();
+  const getSnapshot = runtime.getSnapshot.bind(runtime);
+  const snapshot = {
+    connectionStatus: "online",
+    client: { uploadFile },
+  } as unknown as HostRuntimeSnapshot;
+  vi.spyOn(runtime, "getSnapshot").mockImplementation((id) =>
+    id === "inline-host" ? snapshot : getSnapshot(id),
+  );
+  const onSubmitDesktopReply = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  const topic = makeTopic();
+  await act(async () =>
+    root.render(
+      <PortalProvider>
+        <TopicThreadCard
+          agentKey="inline:main"
+          serverId="inline-host"
+          workspaceId="inline-workspace"
+          topic={topic}
+          isPaneFocused={false}
+          onAutoMarkRead={vi.fn()}
+          onMarkTopicMode={vi.fn()}
+          onFlushTopicInbox={vi.fn()}
+          onOpenAgentBeside={vi.fn()}
+          onSubmitDesktopReply={onSubmitDesktopReply}
+          onActivateCompactReply={vi.fn()}
+          onConvertToTodo={vi.fn()}
+          onToggleTodoStatus={vi.fn()}
+          onEditTodo={vi.fn()}
+        />
+      </PortalProvider>,
+    ),
+  );
+  act(() => view.getByTestId("topic-inline-reply-trigger-task:T-100").click());
+  const originalClick = HTMLInputElement.prototype.click;
+  const pickLocalFiles = vi
+    .spyOn(HTMLInputElement.prototype, "click")
+    .mockImplementation(function (this: HTMLInputElement) {
+      if (this.type !== "file") return originalClick.call(this);
+      const selected = new DataTransfer();
+      selected.items.add(new File([new Uint8Array([1, 2, 3])], "trace.png", { type: "image/png" }));
+      selected.items.add(new File(["trace data"], "trace.txt", { type: "text/plain" }));
+      this.files = selected.files;
+      this.dispatchEvent(new Event("change"));
+      this.remove();
+    });
+  await act(async () => {
+    view.getByTestId("topic-inline-reply-attach-task:T-100").click();
+  });
+  pickLocalFiles.mockRestore();
+  await vi.waitFor(() => {
+    expect(view.getByText("trace.png")).toBeTruthy();
+    expect(view.getByText("trace.txt")).toBeTruthy();
+  });
+  const send = view.getByTestId("topic-inline-reply-send-task:T-100");
+  await act(async () => {
+    send.click();
+  });
+  const [first] = onSubmitDesktopReply.mock.calls;
+  expect(first).toEqual([
+    topic,
+    "",
+    "auto",
+    expect.any(String),
+    [
+      expect.objectContaining({
+        kind: "image",
+        metadata: expect.objectContaining({ fileName: "trace.png" }),
+      }),
+      expect.objectContaining({
+        kind: "file",
+        attachment: expect.objectContaining({ fileName: "trace.txt" }),
+      }),
+    ],
+  ]);
+  expect(view.getByText("trace.png")).toBeTruthy();
+  expect(view.getByText("trace.txt")).toBeTruthy();
+  await act(async () => {
+    send.click();
+  });
+  expect(onSubmitDesktopReply.mock.calls[1]).toEqual(first);
+  expect(view.queryByText("trace.png")).toBeNull();
+  expect(view.queryByText("trace.txt")).toBeNull();
 });

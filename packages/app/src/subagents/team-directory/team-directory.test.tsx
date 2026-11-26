@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { WorkspaceTopicReadSnapshot } from "@getpaseo/protocol/messages";
 import {
   PARENT_AGENT_ID_LABEL,
   RESIDENT_AGENT_LABEL,
@@ -23,7 +24,9 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import { useTopicInboxReadStore } from "@/stores/topic-inbox-read-store";
+import { applyTopicReadSnapshotToCache } from "@/topic-read/queries";
 import { useAgentAttentionClear } from "@/hooks/use-agent-attention-clear";
+import { HostRuntimeStore } from "@/runtime/host-runtime";
 import type { StreamItem } from "@/types/stream";
 import { createTeamMessageJumpStore, TeamMessageJumpProvider } from "./message-jump-store";
 import { WorkspaceTeamDirectory } from "./team-directory";
@@ -34,6 +37,10 @@ const runtime = vi.hoisted(() => ({
     flushAgentInbox: ReturnType<typeof vi.fn>;
     clearWorkspaceAttention: ReturnType<typeof vi.fn>;
     clearTeamConclusionAttention: ReturnType<typeof vi.fn>;
+    getWorkspaceTopicReadState: ReturnType<
+      typeof vi.fn<DaemonClient["getWorkspaceTopicReadState"]>
+    >;
+    markWorkspaceTopicRead: ReturnType<typeof vi.fn<DaemonClient["markWorkspaceTopicRead"]>>;
     getLastServerInfoMessage: () => { permissions: string[] };
   },
   archiveAgentSnapshot: vi.fn(),
@@ -94,9 +101,15 @@ vi.mock("@/durable-items/queries", () => ({
 }));
 vi.mock("@/runtime/host-runtime", async (original) => ({
   ...(await original<typeof import("@/runtime/host-runtime")>()),
-  getHostRuntimeStore: () => ({ archiveAgentSnapshot: runtime.archiveAgentSnapshot }),
+  getHostRuntimeStore: () => ({
+    archiveAgentSnapshot: runtime.archiveAgentSnapshot,
+    getSnapshot: () => ({ connectionStatus: "online", client: runtime.client }),
+    subscribeAll: () => () => {},
+  }),
   useHostRuntimeClient: () => runtime.client,
   useHostRuntimeIsConnected: () => true,
+  useHostRuntimeConnectionStatuses: (serverIds: readonly string[]) =>
+    new Map(serverIds.map((serverId) => [serverId, "online"] as const)),
 }));
 vi.mock("../resident-dialog", () => ({
   useOpenResidentDialog: () => null,
@@ -162,10 +175,12 @@ function setupDirectory({
   supportsIdleArchive,
   extraAgents = [],
   mainStreamTail = [],
+  topicReadSnapshot,
 }: {
   supportsIdleArchive: boolean;
   extraAgents?: Agent[];
   mainStreamTail?: StreamItem[];
+  topicReadSnapshot?: WorkspaceTopicReadSnapshot;
 }) {
   const archiveAgent = vi.fn(async () => ({ archivedAt: "2026-11-24T12:00:00.000Z" }));
   const flushAgentInbox = vi.fn(async () => ({}));
@@ -186,11 +201,17 @@ function setupDirectory({
     },
   );
   const serverInfoMessage = { permissions: ["workspace.write", "hub.execute"] };
+  const getWorkspaceTopicReadState = vi.fn<DaemonClient["getWorkspaceTopicReadState"]>(
+    async () => ({ requestId: "get-read-state", snapshot: topicReadSnapshot ?? null, error: null }),
+  );
+  const markWorkspaceTopicRead = vi.fn<DaemonClient["markWorkspaceTopicRead"]>();
   runtime.client = {
     archiveAgent,
     flushAgentInbox,
     clearWorkspaceAttention,
     clearTeamConclusionAttention,
+    getWorkspaceTopicReadState,
+    markWorkspaceTopicRead,
     getLastServerInfoMessage: () => serverInfoMessage,
   };
   const store = useSessionStore.getState();
@@ -227,7 +248,10 @@ function setupDirectory({
     serverId: SERVER_ID,
     hostname: null,
     version: null,
-    features: { agentIdleArchiveV1: supportsIdleArchive },
+    features: {
+      agentIdleArchiveV1: supportsIdleArchive,
+      workspaceTopicReadState: Boolean(topicReadSnapshot),
+    },
   });
 
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -249,10 +273,13 @@ function setupDirectory({
       </TeamMessageJumpProvider>
     </QueryClientProvider>,
   );
-  return { archiveAgent, onOpenAgent, jumpStore };
+  return { archiveAgent, onOpenAgent, jumpStore, queryClient, markWorkspaceTopicRead };
 }
 
 beforeEach(() => {
+  vi.spyOn(HostRuntimeStore.prototype, "archiveAgentSnapshot").mockImplementation((...args) =>
+    runtime.archiveAgentSnapshot(...args),
+  );
   useTeamDirectoryViewStore.setState({ activeTab: "agents", agentGroupMode: "activity" });
   useTopicInboxReadStore.setState({ scopes: {} });
 });
@@ -261,6 +288,7 @@ afterEach(() => {
   cleanup();
   useSessionStore.getState().clearSession(SERVER_ID);
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 it("collapses non-focused idle members by default in activity mode and hides batch cleanup when agentIdleArchiveV1 is unsupported", () => {
@@ -372,6 +400,116 @@ it("switches between attribute view (showing parent Level-1 on Level-2 rows) and
   });
   expect(screen.getByTestId("team-directory-read-section")).toBeTruthy();
 });
+
+it.each(["single", "all"] as const)(
+  "applies recipient topic snapshots and marks only bound replies via %s",
+  async (method) => {
+    const timestamp = new Date("2026-11-25T09:00:00.000Z");
+    const report = (id: string, seq: number, rootMessageId?: string, event = "message") =>
+      ({
+        kind: "tool_call",
+        id,
+        timestamp,
+        timelineCursor: { epoch: "ep-1", seq },
+        payload: {
+          source: "agent",
+          data: {
+            callId: id,
+            name: "agent_message",
+            agentMessage: { event, sender: { id: "task-idle" }, text: id, rootMessageId },
+          },
+        },
+      }) as StreamItem;
+    const snapshot = {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: "main-1",
+      watermarkEpoch: "ep-1",
+      watermarkSeq: -1,
+      watermarkTimestampMs: 0,
+      revision: 0,
+      topics: [],
+    } satisfies WorkspaceTopicReadSnapshot;
+    const { queryClient, markWorkspaceTopicRead } = setupDirectory({
+      supportsIdleArchive: true,
+      topicReadSnapshot: snapshot,
+      mainStreamTail: [
+        { kind: "user_message", id: "prompt", messageId: "prompt", text: "Question", timestamp },
+        report("bound-report", 12, "prompt"),
+        report("permission-report", 13, "prompt", "permission-required"),
+        report("other-report", 14, "not-loaded"),
+      ],
+    });
+    const read = {
+      ...snapshot,
+      revision: 1,
+      topics: [
+        {
+          topicKey: "msg:prompt",
+          readUpToSeq: 12,
+          readUpToTimestampMs: timestamp.getTime(),
+          markedUnreadAtMs: null,
+          updatedAt: timestamp.toISOString(),
+        },
+      ],
+    };
+    markWorkspaceTopicRead.mockResolvedValue({
+      requestId: "topic-mark",
+      snapshot: { ...read, revision: 3 },
+      error: null,
+    });
+    fireEvent.click(screen.getByTestId("team-directory-tab-messages"));
+    await waitFor(() => expect(runtime.client.getWorkspaceTopicReadState).toHaveBeenCalled());
+    const unreadSection = screen.getByTestId("team-directory-unread-section");
+    const boundRow = screen.getByTestId("team-directory-message-msg:bound-report");
+    await act(async () => {
+      applyTopicReadSnapshotToCache(queryClient, SERVER_ID, { ...read, mainAgentId: "main-2" });
+    });
+    expect(unreadSection.contains(boundRow)).toBe(true);
+    await act(async () => applyTopicReadSnapshotToCache(queryClient, SERVER_ID, read));
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("team-directory-read-section")
+          .contains(screen.getByTestId("team-directory-message-msg:bound-report")),
+      ).toBe(true),
+    );
+    await act(async () =>
+      applyTopicReadSnapshotToCache(queryClient, SERVER_ID, { ...snapshot, revision: 2 }),
+    );
+    await waitFor(() =>
+      expect(
+        unreadSection.contains(screen.getByTestId("team-directory-message-msg:bound-report")),
+      ).toBe(true),
+    );
+    fireEvent.click(
+      screen.getByTestId(
+        method === "all"
+          ? "team-directory-mark-all-read"
+          : "team-directory-message-msg:bound-report",
+      ),
+    );
+    expect(markWorkspaceTopicRead).toHaveBeenCalledExactlyOnceWith({
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: "main-1",
+      topicKey: "msg:prompt",
+      mode: "read",
+      epoch: "ep-1",
+      seq: 12,
+      timestampMs: timestamp.getTime(),
+    });
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("team-directory-read-section")
+          .contains(screen.getByTestId("team-directory-message-msg:bound-report")),
+      ).toBe(true),
+    );
+    expect(
+      unreadSection.contains(screen.getByTestId("team-directory-message-msg:permission-report")),
+    ).toBe(true);
+    expect(runtime.client.clearTeamConclusionAttention).not.toHaveBeenCalled();
+  },
+);
 
 it.each(["open", "single", "all"] as const)(
   "reads only the captured main conclusion via %s and leaves unrelated attention alone",

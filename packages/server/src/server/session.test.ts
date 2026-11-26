@@ -389,7 +389,7 @@ interface SessionForTestOptions {
     getWorkspaceGitMetadata?: ReturnType<typeof vi.fn>;
     getProjectSlug?: ReturnType<typeof vi.fn>;
   };
-  workspaceRegistry?: { get: ReturnType<typeof vi.fn> };
+  workspaceRegistry?: FileBackedWorkspaceRegistry | { get: ReturnType<typeof vi.fn> };
   projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
   terminalManager?: SessionOptions["terminalManager"];
   serviceProxy?: SessionOptions["serviceProxy"];
@@ -9994,6 +9994,102 @@ test.each([
   } finally {
     await session.cleanup();
     providerSnapshotManager.destroy();
+  }
+});
+
+test("marks topic history read through persisted coordinates without loading its main agent", async () => {
+  const home = mkdtempSync(join(tmpdir(), "paseo-topic-read-history-"));
+  const logger = pino({ level: "silent" });
+  const storage = new AgentStorage(join(home, "agents"), logger);
+  const registry = new FileBackedWorkspaceRegistry(join(home, "workspaces.json"), logger);
+  const timestamp = "2026-11-26T09:00:00.000Z";
+  const workspaceId = "topic-workspace";
+  const mainAgentId = "topic-main";
+  const messages: SessionOutboundMessage[] = [];
+  const manager = new AgentManager({ logger, registry: storage, workspaceRegistry: registry });
+  const session = createSessionForTest({
+    paseoHome: home,
+    agentManager: manager,
+    agentStorage: storage,
+    workspaceRegistry: registry,
+    topicReadState: new TopicReadStateStore(join(home, "reads")),
+    messages,
+  });
+  try {
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project",
+        cwd: home,
+        kind: "directory",
+        displayName: "Topic",
+        title: "Topic",
+        topic: {},
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    const record = createStoredAgentRecord({
+      id: mainAgentId,
+      cwd: home,
+      workspaceId,
+      lastStatus: "closed",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    await storage.upsert(record);
+    await storage.timelinePrefixes.save(mainAgentId, {
+      version: 1,
+      rows: [
+        {
+          seq: 1,
+          timestamp,
+          item: { type: "user_message", messageId: "prompt", text: "Question" },
+        },
+        { seq: 2, timestamp, item: { type: "assistant_message", text: "Reply" } },
+      ],
+    });
+    await session.handleMessage({
+      type: "fetch_agent_timeline_request",
+      agentId: mainAgentId,
+      requestId: "history",
+    });
+    const history = filterByType(messages, "fetch_agent_timeline_response").at(-1)?.payload;
+    expect(history).toMatchObject({ error: null, endCursor: { seq: 2 } });
+    const epoch = history?.epoch;
+    expect(epoch).toMatch(/^silent-topic:/);
+
+    await session.handleMessage({
+      type: "workspace.topic_read.mark.request",
+      requestId: "single",
+      workspaceId,
+      mainAgentId,
+      topicKey: "msg:prompt",
+      mode: "read",
+      epoch,
+      seq: 2,
+    });
+    expect(
+      filterByType(messages, "workspace.topic_read.mark.response").at(-1)?.payload,
+    ).toMatchObject({
+      error: null,
+      snapshot: { watermarkEpoch: epoch, topics: [{ readUpToSeq: 2 }] },
+    });
+    await session.handleMessage({
+      type: "workspace.topic_read.mark_all.request",
+      requestId: "all",
+      workspaceId,
+      mainAgentId,
+      epoch,
+      maxSeq: 20,
+    });
+    expect(
+      filterByType(messages, "workspace.topic_read.mark_all.response").at(-1)?.payload,
+    ).toMatchObject({ error: null, snapshots: [{ watermarkEpoch: epoch, watermarkSeq: 2 }] });
+    expect(manager.getAgent(mainAgentId)).toBeNull();
+  } finally {
+    await session.cleanup();
+    await manager.flush();
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

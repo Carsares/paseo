@@ -173,8 +173,8 @@ function BottomOverlayInset({ height }: { height: number }) {
   return <View style={style} />;
 }
 
-function renderPendingPermissionsNode(input: {
-  pendingPermissions: PendingPermission[];
+export function renderPendingPermissionsNode(input: {
+  pendingPermissions: readonly PendingPermission[];
   client: DaemonClient | null;
 }): ReactNode {
   if (input.pendingPermissions.length === 0) {

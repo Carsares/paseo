@@ -95,6 +95,30 @@ describe("notification open", () => {
     return { source, agents, routes, terminals, router };
   }
 
+  it("hands two finished notifications for the same Main Control to their own topics", async () => {
+    const { source, agents, router } = setup();
+    const stop = router.start();
+    await flush();
+    for (const topicKey of ["task:a", "task:b"]) {
+      source.tap({
+        id: topicKey,
+        data: {
+          reason: "finished",
+          serverId: "host",
+          agentId: "main",
+          workspaceId: "work",
+          topicKey,
+        },
+      });
+    }
+    await flush();
+    expect(agents.slice(1)).toEqual([
+      { serverId: "host", workspaceId: "work", agentId: "main", topicKey: "task:a" },
+      { serverId: "host", workspaceId: "work", agentId: "main", topicKey: "task:b" },
+    ]);
+    stop();
+  });
+
   it("takes the launch tap once across remounts", async () => {
     const { source, agents, router } = setup();
     router.start()();

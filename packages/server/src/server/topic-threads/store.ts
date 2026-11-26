@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
+  AgentAttachmentSchema,
   TopicAnchorSummarySchema,
   TopicThreadEntrySchema,
+  TopicReplyRouteModeSchema,
   WorkspaceDurableItemSchema,
   WorkspaceTaskSummarySchema,
   WorkspaceTopicDecideRequestSchema,
@@ -13,6 +15,7 @@ import {
 import { z } from "zod";
 import { normalizePathForIdentity } from "../../utils/path.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
+import type { WorkspaceTask } from "../agent/task-ledger/index.js";
 
 import {
   checkTopicAddress,
@@ -61,11 +64,42 @@ const storedDecisionSchema = z.object({
   blockingQuestionGeneration: z.uuid().nullable().optional(),
   durableItem: WorkspaceDurableItemSchema.optional(),
   task: WorkspaceTaskSummarySchema.optional(),
+  followupSuperseded: z.boolean().optional(),
 });
 export type StoredTopicDecision = z.infer<typeof storedDecisionSchema>;
-type NewTopicDecision = Omit<StoredTopicDecision, "operationId" | "durableItem" | "task">;
-type TopicDecisionProgress = Pick<StoredTopicDecision, "durableItem" | "task">;
+type TopicDecisionProgress = Pick<
+  StoredTopicDecision,
+  "durableItem" | "task" | "followupSuperseded"
+>;
+type NewTopicDecision = Omit<StoredTopicDecision, "operationId" | keyof TopicDecisionProgress>;
 export type TopicAgentReply = Pick<TopicThreadEntry, "text" | "sourceMessageId" | "authorTitle">;
+
+export function isOriginalDecisionTask(record: StoredTopicDecision, task: WorkspaceTask) {
+  return (
+    record.taskId === task.taskId &&
+    record.taskCreatedAt === task.createdAt &&
+    record.rootMessageId === task.rootMessageId
+  );
+}
+
+export function canDeliverDurableDecision(
+  record: StoredTopicDecision,
+  current: WorkspaceTask | undefined,
+) {
+  return (
+    !record.followupSuperseded &&
+    current !== undefined &&
+    isOriginalDecisionTask(record, current) &&
+    current.status === record.desiredStatus &&
+    current.status !== "canceled" &&
+    current.status !== "deferred" &&
+    current.blockingQuestion === undefined &&
+    (current.blockingQuestionGeneration === record.operationId ||
+      // Older decisions did not write a generation when clearing the question.
+      (record.blockingQuestionGeneration === undefined &&
+        current.blockingQuestionGeneration === undefined))
+  );
+}
 
 function requireMatchingFollowup(previous: TopicThreadEntry, followup: Followup) {
   const promoted =
@@ -84,7 +118,19 @@ function requireMatchingFollowup(previous: TopicThreadEntry, followup: Followup)
     throw new Error("This message ID is already used by another topic follow-up.");
 }
 
-const storedEntrySchema = TopicThreadEntrySchema.extend({ handoffPending: z.boolean().optional() });
+const deliverySchema = z.object({
+  routeMode: TopicReplyRouteModeSchema.optional(),
+  attachments: z.array(AgentAttachmentSchema).optional(),
+  decisionPrompt: z.string().optional(),
+  taskCreatedAt: z.iso.datetime().optional(),
+});
+export type TopicDelivery = z.infer<typeof deliverySchema>;
+const storedEntrySchema = TopicThreadEntrySchema.extend({
+  handoffPending: z.boolean().optional(),
+  followupSuppressed: z.boolean().optional(),
+  delivery: deliverySchema.optional(),
+  retryOfEntryId: z.string().optional(),
+});
 type StoredEntry = z.infer<typeof storedEntrySchema>;
 const entriesSchema = z.array(storedEntrySchema);
 const topicFileSchema = z.object({
@@ -124,26 +170,44 @@ function migrateLegacyReplies(
   });
 }
 
-function requireDecisionClaim(data: TopicFile, followup: Followup) {
+function requireDecisionClaim(
+  data: TopicFile,
+  followup: Followup,
+  decisionMessageId = followup.sourceMessageId,
+  historyOnly = false,
+) {
   const record = data.decisions?.find(
-    ({ input }) =>
-      sameThreadScope(input, followup) && input.clientMessageId === followup.sourceMessageId,
+    ({ input }) => sameThreadScope(input, followup) && input.clientMessageId === decisionMessageId,
   );
   const isDecision = followup.origin === "decision_reply" || followup.origin === "butler_dispatch";
   if (!isDecision) {
     if (record) throw new Error("This message ID is already used by a topic decision.");
     return;
   }
-  if (!record?.task || record.origin !== followup.origin || record.taskId !== followup.taskId)
+  if (
+    !record ||
+    (!record.task && !(historyOnly && record.durableItem)) ||
+    record.origin !== followup.origin ||
+    record.taskId !== followup.taskId ||
+    record.rootMessageId !== followup.rootMessageId
+  )
     throw new Error("The topic decision has not been applied to this task.");
   if (record.input.resolutionKind === "durable_item" && !record.durableItem)
     throw new Error("The durable item decision has not been recorded.");
+  if (!historyOnly && record.followupSuperseded)
+    throw new Error("The task changed since this topic decision was recorded.");
 }
 
 const pendingByFile = new Map<string, Promise<void>>();
 const activeEntries = new Set<string>();
 
-function publicEntry({ handoffPending: _, ...entry }: StoredEntry): TopicThreadEntry {
+function publicEntry({
+  handoffPending: _,
+  followupSuppressed: _suppressed,
+  delivery: _delivery,
+  retryOfEntryId: _retry,
+  ...entry
+}: StoredEntry): TopicThreadEntry {
   return entry;
 }
 
@@ -227,18 +291,24 @@ export class TopicThreadStore {
     });
   }
 
-  appendDecisionEntry(input: Followup, assertCurrent?: () => void): Promise<EntryWrite> {
-    return this.appendCompleted({ ...input, role: "system_note" }, assertCurrent);
+  appendDecisionEntry(
+    input: Followup,
+    assertCurrent?: () => void,
+    superseded = false,
+  ): Promise<EntryWrite & { followupSuppressed?: boolean }> {
+    return this.appendCompleted({ ...input, role: "system_note" }, assertCurrent, superseded);
   }
 
   private appendCompleted(
     input: Followup &
       Pick<TopicThreadEntry, "role" | "reportStatus" | "authorAgentId" | "authorTitle">,
     assertCurrent?: () => void,
-  ): Promise<EntryWrite> {
+    superseded = false,
+  ): Promise<EntryWrite & { followupSuppressed?: boolean }> {
     return this.run(input.workspaceId, async (data, file) => {
       checkTopicAddress(input);
-      if (input.role === "system_note") requireDecisionClaim(data, input);
+      if (input.role === "system_note")
+        requireDecisionClaim(data, input, input.sourceMessageId, true);
       const anchor = data.anchors.find(
         (item) => sameThreadScope(item, input) && item.topicKey === input.topicKey,
       );
@@ -252,6 +322,39 @@ export class TopicThreadStore {
             : entry.role !== "agent_reply"),
       );
       if (previous) {
+        if (superseded && previous.role === "user_followup") {
+          requireMatchingFollowup(previous, input);
+          if (
+            previous.taskId !== input.taskId ||
+            previous.rootMessageId !== input.rootMessageId ||
+            previous.decision !== input.decision ||
+            previous.durableItemRequestId !== input.durableItemRequestId
+          )
+            throw new Error("This follow-up belongs to a different topic decision.");
+          const unchanged = {
+            entry: publicEntry(previous),
+            changed: false,
+            followupSuppressed: previous.followupSuppressed,
+          };
+          if (previous.status === "completed" || activeEntries.has(`${file}:${previous.entryId}`))
+            return unchanged;
+          if (previous.status === "error" && !previous.retryable) return unchanged;
+          // A durable handoff marker precedes provider submission. A legacy entry
+          // without a marker cannot prove that it was never submitted.
+          const followupSuppressed =
+            previous.retryable === true ||
+            (previous.status === "queued" && previous.handoffPending === false);
+          Object.assign(previous, {
+            followupSuppressed,
+            status: "error",
+            retryable: false,
+            handoffPending: undefined,
+            updatedAt: new Date().toISOString(),
+          });
+          assertCurrent?.();
+          await writeJsonFileAtomic(file, data);
+          return { entry: publicEntry(previous), changed: true, followupSuppressed };
+        }
         if (
           previous.role !== input.role ||
           previous.origin !== input.origin ||
@@ -336,14 +439,59 @@ export class TopicThreadStore {
     });
   }
 
+  getDelivery(
+    scope: ThreadScope & { topicKey: string },
+    id: { entryId: string } | { sourceMessageId: string },
+  ) {
+    return this.run(scope.workspaceId, ({ entries, decisions }) => {
+      const found = entries.find(
+        (entry) =>
+          entry.role === "user_followup" &&
+          sameThreadScope(entry, scope) &&
+          entry.topicKey === scope.topicKey &&
+          ("entryId" in id
+            ? entry.entryId === id.entryId
+            : entry.sourceMessageId === id.sourceMessageId),
+      );
+      if (!found) return;
+      const root = found.retryOfEntryId
+        ? entries.find((entry) => entry.entryId === found.retryOfEntryId)
+        : found;
+      if (!root?.delivery) return;
+      const decision = decisions?.find(
+        ({ input }) =>
+          sameThreadScope(input, scope) && input.clientMessageId === root.sourceMessageId,
+      );
+      return { entry: publicEntry(found), delivery: root.delivery, decision };
+    });
+  }
+
   begin(
     followup: Followup,
     wasAccepted?: (entry: TopicThreadEntry) => Promise<boolean>,
     assertCurrent?: () => void,
-  ): Promise<{ entry: TopicThreadEntry; changed: boolean; release?: () => void }> {
+    delivery?: TopicDelivery,
+    retryOfEntryId?: string,
+  ): Promise<{
+    entry: TopicThreadEntry;
+    changed: boolean;
+    release?: () => void;
+    sourceUpdate?: TopicThreadEntry;
+  }> {
     return this.run(followup.workspaceId, async (data, file) => {
       const { entries } = data;
-      requireDecisionClaim(data, followup);
+      const source = retryOfEntryId
+        ? entries.find(
+            (entry) =>
+              entry.entryId === retryOfEntryId &&
+              entry.role === "user_followup" &&
+              entry.topicKey === followup.topicKey &&
+              sameThreadScope(entry, followup),
+          )
+        : undefined;
+      if (retryOfEntryId && (!source?.delivery || source.retryOfEntryId))
+        throw new Error("The original topic follow-up is unavailable.");
+      requireDecisionClaim(data, followup, source?.sourceMessageId);
       const index = entries.findIndex(
         (entry) =>
           entry.role !== "agent_reply" &&
@@ -353,40 +501,76 @@ export class TopicThreadStore {
       const previous = entries[index];
       const now = new Date().toISOString();
       if (previous) {
-        requireMatchingFollowup(previous, followup);
-        const key = `${file}:${previous.entryId}`;
-        if (
-          previous.status === "completed" ||
-          previous.status === "error" ||
-          activeEntries.has(key)
-        )
-          return { entry: publicEntry(previous), changed: false };
-
-        // A restarted router has no live claim. Recover when the client resends the request
-        // so attachments are available. A past provider handoff may already have executed.
-        // Before the handoff marker existed, running was only written after the turn started.
-        const handedOff =
-          previous.handoffPending === true ||
-          (previous.handoffPending === undefined && previous.status === "running") ||
-          (await wasAccepted?.(publicEntry(previous))) === true;
-        const entry = publicEntry({
-          ...previous,
-          ...(handedOff
-            ? { status: "error" }
-            : { status: "queued", routedAgentId: followup.routedAgentId }),
-          updatedAt: now,
-        });
-        entries[index] = { ...entry, handoffPending: handedOff ? undefined : false };
-        assertCurrent?.();
-        await writeJsonFileAtomic(file, data);
-        return { entry, changed: true, release: handedOff ? undefined : this.claim(file, entry) };
+        return this.recoverFollowup(
+          data,
+          file,
+          index,
+          followup,
+          wasAccepted,
+          assertCurrent,
+          retryOfEntryId,
+        );
       }
       const entry = this.newEntry(data, { ...followup, role: "user_followup" }, "queued");
-      entries.push({ ...entry, handoffPending: false });
+      if (source && source.retryable !== true)
+        throw new Error("The original delivery cannot be retried safely.");
+      entries.push({
+        ...entry,
+        handoffPending: false,
+        delivery: source ? undefined : delivery,
+        retryOfEntryId,
+      });
+      if (source) {
+        source.retryable = false;
+        source.updatedAt = now;
+      }
       assertCurrent?.();
       await writeJsonFileAtomic(file, data);
-      return { entry, changed: true, release: this.claim(file, entry) };
+      return {
+        entry,
+        changed: true,
+        release: this.claim(file, entry),
+        sourceUpdate: source && publicEntry(source),
+      };
     });
+  }
+
+  private async recoverFollowup(
+    data: TopicFile,
+    file: string,
+    index: number,
+    followup: Followup,
+    wasAccepted: ((entry: TopicThreadEntry) => Promise<boolean>) | undefined,
+    assertCurrent: (() => void) | undefined,
+    retryOfEntryId: string | undefined,
+  ) {
+    const previous = data.entries[index];
+    const now = new Date().toISOString();
+    requireMatchingFollowup(previous, followup);
+    if (previous.retryOfEntryId !== retryOfEntryId)
+      throw new Error("This message ID is already used by another topic operation.");
+    const key = `${file}:${previous.entryId}`;
+    if (previous.status === "completed" || previous.status === "error" || activeEntries.has(key))
+      return { entry: publicEntry(previous), changed: false };
+
+    // A restarted router has no live claim. Recover when the client resends the request
+    // so attachments are available. A past provider handoff may already have executed.
+    // Before the handoff marker existed, running was only written after the turn started.
+    const handedOff =
+      previous.handoffPending === true ||
+      (previous.handoffPending === undefined && previous.status === "running") ||
+      (await wasAccepted?.(publicEntry(previous))) === true;
+    const entry = publicEntry({
+      ...previous,
+      ...(handedOff
+        ? { status: "error" }
+        : { status: "queued", routedAgentId: followup.routedAgentId }),
+      updatedAt: now,
+    });
+    data.entries[index] = { ...previous, ...entry, handoffPending: handedOff ? undefined : false };
+    assertCurrent?.();
+    await writeJsonFileAtomic(file, data);
+    return { entry, changed: true, release: handedOff ? undefined : this.claim(file, entry) };
   }
 
   private claim(file: string, entry: TopicThreadEntry): () => void {
@@ -433,6 +617,7 @@ export class TopicThreadStore {
     entryId: string,
     status: "running" | "completed" | "error",
     reply?: TopicAgentReply,
+    suppressFollowup = false,
   ): Promise<TopicThreadEntry[]> {
     return this.run(workspaceId, async (data, file) => {
       const { entries } = data;
@@ -450,7 +635,26 @@ export class TopicThreadStore {
         handoffPending: status === "running" ? user.handoffPending : undefined,
       };
       entries[index] = updated;
-      const changes: TopicThreadEntry[] = [publicEntry(updated)];
+      const source =
+        user.retryOfEntryId && entries.find((entry) => entry.entryId === user.retryOfEntryId);
+      const retryable =
+        status === "error" &&
+        user.status === "queued" &&
+        user.handoffPending === false &&
+        !!(source ? source.delivery : user.delivery);
+      const changes: TopicThreadEntry[] = [];
+      if (retryable) {
+        if (suppressFollowup) {
+          entries[index].followupSuppressed = true;
+          entries[index].retryable = false;
+        } else {
+          const retrySource = source || entries[index];
+          retrySource.retryable = true;
+          retrySource.updatedAt = now;
+          if (source) changes.push(publicEntry(source));
+        }
+      }
+      changes.unshift(publicEntry(entries[index]));
       if (reply) {
         const entry = TopicThreadEntrySchema.parse({
           workspaceId: user.workspaceId,

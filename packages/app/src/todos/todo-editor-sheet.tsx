@@ -1,4 +1,4 @@
-import type { WorkspaceTodoChecklistItem } from "@getpaseo/protocol/messages";
+import type { WorkspaceTodoChecklistItem, WorkspaceTodoItem } from "@getpaseo/protocol/messages";
 import { Check, Plus, Square, Trash2 } from "lucide-react-native";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -12,7 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { useHostFeature } from "@/runtime/host-features";
-import { useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import { useTopicStreamViewStore, type TodoEditorRequest } from "@/stores/topic-stream-view-store";
 import type { Theme } from "@/styles/theme";
 import { buildQuickDueAt, type QuickDuePreset } from "./model";
 import { useDeleteWorkspaceTodo, useUpsertWorkspaceTodo } from "./queries";
@@ -49,30 +49,45 @@ function formatLocalDateTimeInput(iso: string | null | undefined): string {
 }
 
 function parseLocalDateTimeInput(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const normalized = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T");
-  const parsed = new Date(normalized);
+  const local = raw.trim().replace("T", " ");
+  if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(local)) return null;
+  const parsed = new Date(local.replace(" ", "T"));
   if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toISOString();
-}
-
-function resolveRemindMinutes(
-  resolvedDueAt: string | null,
-  remindBefore15m: boolean,
-): number | null {
-  if (!resolvedDueAt) return null;
-  return remindBefore15m ? 15 : 0;
+  const iso = parsed.toISOString();
+  return formatLocalDateTimeInput(iso) === local ? iso : null;
 }
 
 function resolveDueAtForSave(
   dueSelection: DueSelection,
   customDueText: string,
   dueIso: string | null,
+  original: string | null | undefined,
 ): string | null {
   if (dueSelection === "none") return null;
-  if (dueSelection === "custom") return parseLocalDateTimeInput(customDueText);
-  return dueIso;
+  if (dueSelection !== "custom") return dueIso;
+  const local = customDueText.trim().replace("T", " ");
+  if (original && local === formatLocalDateTimeInput(original)) return original;
+  return parseLocalDateTimeInput(local);
+}
+
+function buildDeadlineUpdate(
+  existing: WorkspaceTodoItem | undefined,
+  dueAt: string | null,
+  remindMinutes: number | null,
+  reminderEdited: boolean,
+): Partial<Pick<WorkspaceTodoItem, "dueAt" | "remindBeforeMinutes">> {
+  const remindBeforeMinutes = dueAt ? (remindMinutes ?? 0) : null;
+  if (!existing) return { dueAt, remindBeforeMinutes };
+  const update: Partial<Pick<WorkspaceTodoItem, "dueAt" | "remindBeforeMinutes">> = {};
+  if (dueAt !== existing.dueAt) update.dueAt = dueAt;
+  const changedDueAvailability = Boolean(existing.dueAt) !== Boolean(dueAt);
+  if (
+    changedDueAvailability ||
+    (reminderEdited && remindBeforeMinutes !== existing.remindBeforeMinutes)
+  ) {
+    update.remindBeforeMinutes = remindBeforeMinutes;
+  }
+  return update;
 }
 
 function toggleStepInList(
@@ -158,11 +173,11 @@ const DuePillButton = memo(function DuePillButton({
 });
 
 const RemindOptionSection = memo(function RemindOptionSection({
-  remindBefore15m,
+  remindMinutes,
   onSelectOnTime,
   onSelectBefore15m,
 }: {
-  remindBefore15m: boolean;
+  remindMinutes: number | null;
   onSelectOnTime: () => void;
   onSelectBefore15m: () => void;
 }) {
@@ -173,22 +188,22 @@ const RemindOptionSection = memo(function RemindOptionSection({
       <View style={styles.duePills}>
         <PressHighlight
           accessibilityRole="button"
-          accessibilityState={!remindBefore15m ? SELECTED_STATE : UNSELECTED_STATE}
+          accessibilityState={!remindMinutes ? SELECTED_STATE : UNSELECTED_STATE}
           onPress={onSelectOnTime}
-          style={[styles.duePill, !remindBefore15m && styles.duePillSelected]}
+          style={[styles.duePill, !remindMinutes && styles.duePillSelected]}
         >
-          <Text style={[styles.duePillText, !remindBefore15m && styles.duePillTextSelected]}>
+          <Text style={[styles.duePillText, !remindMinutes && styles.duePillTextSelected]}>
             {t("topicWorkbench.todos.remindOnTime")}
           </Text>
         </PressHighlight>
         <PressHighlight
           accessibilityRole="button"
-          accessibilityState={remindBefore15m ? SELECTED_STATE : UNSELECTED_STATE}
+          accessibilityState={remindMinutes === 15 ? SELECTED_STATE : UNSELECTED_STATE}
           onPress={onSelectBefore15m}
-          style={[styles.duePill, remindBefore15m && styles.duePillSelected]}
+          style={[styles.duePill, remindMinutes === 15 && styles.duePillSelected]}
           testID="todo-editor-remind-15m"
         >
-          <Text style={[styles.duePillText, remindBefore15m && styles.duePillTextSelected]}>
+          <Text style={[styles.duePillText, remindMinutes === 15 && styles.duePillTextSelected]}>
             {t("topicWorkbench.todos.remindBefore15m")}
           </Text>
         </PressHighlight>
@@ -197,20 +212,18 @@ const RemindOptionSection = memo(function RemindOptionSection({
   );
 });
 
-export const TodoEditorSheet = memo(function TodoEditorSheet({
-  serverId,
-  workspaceId,
-}: {
-  serverId: string;
-  workspaceId: string;
-}) {
-  const { t } = useTranslation();
+export const TodoEditorSheet = memo(function TodoEditorSheet() {
   const request = useTopicStreamViewStore((state) => state.todoEditorRequest);
-  const closeTodoEditor = useTopicStreamViewStore((state) => state.closeTodoEditor);
+  return request ? <TodoEditorForm request={request} /> : null;
+});
 
-  const visible = Boolean(
-    request && request.serverId === serverId && request.workspaceId === workspaceId,
-  );
+function TodoEditorForm({ request }: { request: TodoEditorRequest }) {
+  const { t, i18n } = useTranslation();
+  const { serverId, workspaceId, existingTodo } = request;
+  const closeTodoEditor = useCallback(() => {
+    const state = useTopicStreamViewStore.getState();
+    if (state.todoEditorRequest === request) state.closeTodoEditor();
+  }, [request]);
   const supportsTodos = useHostFeature(serverId, "workspaceTodos");
   const upsertMutation = useUpsertWorkspaceTodo(serverId);
   const deleteMutation = useDeleteWorkspaceTodo(serverId);
@@ -222,14 +235,14 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
   const [dueSelection, setDueSelection] = useState<DueSelection>("none");
   const [dueIso, setDueIso] = useState<string | null>(null);
   const [customDueText, setCustomDueText] = useState("");
-  const [remindBefore15m, setRemindBefore15m] = useState(false);
+  const [remindMinutes, setRemindMinutes] = useState<number | null>(null);
+  const [reminderEdited, setReminderEdited] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [formResetKey, setFormResetKey] = useState(0);
   const [stepResetKey, setStepResetKey] = useState(0);
   const [dueResetKey, setDueResetKey] = useState(0);
 
   useEffect(() => {
-    if (!visible || !request) return;
     const existing = request.existingTodo;
     if (existing) {
       setTitle(existing.title);
@@ -238,7 +251,7 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
       setDueIso(existing.dueAt);
       setDueSelection(existing.dueAt ? "custom" : "none");
       setCustomDueText(formatLocalDateTimeInput(existing.dueAt));
-      setRemindBefore15m((existing.remindBeforeMinutes ?? 0) > 0);
+      setRemindMinutes(existing.remindBeforeMinutes);
     } else {
       setTitle(request.initialTitle ?? "");
       setNote(request.initialNote ?? "");
@@ -246,14 +259,15 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
       setDueIso(null);
       setDueSelection("none");
       setCustomDueText("");
-      setRemindBefore15m(false);
+      setRemindMinutes(null);
     }
+    setReminderEdited(false);
     setNewStepText("");
     setErrorText(null);
     setFormResetKey((k) => k + 1);
     setStepResetKey((k) => k + 1);
     setDueResetKey((k) => k + 1);
-  }, [request, visible]);
+  }, [request]);
 
   const handleSelectDue = useCallback((selection: DueSelection) => {
     setDueSelection(selection);
@@ -295,17 +309,36 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
     setChecklist((current) => removeStepFromList(current, itemId));
   }, []);
 
-  const handleSelectRemindOnTime = useCallback(() => setRemindBefore15m(false), []);
-  const handleSelectRemindBefore15m = useCallback(() => setRemindBefore15m(true), []);
+  const handleSelectRemindOnTime = useCallback(() => {
+    setRemindMinutes(0);
+    setReminderEdited(true);
+  }, []);
+  const handleSelectRemindBefore15m = useCallback(() => {
+    setRemindMinutes(15);
+    setReminderEdited(true);
+  }, []);
 
   const handleSave = useCallback(async () => {
-    if (!request || !supportsTodos) return;
+    if (!supportsTodos) return;
     const trimmedTitle = title.trim();
     if (!trimmedTitle) return;
 
-    const resolvedDueAt = resolveDueAtForSave(dueSelection, customDueText, dueIso);
-    const remindMinutes = resolveRemindMinutes(resolvedDueAt, remindBefore15m);
-
+    const resolvedDueAt = resolveDueAtForSave(
+      dueSelection,
+      customDueText,
+      dueIso,
+      existingTodo?.dueAt,
+    );
+    if (dueSelection === "custom" && !resolvedDueAt) {
+      setErrorText(
+        t("topicWorkbench.todos.invalidDueDate", {
+          defaultValue: i18n.resolvedLanguage?.startsWith("zh")
+            ? "请输入有效的日期和时间（YYYY-MM-DD HH:mm）。"
+            : "Enter a valid date and time (YYYY-MM-DD HH:mm).",
+        }),
+      );
+      return;
+    }
     setErrorText(null);
     try {
       await upsertMutation.mutateAsync({
@@ -319,13 +352,14 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
         title: trimmedTitle,
         ...(note.trim() ? { note: note.trim() } : {}),
         checklist,
-        dueAt: resolvedDueAt,
-        remindBeforeMinutes: remindMinutes,
+        ...buildDeadlineUpdate(existingTodo, resolvedDueAt, remindMinutes, reminderEdited),
         source: request.existingTodo ? request.existingTodo.source : (request.source ?? null),
       });
       closeTodoEditor();
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : String(err));
+      if (useTopicStreamViewStore.getState().todoEditorRequest === request) {
+        setErrorText(err instanceof Error ? err.message : String(err));
+      }
     }
   }, [
     checklist,
@@ -333,17 +367,21 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
     customDueText,
     dueIso,
     dueSelection,
+    existingTodo,
+    i18n.resolvedLanguage,
     note,
-    remindBefore15m,
+    remindMinutes,
+    reminderEdited,
     request,
     supportsTodos,
+    t,
     title,
     upsertMutation,
     workspaceId,
   ]);
 
   const handleDelete = useCallback(async () => {
-    if (!request?.existingTodo) return;
+    if (!request.existingTodo) return;
     setErrorText(null);
     try {
       await deleteMutation.mutateAsync({
@@ -352,7 +390,9 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
       });
       closeTodoEditor();
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : String(err));
+      if (useTopicStreamViewStore.getState().todoEditorRequest === request) {
+        setErrorText(err instanceof Error ? err.message : String(err));
+      }
     }
   }, [closeTodoEditor, deleteMutation, request, workspaceId]);
 
@@ -434,7 +474,7 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
 
   return (
     <AdaptiveModalSheet
-      visible={visible}
+      visible
       onClose={closeTodoEditor}
       header={header}
       footer={footer}
@@ -540,18 +580,22 @@ export const TodoEditorSheet = memo(function TodoEditorSheet({
 
           {dueSelection !== "none" ? (
             <RemindOptionSection
-              remindBefore15m={remindBefore15m}
+              remindMinutes={remindMinutes}
               onSelectOnTime={handleSelectRemindOnTime}
               onSelectBefore15m={handleSelectRemindBefore15m}
             />
           ) : null}
 
-          {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
+          {errorText ? (
+            <Text accessibilityRole="alert" style={styles.errorText} testID="todo-editor-error">
+              {errorText}
+            </Text>
+          ) : null}
         </View>
       )}
     </AdaptiveModalSheet>
   );
-});
+}
 
 const styles = StyleSheet.create((theme) => ({
   formBody: {

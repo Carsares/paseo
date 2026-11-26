@@ -215,7 +215,7 @@ test("keeps explicit legacy reply ownership and leaves ambiguous replies under t
   await store.upsertAnchor(root);
   const bound = await store.begin({ ...followup, ...root, taskId: "B" });
   bound.release?.();
-  await store.update(root.workspaceId, bound.entry.entryId, "completed");
+  const [completed] = await store.update(root.workspaceId, bound.entry.entryId, "completed");
   const unbound = await store.begin({
     ...followup,
     ...root,
@@ -226,15 +226,12 @@ test("keeps explicit legacy reply ownership and leaves ambiguous replies under t
   await store.upsertAnchor({ ...root, topicKey: "task:A", taskId: "A" });
   const reopened = new TopicThreadStore(home);
   expect(await reopened.list(root, "task:A")).toEqual([]);
-  expect(await reopened.list(root, root.topicKey)).toEqual([
-    { ...bound.entry, status: "completed" },
-    unbound.entry,
-  ]);
+  expect(await reopened.list(root, root.topicKey)).toEqual([completed, unbound.entry]);
 
   await reopened.upsertAnchor({ ...root, topicKey: "task:B", taskId: "B" });
   const readBack = new TopicThreadStore(home);
   expect(await readBack.list(root, "task:B")).toEqual([
-    { ...bound.entry, status: "completed", topicKey: "task:B", taskId: "B" },
+    { ...completed, topicKey: "task:B", taskId: "B" },
   ]);
   expect(await readBack.list(root, root.topicKey)).toEqual([unbound.entry]);
   expect(await readBack.list(root, "task:A")).toEqual([]);

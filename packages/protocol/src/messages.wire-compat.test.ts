@@ -39,6 +39,7 @@ import {
   TopicThreadEntrySchema,
   WorkspaceTopicListEntriesResponseSchema,
   WorkspaceTopicReplyRequestSchema,
+  WorkspaceTopicReadMarkRequestSchema,
   WorkspaceTopicThreadUpdatedMessageSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
@@ -277,6 +278,11 @@ test("topic thread metadata and anchors extend legacy reply, list and update mes
     text: "Any update?",
   };
   const replyWithPreview = { ...reply, rootPromptPreview: anchor.rootPromptText };
+  const retry = { ...replyWithPreview, retryOfEntryId: entry.entryId };
+  expect(WorkspaceTopicReplyRequestSchema.parse(retry)).toEqual(retry);
+  expect(WorkspaceTopicReplyRequestSchema.omit({ retryOfEntryId: true }).parse(retry)).toEqual(
+    replyWithPreview,
+  );
   expect(WorkspaceTopicReplyRequestSchema.parse(reply)).toEqual(reply);
   expect(WorkspaceTopicReplyRequestSchema.parse(replyWithPreview)).toEqual(replyWithPreview);
   expect(
@@ -286,6 +292,7 @@ test("topic thread metadata and anchors extend legacy reply, list and update mes
   const legacyEntrySchema = TopicThreadEntrySchema.omit({
     origin: true,
     reportStatus: true,
+    retryable: true,
     durableItemRequestId: true,
     decision: true,
   });
@@ -305,6 +312,15 @@ test("topic thread metadata and anchors extend legacy reply, list and update mes
   expect(SessionOutboundMessageSchema.parse(threadUpdate)).toEqual(threadUpdate);
   expect(SessionOutboundMessageSchema.parse(anchoredUpdate)).toEqual(anchoredUpdate);
   expect(legacyThreadUpdateSchema.parse(anchoredUpdate)).toEqual(threadUpdate);
+  const retryUpdate = {
+    ...anchoredUpdate,
+    payload: { ...anchoredUpdate.payload, entry: { ...entry, status: "error", retryable: true } },
+  };
+  expect(SessionOutboundMessageSchema.parse(retryUpdate)).toEqual(retryUpdate);
+  expect(legacyThreadUpdateSchema.parse(retryUpdate).payload.entry).toEqual({
+    ...entry,
+    status: "error",
+  });
   expect(
     SessionOutboundMessageSchema.safeParse({
       ...threadUpdate,
@@ -332,6 +348,28 @@ test("topic thread metadata and anchors extend legacy reply, list and update mes
   expect(SessionOutboundMessageSchema.parse(anchoredList)).toEqual(anchoredList);
   expect(legacyListSchema.parse(anchoredList)).toEqual(list);
 });
+
+test.each(["before-reset", null])(
+  "single-topic read markers accept an optional observed epoch %s",
+  (epoch) => {
+    const old = {
+      type: "workspace.topic_read.mark.request",
+      requestId: "read-1",
+      workspaceId: "workspace",
+      mainAgentId: "main",
+      topicKey: "task:release",
+      mode: "read",
+      seq: 2,
+      timestampMs: 10,
+    };
+    const watermarked = { ...old, epoch };
+    expect(SessionInboundMessageSchema.parse(watermarked)).toEqual(watermarked);
+    expect(SessionInboundMessageSchema.parse(old)).toEqual(old);
+    expect(WorkspaceTopicReadMarkRequestSchema.omit({ epoch: true }).parse(watermarked)).toEqual(
+      old,
+    );
+  },
+);
 
 test("hello preserves the opt-in workspace butler capability", () => {
   const legacyHello = {

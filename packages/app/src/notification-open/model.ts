@@ -12,7 +12,7 @@ export type NotificationOpenTarget =
       topicKey?: string;
       todoId?: string;
     }
-  | { kind: "agent"; serverId: string; agentId: string }
+  | { kind: "agent"; serverId: string; agentId: string; workspaceId?: string; topicKey?: string }
   | { kind: "terminal"; serverId: string; workspaceId: string; terminalId: string }
   | { kind: "host"; serverId: string };
 
@@ -43,13 +43,21 @@ export function parseNotificationOpenTarget(data: unknown): NotificationOpenTarg
   const terminalId = readId(data, "terminalId");
   if (workspaceId && terminalId) return { kind: "terminal", serverId, workspaceId, terminalId };
   const agentId = readId(data, "agentId");
-  if (agentId) return { kind: "agent", serverId, agentId };
+  if (agentId) {
+    const topicKey = readId(data, "topicKey");
+    return {
+      kind: "agent",
+      serverId,
+      agentId,
+      ...(reason === "finished" && workspaceId && topicKey ? { workspaceId, topicKey } : {}),
+    };
+  }
   return { kind: "host", serverId };
 }
 
 interface NotificationOpenRouterDeps {
   source: NotificationOpenSource;
-  openAgent: (target: { serverId: string; agentId: string }) => void;
+  openAgent: (target: Omit<Extract<NotificationOpenTarget, { kind: "agent" }>, "kind">) => void;
   openRoute: (route: string) => void;
   openTerminal: (target: Extract<NotificationOpenTarget, { kind: "terminal" }>) => void;
   openTodoDue?: (target: Extract<NotificationOpenTarget, { kind: "todo_due" }>) => void;
@@ -71,7 +79,8 @@ export function createNotificationOpenRouter(deps: NotificationOpenRouterDeps) {
         deps.openAgent({ serverId: target.serverId, agentId: target.agentId });
       }
     } else if (target?.kind === "agent") {
-      deps.openAgent({ serverId: target.serverId, agentId: target.agentId });
+      const { kind: _, ...agent } = target;
+      deps.openAgent(agent);
     } else if (target?.kind === "terminal") {
       deps.openTerminal(target);
     } else if (target?.kind === "host") {

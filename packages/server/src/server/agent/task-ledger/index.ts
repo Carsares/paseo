@@ -97,6 +97,7 @@ const WorkspaceTaskSchema = WorkspaceTaskUpsertSchema.extend({
   events: z.array(TaskEventSchema).optional(),
   recentAgentStates: z.array(TaskEventSchema).optional(),
   blockingQuestionGeneration: z.uuid().optional(),
+  appliedReportIds: z.array(z.string().min(1)).optional(),
   silentReportIds: z.array(z.string().min(1)).max(TASK_PENDING_SILENT_REPORT_LIMIT).optional(),
   touchedFiles: z
     .array(z.string().refine(isNormalizedTouchedFile))
@@ -223,6 +224,7 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     leadServerId,
     conclusionMessageId,
     latestReplyPreview,
+    appliedReportIds,
     createdAt = now,
   } = current ?? {};
   const next = WorkspaceTaskSchema.parse({
@@ -243,6 +245,7 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     events: current?.events,
     recentAgentStates: current?.recentAgentStates,
     touchedFiles: current?.touchedFiles,
+    appliedReportIds,
     silentReportIds: current?.silentReportIds,
     createdAt,
     updatedAt: now,
@@ -261,6 +264,26 @@ function applyBlockingQuestionPatch(next: WorkspaceTask, update: WorkspaceTaskTu
   if (next.blockingQuestion === undefined && update.blockingQuestionClearedBy === undefined) return;
   delete next.blockingQuestion;
   next.blockingQuestionGeneration = update.blockingQuestionClearedBy ?? randomUUID();
+}
+
+function applyTurnOutcomePatch(
+  current: WorkspaceTask,
+  selected: WorkspaceTaskTurnOutcomePatch,
+  reportId: string | undefined,
+): WorkspaceTask {
+  const update = TurnOutcomePatchSchema.parse(selected);
+  const touchedFiles = mergeTouchedFiles(current.touchedFiles ?? [], update.touchedFiles ?? []);
+  const next = { ...current };
+  if (update.status !== undefined) next.status = update.status;
+  if (update.handoffSummary !== undefined) next.handoffSummary = update.handoffSummary;
+  if (update.latestReplyPreview !== undefined) next.latestReplyPreview = update.latestReplyPreview;
+  applyBlockingQuestionPatch(next, update);
+  if (reportId) next.appliedReportIds = [...(current.appliedReportIds ?? []), reportId];
+  if (update.silentReportId && !current.silentReportIds?.includes(update.silentReportId)) {
+    next.silentReportIds = [...(current.silentReportIds ?? []), update.silentReportId];
+  }
+  if (touchedFiles.length) next.touchedFiles = touchedFiles;
+  return next;
 }
 
 function* retainedTaskEvents(tasks: WorkspaceTask[]) {
@@ -403,32 +426,36 @@ export class WorkspaceTaskLedgerStore {
     workspaceId: string,
     taskId: string,
     patch: WorkspaceTaskTurnOutcomePatch | SelectTurnOutcomePatch,
+    coordination?: {
+      reportId?: string;
+      beforeCommit?: (current: Readonly<WorkspaceTask>) => Promise<void>;
+      withRelatedStore?: (
+        commit: () => Promise<WorkspaceTask | null>,
+      ) => Promise<WorkspaceTask | null>;
+    },
   ): Promise<WorkspaceTask | null> {
     const file = this.filePath(workspaceId);
-    return serializeFile(file, async () => {
+    const commit = async () => {
       const tasks = await readTasks(file);
       const current = tasks.find((task) => task.taskId === taskId);
       if (!current) return null;
+      const reportId = coordination?.reportId;
+      if (reportId && current.appliedReportIds?.includes(reportId)) return current;
       const selected = typeof patch === "function" ? patch(current, tasks) : patch;
       if (!selected) return null;
-      const update = TurnOutcomePatchSchema.parse(selected);
-      const touchedFiles = mergeTouchedFiles(current.touchedFiles ?? [], update.touchedFiles ?? []);
-      const next = { ...current };
-      if (update.status !== undefined) next.status = update.status;
-      if (update.handoffSummary !== undefined) next.handoffSummary = update.handoffSummary;
-      if (update.latestReplyPreview !== undefined)
-        next.latestReplyPreview = update.latestReplyPreview;
-      applyBlockingQuestionPatch(next, update);
-      if (update.silentReportId && !current.silentReportIds?.includes(update.silentReportId)) {
-        next.silentReportIds = [...(current.silentReportIds ?? []), update.silentReportId];
-      }
-      if (touchedFiles.length) next.touchedFiles = touchedFiles;
-      if (JSON.stringify(current) === JSON.stringify(next)) return current;
-      next.updatedAt = new Date().toISOString();
+      const next = applyTurnOutcomePatch(current, selected, reportId);
+      const changed = JSON.stringify(current) !== JSON.stringify(next);
+      if (changed) next.updatedAt = new Date().toISOString();
       const validated = WorkspaceTaskSchema.parse(next);
+      // Related stores must never acquire the ledger lane while holding their own write lane.
+      await coordination?.beforeCommit?.(current);
+      if (!changed) return current;
       await this.writeTasks(workspaceId, file, replaceTask(tasks, validated));
       return validated;
-    });
+    };
+    return serializeFile(file, () =>
+      coordination?.withRelatedStore ? coordination.withRelatedStore(commit) : commit(),
+    );
   }
 
   async acknowledgeSilentReport(

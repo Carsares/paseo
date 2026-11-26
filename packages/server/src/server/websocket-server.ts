@@ -651,6 +651,13 @@ function parentReportFingerprint(report: AgentFinishReport): string {
     .digest("hex");
 }
 
+function readTeamConclusionTopicKey(
+  teamConclusion: { topicKey: string } | undefined,
+): string | undefined {
+  if (!teamConclusion) return undefined;
+  return teamConclusion.topicKey;
+}
+
 interface PendingAgentFinishReportConfirmation {
   childAgentId: string;
   parentAgentId: string;
@@ -1187,7 +1194,10 @@ export class VoiceAssistantWebSocketServer {
       taskLedger: this.taskLedger,
       durableItems: this.durableItems,
       broadcast: (message) => {
-        if (message.type === "workspace.topic.thread.updated") {
+        if (
+          message.type === "workspace.topic.thread.updated" ||
+          message.type === "workspace.durable_item.updated"
+        ) {
           this.broadcast(wrapSessionMessage(message));
         }
       },
@@ -1768,18 +1778,20 @@ export class VoiceAssistantWebSocketServer {
 
   private workspaceTopicFeatures(): {
     workspaceTopicThreads?: true;
+    workspaceTopicReplyRetry?: true;
     workspaceTopicReadState?: true;
     workspaceTodos?: true;
     workspaceButlerV1?: true;
   } {
     const features: {
       workspaceTopicThreads?: true;
+      workspaceTopicReplyRetry?: true;
       workspaceTopicReadState?: true;
       workspaceTodos?: true;
       workspaceButlerV1?: true;
     } = {};
     if (this.featureOverrides.workspaceTopicThreads !== false)
-      features.workspaceTopicThreads = true;
+      features.workspaceTopicThreads = features.workspaceTopicReplyRetry = true;
     if (this.featureOverrides.workspaceTopicReadState !== false)
       features.workspaceTopicReadState = true;
     if (this.featureOverrides.workspaceTodos !== false) features.workspaceTodos = true;
@@ -4001,8 +4013,6 @@ export class VoiceAssistantWebSocketServer {
     const canBypass = (current: Readonly<WorkspaceTask>, tasks: readonly WorkspaceTask[]) =>
       report.event === "finished" &&
       (current.silentReportIds?.length ?? 0) < TASK_PENDING_SILENT_REPORT_LIMIT &&
-      current.blockingQuestionGeneration === task.blockingQuestionGeneration &&
-      current.blockingQuestion === task.blockingQuestion &&
       !current.participants.some(
         (participant) =>
           participant.boundBy === mainAgentId &&
@@ -4031,6 +4041,7 @@ export class VoiceAssistantWebSocketServer {
         touchedFiles,
         sourceKind: source.kind,
       });
+    let pendingTaskDecision = false;
     const updatedTask = await this.taskLedger.syncFromTurnOutcome(
       workspaceId,
       taskId,
@@ -4039,11 +4050,30 @@ export class VoiceAssistantWebSocketServer {
         // finish writing the card without reapplying an old completion to a newer task state.
         if (current.silentReportIds?.includes(messageId) || alreadyLanded) return {};
         if (!ownedTask(current) || !isActiveWorkspaceTask(current)) return null;
-        const bypassMainControl = canBypass(current, tasks);
+        const bypassMainControl = !pendingTaskDecision && canBypass(current, tasks);
         return {
           ...taskReportOutcomePatch({ status, summary, bypassMainControl, touchedFiles }),
           silentReportId: bypassMainControl ? messageId : undefined,
         };
+      },
+      {
+        reportId: messageId,
+        withRelatedStore:
+          status === "completed"
+            ? (commit) =>
+                this.durableItems.withPendingWorkspaceItems(
+                  { workspaceId, serverId: this.serverId },
+                  (items) => {
+                    pendingTaskDecision = items.some(
+                      (item) =>
+                        (item.kind === "acceptance" || item.kind === "decision") &&
+                        (item.taskId === taskId ||
+                          (item.taskId === undefined && item.topicKey === topicKey)),
+                    );
+                    return commit();
+                  },
+                )
+            : undefined,
       },
     );
     const bypassMainControl =
@@ -4125,12 +4155,13 @@ export class VoiceAssistantWebSocketServer {
         (task) => task.taskId === taskId && task.silentReportIds?.includes(messageId),
       );
     if (!pending) return;
-    await this.sendSilentTaskNotificationOnce(mainAgentId, messageId, report.prompt);
+    await this.sendSilentTaskNotificationOnce(mainAgentId, taskId, messageId, report.prompt);
     await this.taskLedger.acknowledgeSilentReport(workspaceId, taskId, messageId);
   }
 
   private async sendSilentTaskNotificationOnce(
     mainAgentId: string,
+    taskId: string,
     messageId: string,
     prompt: string,
   ): Promise<void> {
@@ -4140,7 +4171,7 @@ export class VoiceAssistantWebSocketServer {
       request: { messageId },
       // Keep the successful send in memory if committing its receipt fails.
       retryIfUnsent: () => false,
-      send: () => this.notifySilentTeamConclusion(mainAgentId, prompt),
+      send: () => this.notifySilentTeamConclusion(mainAgentId, taskId, prompt),
     });
   }
 
@@ -4226,7 +4257,7 @@ export class VoiceAssistantWebSocketServer {
         if (silentDelivery) {
           await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
           // Legacy pending receipts may lack a ledger marker. Notify before committing them.
-          await this.sendSilentTaskNotificationOnce(mainAgentId, messageId, report.prompt);
+          await this.sendSilentTaskNotificationOnce(mainAgentId, taskId, messageId, report.prompt);
         }
         return silentDelivery;
       },
@@ -4872,7 +4903,11 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
-  private async notifySilentTeamConclusion(agentId: string, prompt: string): Promise<void> {
+  private async notifySilentTeamConclusion(
+    agentId: string,
+    taskId: string,
+    prompt: string,
+  ): Promise<void> {
     const stored = await this.agentStorage.get(agentId);
     if (!stored?.workspaceId || stored.archivedAt || stored.attentionReason !== "finished") return;
     await this.broadcastAgentAttention({
@@ -4882,6 +4917,7 @@ export class VoiceAssistantWebSocketServer {
       attentionTimestamp: stored.attentionTimestamp ? new Date(stored.attentionTimestamp) : null,
       teamConclusion: {
         workspaceId: stored.workspaceId,
+        topicKey: `task:${taskId}`,
         summary: prompt.replace(/^Report to parent \(completed\):\n\n/, ""),
       },
     });
@@ -4913,10 +4949,11 @@ export class VoiceAssistantWebSocketServer {
     provider: AgentProvider;
     reason: "finished" | "error" | "permission";
     attentionTimestamp: Date | null;
-    teamConclusion?: { workspaceId: string; summary: string };
+    teamConclusion?: { workspaceId: string; topicKey: string; summary: string };
   }): Promise<void> {
+    const { teamConclusion } = params;
     const agent = this.agentManager.getAgent(params.agentId);
-    const workspaceId = params.teamConclusion?.workspaceId ?? agent?.workspaceId;
+    const workspaceId = teamConclusion?.workspaceId ?? agent?.workspaceId;
     if (!workspaceId) return;
     const clientEntries = await this.listAgentAttentionClients(agent);
     const notificationEntries = clientEntries.filter(({ ws }) =>
@@ -4925,13 +4962,13 @@ export class VoiceAssistantWebSocketServer {
     const allStates = notificationEntries.map((e) => e.state);
     const nowMs = Date.now();
     const assistantMessage =
-      params.teamConclusion?.summary ??
-      (await this.agentManager.getLastAssistantMessage(params.agentId));
+      teamConclusion?.summary ?? (await this.agentManager.getLastAssistantMessage(params.agentId));
     const notification = buildAgentAttentionNotificationPayload({
       reason: params.reason,
       serverId: this.serverId,
       workspaceId,
       agentId: params.agentId,
+      topicKey: readTeamConclusionTopicKey(teamConclusion),
       assistantMessage,
       permissionRequest: agent ? findLatestPermissionRequest(agent.pendingPermissions) : null,
     });
@@ -4958,6 +4995,7 @@ export class VoiceAssistantWebSocketServer {
         notificationEntries[plan.inAppRecipientIndex]?.ws === ws;
       const timestamp = new Date().toISOString();
       const connection = this.sessions.get(ws);
+      const modern = connection?.session.delivery.isModern(ws);
       const attentionPayload = {
         agentId: params.agentId,
         reason: params.reason,
@@ -4966,8 +5004,7 @@ export class VoiceAssistantWebSocketServer {
         notification,
       };
       const message = wrapSessionMessage(
-        connection?.session.delivery.isModern(ws) ||
-          connection?.session.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, ws)
+        modern || connection?.session.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, ws)
           ? {
               type: "agent_attention_required",
               payload: attentionPayload,
@@ -4989,8 +5026,8 @@ export class VoiceAssistantWebSocketServer {
             },
       );
 
-      if (message.type === "session" && this.sessions.get(ws)?.session.delivery.isModern(ws))
-        this.sessions.get(ws)!.session.publishToSource(ws, message.message);
+      if (message.type === "session" && modern)
+        connection?.session.publishToSource(ws, message.message);
       else this.sendToClient(ws, message);
     }
     if (params.teamConclusion) await push;

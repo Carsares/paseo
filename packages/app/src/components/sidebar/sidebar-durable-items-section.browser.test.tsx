@@ -8,7 +8,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { within } from "@testing-library/dom";
 import type { DiffState } from "@getpaseo/client";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type { ParsedDiffFile, WorkspaceDurableItem } from "@getpaseo/protocol/messages";
+import type {
+  ParsedDiffFile,
+  WorkspaceDurableItem,
+  WorkspaceTodoItem,
+} from "@getpaseo/protocol/messages";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { RetainedPanelActivity } from "@/components/retained-panel";
@@ -32,6 +36,8 @@ import { ActiveWorkspaceSheetProvider } from "@/screens/workspace/sheet-pane/act
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import { useSessionStore, type Agent, type WorkspaceDescriptor } from "@/stores/session-store";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
+import { useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import { TodoEditorSheet } from "@/todos/todo-editor-sheet";
 import type { HostProfile } from "@/types/host-connection";
 
 vi.mock("@/constants/layout", async (importOriginal) => ({
@@ -75,6 +81,8 @@ type Client = Pick<
   | "readFile"
   | "readDiff"
   | "checkoutGitWorkingTreeGet"
+  | "listWorkspaceTodos"
+  | "upsertWorkspaceTodo"
 >;
 const snapshots = new Map<
   string,
@@ -142,6 +150,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   act(() => root.unmount());
+  useTopicStreamViewStore.getState().closeTodoEditor();
   queryClient.clear();
   container.remove();
   vi.restoreAllMocks();
@@ -153,7 +162,7 @@ afterEach(() => {
 function seed(
   serverId: string,
   listItems: WorkspaceDurableItem[],
-  options: { capable?: boolean; withConclusion?: boolean } = {},
+  options: { capable?: boolean; withConclusion?: boolean; todo?: WorkspaceTodoItem } = {},
 ) {
   const list = vi.fn<Client["listWorkspaceDurableItems"]>(
     async ({ workspaceId, statusFilter }) => ({
@@ -173,6 +182,16 @@ function seed(
   const workingTree = vi
     .fn<Client["checkoutGitWorkingTreeGet"]>()
     .mockRejectedValue(new Error("Host does not support checkoutGitStagingV1"));
+  const listTodos = vi.fn<Client["listWorkspaceTodos"]>(async () => ({
+    requestId: "todo-list",
+    items: options.todo ? [options.todo] : [],
+    error: null,
+  }));
+  const upsertTodo = vi.fn<Client["upsertWorkspaceTodo"]>(async (input) => ({
+    requestId: "todo-save",
+    item: options.todo ? { ...options.todo, ...input, revision: options.todo.revision + 1 } : null,
+    error: null,
+  }));
   snapshots.set(serverId, {
     connectionStatus: "online",
     client: {
@@ -181,6 +200,8 @@ function seed(
       readFile,
       readDiff,
       checkoutGitWorkingTreeGet: workingTree,
+      listWorkspaceTodos: listTodos,
+      upsertWorkspaceTodo: upsertTodo,
     },
   });
   hosts = [
@@ -202,7 +223,11 @@ function seed(
         ...state.sessions,
         [serverId]: {
           serverInfo: {
-            features: { workspaceDurableItemsV1: options.capable ?? true, diffSubscription: true },
+            features: {
+              workspaceDurableItemsV1: options.capable ?? true,
+              diffSubscription: true,
+              workspaceTodos: Boolean(options.todo),
+            },
           },
           agents: options.withConclusion ? new Map([[completed.id, completed]]) : new Map(),
           workspaces: new Map([[inactiveWorkspace.id, inactiveWorkspace]]),
@@ -210,7 +235,7 @@ function seed(
       },
     }));
   });
-  return { list, decide, readFile, readDiff, workingTree };
+  return { list, decide, readFile, readDiff, workingTree, upsertTodo };
 }
 
 const toggleProject = () => {};
@@ -299,6 +324,78 @@ function renderSidebar(active = true, sheetHost?: SheetPaneHost) {
   act(() => root.render(<QueryClientProvider client={queryClient}>{content}</QueryClientProvider>));
   return within(container);
 }
+
+it("edits a different workspace's todo from the global sidebar while a terminal is visible", async () => {
+  await page.viewport(1000, 720);
+  const todo = {
+    todoId: "global-todo",
+    workspaceId: "parked",
+    title: "Review tomorrow",
+    status: "pending",
+    checklist: [],
+    dueAt: "2026-11-27T10:20:35.200Z",
+    remindBeforeMinutes: 45,
+    snoozedUntil: "2026-11-27T11:20:35.200Z",
+    lastDueNotifiedAt: null,
+    source: null,
+    assignedAgentId: null,
+    revision: 4,
+    createdAt: pending.createdAt,
+    updatedAt: pending.createdAt,
+    completedAt: null,
+  } satisfies WorkspaceTodoItem;
+  const otherHost = seed("terminal-host", []);
+  const todoHost = seed("todo-host", [pending], { todo });
+  act(() =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <AppSheetTestProviders>
+          <ToastProvider>
+            <SidebarUnderTest />
+            <div data-testid="terminal-pane">Terminal in another workspace</div>
+            <TodoEditorSheet />
+          </ToastProvider>
+        </AppSheetTestProviders>
+      </QueryClientProvider>,
+    ),
+  );
+
+  await page.getByRole("button", { name: "Review tomorrow, Dormant workspace, todo-host" }).click();
+  await expect.element(page.getByTestId("todo-editor-sheet")).toBeVisible();
+  expect(page.getByTestId("todo-editor-sheet").all()).toHaveLength(1);
+  await expect.element(page.getByTestId("terminal-pane")).toBeVisible();
+  const title = page.getByTestId("todo-editor-title-input");
+  const due = page.getByTestId("todo-editor-due-custom-input");
+  const originalDueInput = (due.element() as HTMLInputElement).value;
+  expect(originalDueInput).toMatch(/^2026-11-27 \d{2}:20$/);
+  await title.fill("Updated title");
+  await due.fill("2026-02-30 09:00");
+  await page.getByTestId("todo-editor-save").click();
+  await expect.element(page.getByTestId("todo-editor-error")).toBeVisible();
+  await expect.element(due).toHaveValue("2026-02-30 09:00");
+  expect(todoHost.upsertTodo).not.toHaveBeenCalled();
+
+  await due.fill(originalDueInput);
+  await page.getByTestId("todo-editor-save").click();
+  await expect.element(page.getByTestId("todo-editor-sheet")).not.toBeInTheDocument();
+  expect(todoHost.upsertTodo).toHaveBeenCalledExactlyOnceWith({
+    workspaceId: "parked",
+    todoId: todo.todoId,
+    expectedRevision: 4,
+    title: "Updated title",
+    checklist: [],
+    source: null,
+  });
+  expect(otherHost.upsertTodo).not.toHaveBeenCalled();
+  expect(queryClient.getQueryData(["workspace-todos", "todo-host", null])).toMatchObject([
+    {
+      title: "Updated title",
+      dueAt: todo.dueAt,
+      remindBeforeMinutes: 45,
+      snoozedUntil: todo.snoozedUntil,
+    },
+  ]);
+});
 
 it("keeps a single inbox above unread conclusions when switching the default sidebar grouping", async () => {
   const host = seed("host-a", [pending], { withConclusion: true });
