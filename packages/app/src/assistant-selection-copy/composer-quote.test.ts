@@ -5,8 +5,13 @@ import {
   KeyboardActionDispatcherProvider,
   useKeyboardActionDispatcher,
 } from "@/keyboard/keyboard-action-dispatcher-context";
-import { describe, expect, it } from "vitest";
-import { appendQuoteToDraft, ComposerQuoteProvider, useComposerQuote } from "./composer-quote";
+import { describe, expect, it, vi } from "vitest";
+import {
+  appendQuoteToDraft,
+  ComposerQuoteProvider,
+  QuoteTopicProvider,
+  useComposerQuote,
+} from "./composer-quote";
 
 describe("ComposerQuoteProvider", () => {
   it("offers an attachment to the active composer before focusing the input", () => {
@@ -49,6 +54,45 @@ describe("ComposerQuoteProvider", () => {
     });
     result.current?.addQuote({ quote: "Selected text" });
     expect(calls).toEqual(["Selected text", "message-input"]);
+  });
+
+  it("merges ambient QuoteTopicProvider metadata and preserves explicit overrides", () => {
+    const addQuoteAttachment = vi.fn();
+    const { result } = renderHook(useComposerQuote, {
+      wrapper: ({ children }) =>
+        createElement(
+          KeyboardActionDispatcherProvider,
+          null,
+          createElement(
+            ComposerQuoteProvider,
+            { target: { addQuoteAttachment } },
+            createElement(
+              QuoteTopicProvider,
+              { topic: { topicKey: "task:T-1", taskId: "T-1", rootMessageId: "m-1" } },
+              children,
+            ),
+          ),
+        ),
+    });
+
+    result.current?.addQuote({ quote: "From topic card", label: "Lead" });
+    expect(addQuoteAttachment).toHaveBeenLastCalledWith("From topic card", "Lead", {
+      topicKey: "task:T-1",
+      taskId: "T-1",
+      rootMessageId: "m-1",
+    });
+
+    result.current?.addQuote({
+      quote: "Specific reply",
+      label: "Lead",
+      sourceMessageId: "reply-9",
+    });
+    expect(addQuoteAttachment).toHaveBeenLastCalledWith("Specific reply", "Lead", {
+      topicKey: "task:T-1",
+      taskId: "T-1",
+      rootMessageId: "m-1",
+      sourceMessageId: "reply-9",
+    });
   });
 });
 

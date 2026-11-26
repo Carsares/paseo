@@ -9,6 +9,7 @@ import {
   LEAD_PLAYBOOK_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
+  RESIDENT_AGENT_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
@@ -22,7 +23,9 @@ import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
 } from "../finish-subscriptions/index.js";
+import { TASK_ID_LABEL, TOPIC_ROOT_MESSAGE_ID_LABEL } from "../hierarchy-policy.js";
 import { createPaseoToolCatalog } from "./paseo-tools.js";
+import { TopicDelegationStore } from "./topic-delegation.js";
 import { PaseoToolInputError } from "./types.js";
 
 const logger = createTestLogger();
@@ -383,6 +386,242 @@ describe("create_agent orchestration playbooks", () => {
       expect(storedForged?.labels).not.toHaveProperty(LEAD_COMMIT_POLICY_LABEL);
       expect(storedForged?.labels?.team).toBe("core");
     } finally {
+      await finishSubscriptions.close();
+      await cleanupWorkdir({ agentManager, agentStorage, workdir });
+    }
+  });
+
+  test("preserves existing TASK_ID_LABEL and original topic attribution on non-resident follow-up without taskBinding", async () => {
+    const workdir = mkdtempSync(join(tmpdir(), "send-prompt-inherit-task-"));
+    const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const workspaceRegistry = createWorkspaceRegistry(workdir);
+    const releaseMain = Promise.withResolvers<void>();
+    const releaseChild = Promise.withResolvers<void>();
+    const mainFollowupPrompt = "Check progress on the payment task";
+    const childFollowupPrompt = "Report current status";
+    const clients = createTestAgentClients({
+      async beforeTurnComplete(prompt) {
+        const text =
+          typeof prompt === "string"
+            ? prompt
+            : prompt.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+        if (text.includes(mainFollowupPrompt)) await releaseMain.promise;
+        if (text.includes(childFollowupPrompt)) await releaseChild.promise;
+      },
+    });
+    const agentManager = new AgentManager({
+      serverId: "self",
+      clients,
+      registry: agentStorage,
+      workspaceRegistry,
+      topicDelegations: new TopicDelegationStore(workdir),
+      logger,
+    });
+    const reportsStore = createJsonFinishSubscriptionStore(workdir, "reports.json");
+    const dispatchedReports: Array<{
+      childAgentId: string;
+      callerAgentId: string;
+      taskId?: string;
+      rootMessageId?: string;
+    }> = [];
+    const finishSubscriptions = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(workdir),
+      followups: {
+        watches: createJsonFinishSubscriptionStore(workdir, "watches.json"),
+        reports: reportsStore,
+        dispatch: async (record) => {
+          dispatchedReports.push({
+            childAgentId: record.childAgentId,
+            callerAgentId: record.callerAgentId,
+            taskId: record.taskId,
+            rootMessageId: record.rootMessageId,
+          });
+        },
+      },
+      serverId: "self",
+      logger,
+      messages: () => ({ enqueue: () => ({ messageId: "m1" }) }) as never,
+      callerIsActive: async () => true,
+      open: async () => {
+        throw new Error("Explicit reports do not observe turns");
+      },
+    });
+    await finishSubscriptions.start();
+
+    try {
+      const main = await agentManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: "ws-playbook",
+      });
+      await agentManager.setAgentMainControl(main.id, true);
+
+      const nonResidentLead = await agentManager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Payment lead" },
+        undefined,
+        {
+          workspaceId: "ws-playbook",
+          labels: {
+            [PARENT_AGENT_ID_LABEL]: main.id,
+            [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+            [TASK_ID_LABEL]: "task-payment",
+            [TOPIC_ROOT_MESSAGE_ID_LABEL]: "root-payment",
+          },
+        },
+      );
+      const residentSpecialist = await agentManager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Resident reviewer" },
+        undefined,
+        {
+          workspaceId: "ws-playbook",
+          labels: {
+            [PARENT_AGENT_ID_LABEL]: main.id,
+            [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+            [RESIDENT_AGENT_LABEL]: "true",
+            [TASK_ID_LABEL]: "task-old-resident",
+            [TOPIC_ROOT_MESSAGE_ID_LABEL]: "root-old-resident",
+          },
+        },
+      );
+
+      const queuedMessages: Array<{
+        agentId: string;
+        messageId: string;
+        topicDelegation?: {
+          workspaceId: string;
+          mainAgentId: string;
+          rootMessageId: string;
+          rootPromptText: string;
+          taskId?: string;
+        };
+      }> = [];
+      let seq = 0;
+      const mainCatalog = createPaseoToolCatalog({
+        serverId: "self",
+        callerAgentId: main.id,
+        verifiedCallerAgentId: main.id,
+        paseoHome: workdir,
+        agentManager,
+        agentStorage,
+        finishSubscriptions: () => finishSubscriptions,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        workspaceRegistry,
+        queueAgentPrompt: async (agentId, message) => {
+          const messageId = `queued-${++seq}`;
+          queuedMessages.push({
+            agentId,
+            messageId,
+            topicDelegation: message.topicDelegation,
+          });
+          if (message.topicDelegation && agentManager.topicDelegations) {
+            await agentManager.topicDelegations.admit({
+              ...message.topicDelegation,
+              agentId,
+              serverId: "self",
+              messageId,
+            });
+          }
+          return messageId;
+        },
+        logger,
+      });
+
+      const mainTurn = await sendPromptToAgent({
+        agentManager,
+        agentStorage,
+        logger,
+        agentId: main.id,
+        prompt: mainFollowupPrompt,
+        messageId: "root-new-nudge",
+        runOptions: directHumanPromptRunOptions(),
+      });
+      if (mainTurn.disposition !== "turn_started") throw new Error("Expected the main turn");
+      await mainTurn.started;
+
+      const sentLead = await mainCatalog.executeTool("send_agent_prompt", {
+        agentId: nonResidentLead.id,
+        prompt: childFollowupPrompt,
+        notifyOnFinish: false,
+      });
+      expect(sentLead.isError).toBeFalsy();
+      expect(sentLead.structuredContent).toMatchObject({
+        deliveryStatus: "queued",
+        topicDelegation: {
+          agentId: nonResidentLead.id,
+          serverId: "self",
+          rootMessageId: "root-payment",
+          taskId: "task-payment",
+        },
+      });
+      expect(queuedMessages[0]?.topicDelegation).toMatchObject({
+        rootMessageId: "root-payment",
+        taskId: "task-payment",
+      });
+
+      // Resident specialists are shared across topics, so a new unbound prompt uses the current turn's topic.
+      const sentResident = await mainCatalog.executeTool("send_agent_prompt", {
+        agentId: residentSpecialist.id,
+        prompt: "Review something unrelated",
+        notifyOnFinish: false,
+      });
+      expect(sentResident.isError).toBeFalsy();
+      expect(sentResident.structuredContent).toMatchObject({
+        deliveryStatus: "queued",
+        topicDelegation: {
+          agentId: residentSpecialist.id,
+          serverId: "self",
+          rootMessageId: "root-new-nudge",
+        },
+      });
+      expect(
+        (sentResident.structuredContent as { topicDelegation?: { taskId?: string } })
+          .topicDelegation?.taskId,
+      ).toBeUndefined();
+
+      // Simulate the non-resident child executing that follow-up turn and reporting back.
+      const leadDispatchId = queuedMessages[0]!.messageId;
+      await agentManager.topicDelegations?.submitting({
+        workspaceId: "ws-playbook",
+        agentId: nonResidentLead.id,
+        serverId: "self",
+        messageId: leadDispatchId,
+      });
+      const childTurn = await sendPromptToAgent({
+        agentManager,
+        agentStorage,
+        logger,
+        agentId: nonResidentLead.id,
+        prompt: childFollowupPrompt,
+        source: { kind: "agent-message", agentId: main.id },
+        messageId: leadDispatchId,
+      });
+      if (childTurn.disposition !== "turn_started") throw new Error("Expected the child turn");
+      await childTurn.started;
+
+      const leadCatalog = createPaseoToolCatalog({
+        serverId: "self",
+        callerAgentId: nonResidentLead.id,
+        verifiedCallerAgentId: nonResidentLead.id,
+        paseoHome: workdir,
+        agentManager,
+        agentStorage,
+        finishSubscriptions: () => finishSubscriptions,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        workspaceRegistry,
+        logger,
+      });
+      const reportResult = await leadCatalog.executeTool("report_to_parent", {
+        status: "completed",
+        summary: "Payment refactor is 80% complete",
+      });
+      expect(reportResult.isError).toBeFalsy();
+      expect(dispatchedReports).toContainEqual({
+        childAgentId: nonResidentLead.id,
+        callerAgentId: main.id,
+        taskId: "task-payment",
+        rootMessageId: "root-payment",
+      });
+    } finally {
+      releaseChild.resolve();
+      releaseMain.resolve();
       await finishSubscriptions.close();
       await cleanupWorkdir({ agentManager, agentStorage, workdir });
     }

@@ -74,13 +74,17 @@ import {
 import { PluginAgentClientRegistry } from "./agent/plugin-provider.js";
 import { createAntigravityProvider } from "../../../../plugins/antigravity-provider/server/provider.js";
 import { createAgentMessageDelivery } from "./agent/agent-messages/delivery.js";
-import { sendPromptToAgent, waitForAgentRunStartWithTimeout } from "./agent/agent-prompt.js";
+import {
+  sendPreparedPromptToAgent,
+  sendPromptToAgent,
+  waitForAgentRunStartWithTimeout,
+} from "./agent/agent-prompt.js";
 import type {
   AgentPromptInput,
   AgentStreamEvent,
   AgentTimelineItem,
 } from "./agent/agent-sdk-types.js";
-import { parseAgentMessage } from "./agent/agent-messages/index.js";
+import { parseAgentMessage, parseAgentMessages } from "./agent/agent-messages/index.js";
 import { MessageReceipts, type QueueHandoff } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import { createPaseoToolCatalog } from "./agent/tools/paseo-tools.js";
@@ -367,6 +371,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 interface SessionForTestOptions {
   workspaceRuntimeStore?: WorkspaceRuntimeStore;
   messageDelivery?: Pick<SessionOptions, "agentMessages" | "messageReceipts">;
+  backgroundReportGraceWaitMs?: number;
   sendToSource?: SessionOptions["onMessageToSource"];
   clientId?: string;
   permissions?: readonly DaemonPermission[];
@@ -453,6 +458,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     messageReceipts: createMessageReceiptsStub(),
     agentMessages: createAgentMessageDeliveryStub(),
     ...options.messageDelivery,
+    backgroundReportGraceWaitMs: options.backgroundReportGraceWaitMs,
     creationService: createTestCreationService(),
     workspaceAutoName: createStub<SessionOptions["workspaceAutoName"]>({
       scheduleForWorktree: vi.fn(),
@@ -10248,4 +10254,322 @@ test("clears finished attention only after each card is read through the current
     await session.cleanup();
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+describe("Main Control background report turn isolation", () => {
+  test("waits for a short background report turn to finish naturally and opens a fresh human turn without steering", async () => {
+    const workdir = mkdtempSync(join(tmpdir(), "paseo-session-bg-grace-finish-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const bgFinish = Promise.withResolvers<void>();
+    const humanFinish = Promise.withResolvers<void>();
+    const startedPrompts: string[] = [];
+    const steerCalls = vi.fn();
+    const interruptCalls = vi.fn();
+    const client = createTestAgentClient("codex", {
+      onStartTurn: (prompt) => {
+        startedPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
+      },
+      beforeTurnComplete: async (prompt) => {
+        const text = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
+        if (text.includes("Background report from child")) {
+          await bgFinish.promise;
+          return;
+        }
+        if (text.includes("Fresh human question")) {
+          await humanFinish.promise;
+        }
+      },
+      steerActiveTurn: async () => {
+        steerCalls();
+        return { accepted: true };
+      },
+      onInterrupt: () => {
+        interruptCalls();
+      },
+    });
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      logger,
+    });
+    let triggerScheduled: (() => void) | undefined;
+    const delivery = createAgentMessageDelivery({
+      isRunning: (id) => manager.hasInFlightRun(id),
+      subscribe: (listener) =>
+        manager.subscribe(
+          (event) => {
+            if (event.type === "agent_state") listener(event.agent.id);
+            if (event.type === "agent_removed") listener(event.agentId);
+          },
+          { replayState: false },
+        ),
+      onStop: (listener) => manager.onStop(listener),
+      schedule: (_delayMs, callback) => {
+        triggerScheduled = callback;
+        return () => {
+          if (triggerScheduled === callback) triggerScheduled = undefined;
+        };
+      },
+      dispatch: async (batch) => {
+        const result = await sendPreparedPromptToAgent({
+          agentManager: manager,
+          agentStorage: storage,
+          agentId: batch.recipientId,
+          prompt: batch.prompt,
+          activeTurnBehavior: batch.activeTurnBehavior,
+          idleOnly: batch.idleOnly,
+          admit: batch.admit,
+          runOptions: { clientMessageId: batch.messageIds[0] },
+          logger,
+        });
+        if (result.disposition === "turn_started") {
+          await waitForAgentRunStartWithTimeout(manager, batch.recipientId, result.started);
+        }
+        return result.disposition;
+      },
+      onError: (error) => {
+        throw error;
+      },
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      paseoHome: workdir,
+      agentManager: manager,
+      agentStorage: storage,
+      messageDelivery: { agentMessages: delivery, messageReceipts: createMessageReceiptsStub() },
+      backgroundReportGraceWaitMs: 500,
+    });
+
+    try {
+      const main = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: "ws-bg",
+      });
+      await manager.setAgentMainControl(main.id, true);
+
+      const reportReceipt = delivery.enqueue({
+        recipientId: main.id,
+        messageId: "report-1",
+        source: {
+          kind: "agent-message",
+          agentId: "child-1",
+          taskId: "task-1",
+          rootMessageId: "root-1",
+        },
+        prompt: "Background report from child",
+      });
+      triggerScheduled?.();
+      await expect(reportReceipt.dispatched).resolves.toBe("turn_started");
+      expect(manager.hasInFlightRun(main.id)).toBe(true);
+      expect(manager.isActiveTurnHumanInitiated(main.id)).toBe(false);
+
+      // Human sends a prompt requesting steer while the background report turn is running.
+      const humanPromise = session.handleMessage({
+        type: "send_agent_message_request",
+        requestId: "req-human-1",
+        agentId: main.id,
+        messageId: "human-1",
+        text: "Fresh human question",
+        activeTurnBehavior: "steer",
+      });
+
+      // Let the background report turn finish naturally well within the 500ms grace period.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(steerCalls).not.toHaveBeenCalled();
+      expect(interruptCalls).not.toHaveBeenCalled();
+      bgFinish.resolve();
+
+      await humanPromise;
+      expect(messages).toContainEqual({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: "req-human-1",
+          agentId: main.id,
+          accepted: true,
+          error: null,
+        },
+      });
+      expect(steerCalls).not.toHaveBeenCalled();
+      expect(interruptCalls).not.toHaveBeenCalled();
+      expect(startedPrompts).toHaveLength(2);
+      expect(startedPrompts[1]).toContain("Fresh human question");
+      expect(startedPrompts[1]).not.toContain("Background report from child");
+      expect(delivery.hasPending(main.id)).toBe(false);
+    } finally {
+      bgFinish.resolve();
+      humanFinish.resolve();
+      await session.cleanup();
+      await delivery.close();
+      manager.prepareForShutdown();
+      await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+      await manager.flushForShutdown();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  test("requeues an unanswered background report when the grace wait expires and the human prompt interrupts it", async () => {
+    const workdir = mkdtempSync(join(tmpdir(), "paseo-session-bg-grace-timeout-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const bgBlock = Promise.withResolvers<void>();
+    const humanFinish = Promise.withResolvers<void>();
+    const startedPrompts: string[] = [];
+    const steerCalls = vi.fn();
+    let bgRunCount = 0;
+    const client = createTestAgentClient("codex", {
+      onStartTurn: (prompt) => {
+        startedPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
+      },
+      beforeTurnComplete: async (prompt) => {
+        const text = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
+        if (text.includes("Slow background report")) {
+          bgRunCount++;
+          if (bgRunCount === 1) await bgBlock.promise;
+          return;
+        }
+        if (text.includes("Urgent human question")) {
+          await humanFinish.promise;
+        }
+      },
+      steerActiveTurn: async () => {
+        steerCalls();
+        return { accepted: true };
+      },
+      onInterrupt: () => {
+        bgBlock.resolve();
+      },
+    });
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      logger,
+    });
+    const scheduled: Array<() => void> = [];
+    const delivery = createAgentMessageDelivery({
+      isRunning: (id) => manager.hasInFlightRun(id),
+      subscribe: (listener) =>
+        manager.subscribe(
+          (event) => {
+            if (event.type === "agent_state") listener(event.agent.id);
+            if (event.type === "agent_removed") listener(event.agentId);
+          },
+          { replayState: false },
+        ),
+      onStop: (listener) => manager.onStop(listener),
+      schedule: (_delayMs, callback) => {
+        scheduled.push(callback);
+        return () => {
+          const idx = scheduled.indexOf(callback);
+          if (idx >= 0) scheduled.splice(idx, 1);
+        };
+      },
+      dispatch: async (batch) => {
+        const result = await sendPreparedPromptToAgent({
+          agentManager: manager,
+          agentStorage: storage,
+          agentId: batch.recipientId,
+          prompt: batch.prompt,
+          activeTurnBehavior: batch.activeTurnBehavior,
+          idleOnly: batch.idleOnly,
+          admit: batch.admit,
+          runOptions: { clientMessageId: batch.messageIds[0] },
+          logger,
+        });
+        if (result.disposition === "turn_started") {
+          await waitForAgentRunStartWithTimeout(manager, batch.recipientId, result.started);
+        }
+        return result.disposition;
+      },
+      onError: (error) => {
+        throw error;
+      },
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      paseoHome: workdir,
+      agentManager: manager,
+      agentStorage: storage,
+      messageDelivery: { agentMessages: delivery, messageReceipts: createMessageReceiptsStub() },
+      backgroundReportGraceWaitMs: 30,
+    });
+
+    try {
+      const main = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: "ws-bg-timeout",
+      });
+      await manager.setAgentMainControl(main.id, true);
+
+      const reportReceipt = delivery.enqueue({
+        recipientId: main.id,
+        messageId: "slow-report-1",
+        source: {
+          kind: "agent-message",
+          agentId: "child-slow",
+          taskId: "task-slow",
+          rootMessageId: "root-slow",
+        },
+        prompt: "Slow background report",
+      });
+      while (scheduled.length) scheduled.shift()!();
+      await expect(reportReceipt.dispatched).resolves.toBe("turn_started");
+
+      // Human sends a prompt requesting steer; after 30ms grace timeout, the background turn is interrupted
+      // and the unanswered report is safely requeued instead of lost or steered into.
+      await session.handleMessage({
+        type: "send_agent_message_request",
+        requestId: "req-human-timeout",
+        agentId: main.id,
+        messageId: "human-timeout",
+        text: "Urgent human question",
+        activeTurnBehavior: "steer",
+      });
+
+      expect(messages).toContainEqual({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: "req-human-timeout",
+          agentId: main.id,
+          accepted: true,
+          error: null,
+        },
+      });
+      expect(steerCalls).not.toHaveBeenCalled();
+      expect(startedPrompts).toHaveLength(2);
+      expect(startedPrompts[1]).toContain("Urgent human question");
+      expect(startedPrompts[1]).not.toContain("Slow background report");
+      expect(delivery.hasPending(main.id)).toBe(true);
+
+      // Once the human turn finishes and the quiet window fires, the requeued report runs in its own turn.
+      humanFinish.resolve();
+      await vi.waitFor(() => expect(manager.hasInFlightRun(main.id)).toBe(false));
+      while (scheduled.length) scheduled.shift()!();
+      await vi.waitFor(() => expect(startedPrompts).toHaveLength(3));
+      const replayed = parseAgentMessages(startedPrompts[2]!);
+      expect(replayed).toMatchObject([
+        {
+          id: "slow-report-1",
+          source: {
+            kind: "agent-message",
+            agentId: "child-slow",
+            taskId: "task-slow",
+            rootMessageId: "root-slow",
+          },
+          text: "Slow background report",
+        },
+      ]);
+    } finally {
+      bgBlock.resolve();
+      humanFinish.resolve();
+      await session.cleanup();
+      await delivery.close();
+      manager.prepareForShutdown();
+      await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+      await manager.flushForShutdown();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
 });

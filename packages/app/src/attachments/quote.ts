@@ -1,6 +1,32 @@
-import type { ComposerAttachment, QuoteComposerAttachment, UserComposerAttachment } from "./types";
+import type {
+  ComposerAttachment,
+  QuoteComposerAttachment,
+  QuoteTopicSourceMetadata,
+  UserComposerAttachment,
+} from "./types";
 
-export type { QuoteComposerAttachment } from "./types";
+export type { QuoteComposerAttachment, QuoteTopicSourceMetadata } from "./types";
+
+function normalizeOptionalQuoteField(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+export function normalizeQuoteTopicMetadata(
+  input: QuoteTopicSourceMetadata | undefined,
+): QuoteTopicSourceMetadata {
+  if (!input) return {};
+  const topicKey = normalizeOptionalQuoteField(input.topicKey);
+  const rootMessageId = normalizeOptionalQuoteField(input.rootMessageId);
+  const taskId = normalizeOptionalQuoteField(input.taskId);
+  const sourceMessageId = normalizeOptionalQuoteField(input.sourceMessageId);
+  return {
+    ...(topicKey ? { topicKey } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+  };
+}
 
 export function normalizeQuoteText(text: string): string {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
@@ -10,17 +36,20 @@ export function normalizeQuoteText(text: string): string {
   return lines.slice(start, end + 1).join("\n");
 }
 
-export function createQuoteAttachment(input: {
-  text: string;
-  id?: string;
-  label?: string;
-}): QuoteComposerAttachment {
-  const label = input.label?.trim();
+export function createQuoteAttachment(
+  input: {
+    text: string;
+    id?: string;
+    label?: string;
+  } & QuoteTopicSourceMetadata,
+): QuoteComposerAttachment {
+  const label = normalizeOptionalQuoteField(input.label);
   return {
     kind: "quote",
     id: input.id ?? `quote_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     text: normalizeQuoteText(input.text),
     ...(label ? { label } : {}),
+    ...normalizeQuoteTopicMetadata(input),
   };
 }
 
@@ -28,9 +57,10 @@ export function appendQuoteAttachment(
   current: readonly UserComposerAttachment[],
   quoteText: string,
   label?: string,
+  metadata?: QuoteTopicSourceMetadata,
 ): UserComposerAttachment[] {
   if (!normalizeQuoteText(quoteText)) return [...current];
-  return [...current, createQuoteAttachment({ text: quoteText, label })];
+  return [...current, createQuoteAttachment({ text: quoteText, label, ...metadata })];
 }
 
 export function formatQuoteAsMarkdownBlockquote(quoteText: string): string {

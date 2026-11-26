@@ -10,6 +10,8 @@ import {
   WorkspaceTaskSummarySchema,
   WorkspaceTopicDecideRequestSchema,
   type TopicAnchorSummary,
+  type TopicMessageAttribution,
+  type TopicMessageAttributionMode,
   type TopicThreadEntry,
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
@@ -40,6 +42,23 @@ export type TopicReportInput = Pick<
   Required<Pick<TopicThreadEntry, "authorAgentId" | "sourceMessageId" | "reportStatus">> & {
     routedAgentId?: string;
   };
+export interface TopicMessageAttributionInput {
+  workspaceId: string;
+  mainAgentId: string;
+  sourceMessageIds: readonly string[];
+  targetTopicKey?: string;
+  targetTaskId?: string;
+  targetRootMessageId?: string;
+  mode?: TopicMessageAttributionMode;
+  title?: string;
+  rootPromptText?: string;
+}
+export interface TopicMessageAttributionResult {
+  anchor: TopicAnchorSummary;
+  updatedAnchors: TopicAnchorSummary[];
+  attributedMessageIds: string[];
+  mode: TopicMessageAttributionMode;
+}
 interface TopicThreadSnapshot {
   entries: TopicThreadEntry[];
   anchors: TopicAnchorSummary[];
@@ -291,7 +310,186 @@ function publicEntry({
   return entry;
 }
 
-async function readTopicFile(file: string): Promise<TopicFile> {
+function readTopicFile(file: string): Promise<TopicFile> {
+  return readTopicFileImpl(file);
+}
+
+interface ParsedAttributionRequest {
+  scope: ThreadScope;
+  sourceMessageIds: string[];
+  topicKey: string;
+  taskId?: string;
+  rootMessageId?: string;
+  mode: TopicMessageAttributionMode;
+  title?: string;
+  rootPromptText: string;
+}
+
+function parseExplicitTopicTarget(
+  rawTopicKey: string,
+  rawTaskId: string | undefined,
+  rawRootMessageId: string | undefined,
+): { topicKey: string; taskId?: string; rootMessageId?: string } {
+  if (rawTopicKey.startsWith("task:")) {
+    const derived = rawTopicKey.slice("task:".length).trim();
+    if (!derived) throw new Error("Invalid targetTopicKey.");
+    if (rawTaskId && rawTaskId !== derived) {
+      throw new Error("targetTaskId does not match targetTopicKey.");
+    }
+    return { topicKey: `task:${derived}`, taskId: derived, rootMessageId: rawRootMessageId };
+  }
+  if (rawTopicKey.startsWith("msg:")) {
+    const derived = rawTopicKey.slice("msg:".length).trim();
+    if (!derived) throw new Error("Invalid targetTopicKey.");
+    if (rawTaskId) throw new Error("targetTaskId cannot be combined with a msg: targetTopicKey.");
+    if (rawRootMessageId && rawRootMessageId !== derived) {
+      throw new Error("targetRootMessageId does not match targetTopicKey.");
+    }
+    return { topicKey: `msg:${derived}`, rootMessageId: derived };
+  }
+  throw new Error('targetTopicKey must start with "task:" or "msg:".');
+}
+
+function parseAttributionRequest(input: TopicMessageAttributionInput): ParsedAttributionRequest {
+  const sourceMessageIds = [
+    ...new Set(input.sourceMessageIds.map((id) => id.trim()).filter(Boolean)),
+  ];
+  if (sourceMessageIds.length === 0) {
+    throw new Error("At least one sourceMessageId is required.");
+  }
+  const rawTopicKey = input.targetTopicKey?.trim() || undefined;
+  const rawTaskId = input.targetTaskId?.trim() || undefined;
+  const rawRootMessageId = input.targetRootMessageId?.trim() || undefined;
+  const hasExplicitTarget = Boolean(rawTopicKey || rawTaskId || rawRootMessageId);
+  let target: { topicKey: string; taskId?: string; rootMessageId?: string };
+  if (rawTopicKey) {
+    target = parseExplicitTopicTarget(rawTopicKey, rawTaskId, rawRootMessageId);
+  } else if (rawTaskId) {
+    target = { topicKey: `task:${rawTaskId}`, taskId: rawTaskId, rootMessageId: rawRootMessageId };
+  } else {
+    const rootMessageId = rawRootMessageId ?? sourceMessageIds[0]!;
+    target = { topicKey: `msg:${rootMessageId}`, rootMessageId };
+  }
+  return {
+    scope: { workspaceId: input.workspaceId, mainAgentId: input.mainAgentId },
+    sourceMessageIds,
+    ...target,
+    mode: input.mode ?? (hasExplicitTarget ? "attach" : "merge"),
+    title: input.title?.trim() || undefined,
+    rootPromptText: input.rootPromptText?.trim() || "",
+  };
+}
+
+function detachAttributedMessagesFromOtherAnchors(
+  anchors: TopicAnchorSummary[],
+  scope: ThreadScope,
+  targetTopicKey: string,
+  attributedSet: ReadonlySet<string>,
+  now: string,
+): { anchors: TopicAnchorSummary[]; updatedOtherAnchors: TopicAnchorSummary[] } {
+  if (attributedSet.size === 0) return { anchors, updatedOtherAnchors: [] };
+  const updatedOtherAnchors: TopicAnchorSummary[] = [];
+  const nextAnchors = anchors.map((anchor) => {
+    if (
+      !sameThreadScope(anchor, scope) ||
+      anchor.topicKey === targetTopicKey ||
+      !anchor.attributedMessages?.some((entry) => attributedSet.has(entry.sourceMessageId))
+    ) {
+      return anchor;
+    }
+    const remaining = anchor.attributedMessages.filter(
+      (entry) => !attributedSet.has(entry.sourceMessageId),
+    );
+    const nextAnchor: TopicAnchorSummary = { ...anchor, updatedAt: now };
+    if (remaining.length > 0) nextAnchor.attributedMessages = remaining;
+    else delete nextAnchor.attributedMessages;
+    updatedOtherAnchors.push(nextAnchor);
+    return nextAnchor;
+  });
+  return { anchors: nextAnchors, updatedOtherAnchors };
+}
+
+function upsertAnchorAttributions(
+  existing: readonly TopicMessageAttribution[] | undefined,
+  attributedMessageIds: readonly string[],
+  mode: TopicMessageAttributionMode,
+  now: string,
+): TopicMessageAttribution[] {
+  const existingById = new Map((existing ?? []).map((entry) => [entry.sourceMessageId, entry]));
+  const merged: TopicMessageAttribution[] = [...existingById.values()];
+  for (const sourceMessageId of attributedMessageIds) {
+    const prior = existingById.get(sourceMessageId);
+    if (prior && prior.mode === mode) continue;
+    const nextEntry: TopicMessageAttribution = { sourceMessageId, mode, attributedAt: now };
+    if (prior) {
+      const idx = merged.findIndex((entry) => entry.sourceMessageId === sourceMessageId);
+      if (idx >= 0) merged[idx] = nextEntry;
+    } else {
+      merged.push(nextEntry);
+    }
+    existingById.set(sourceMessageId, nextEntry);
+  }
+  return merged;
+}
+
+function applyMessageAttributionsToFile(
+  data: TopicFile,
+  parsed: ParsedAttributionRequest,
+  knownTasks: readonly TopicTaskBinding[],
+): TopicMessageAttributionResult {
+  const { scope, sourceMessageIds, mode, title, rootPromptText } = parsed;
+  const inScope = data.anchors.filter((anchor) => sameThreadScope(anchor, scope));
+  const promoted =
+    !parsed.taskId && parsed.rootMessageId
+      ? inScope.filter((anchor) => anchor.taskId && anchor.rootMessageId === parsed.rootMessageId)
+      : [];
+  const targetTopicKey = promoted.length === 1 ? promoted[0]!.topicKey : parsed.topicKey;
+  const targetTaskId = promoted.length === 1 ? promoted[0]!.taskId : parsed.taskId;
+  const targetRootMessageId =
+    promoted.length === 1 ? promoted[0]!.rootMessageId : parsed.rootMessageId;
+
+  const existingTarget = inScope.find((anchor) => anchor.topicKey === targetTopicKey);
+  const effectiveRootMessageId = existingTarget?.rootMessageId ?? targetRootMessageId;
+  const attributedMessageIds = sourceMessageIds.filter((id) => id !== effectiveRootMessageId);
+  const now = new Date().toISOString();
+
+  const detached = detachAttributedMessagesFromOtherAnchors(
+    data.anchors,
+    scope,
+    targetTopicKey,
+    new Set(attributedMessageIds),
+    now,
+  );
+  data.anchors = detached.anchors;
+
+  const mergedAttributions = upsertAnchorAttributions(
+    existingTarget?.attributedMessages,
+    attributedMessageIds,
+    mode,
+    now,
+  );
+  const { anchor, anchors, removedMessageKey } = mergeAnchor(data.anchors, {
+    ...scope,
+    topicKey: targetTopicKey,
+    ...(targetTaskId ? { taskId: targetTaskId } : {}),
+    ...(effectiveRootMessageId ? { rootMessageId: effectiveRootMessageId } : {}),
+    rootPromptText: existingTarget?.rootPromptText || rootPromptText,
+    ...(title ? { title } : {}),
+    ...(mergedAttributions.length > 0 ? { attributedMessages: mergedAttributions } : {}),
+  });
+  if (removedMessageKey) {
+    data.entries = migrateLegacyReplies(data, anchor, removedMessageKey, knownTasks);
+  }
+  data.anchors = anchors;
+  return {
+    anchor,
+    updatedAnchors: [...detached.updatedOtherAnchors, anchor],
+    attributedMessageIds,
+    mode,
+  };
+}
+
+async function readTopicFileImpl(file: string): Promise<TopicFile> {
   try {
     const data: unknown = JSON.parse(await readFile(file, "utf8"));
     if (Array.isArray(data)) return { version: 2, anchors: [], entries: entriesSchema.parse(data) };
@@ -379,6 +577,20 @@ export class TopicThreadStore {
       assertCurrent?.();
       await writeJsonFileAtomic(file, data);
       return anchor;
+    });
+  }
+
+  recordMessageAttributions(
+    input: TopicMessageAttributionInput,
+    assertCurrent?: () => void,
+    knownTasks: readonly TopicTaskBinding[] = [],
+  ): Promise<TopicMessageAttributionResult> {
+    const parsed = parseAttributionRequest(input);
+    return this.run(input.workspaceId, async (data, file) => {
+      const result = applyMessageAttributionsToFile(data, parsed, knownTasks);
+      assertCurrent?.();
+      await writeJsonFileAtomic(file, data);
+      return result;
     });
   }
 

@@ -21,6 +21,9 @@ export interface AgentStreamCoalescerFlush {
   item: CoalescableTimelineItem;
   provider: AgentProvider;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
 }
 
 export interface AgentStreamCoalescerOptions {
@@ -36,6 +39,9 @@ interface PendingTextEntry {
   text: string;
   provider: AgentProvider;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
 }
 
 interface PendingToolCallEntry {
@@ -43,6 +49,9 @@ interface PendingToolCallEntry {
   item: Extract<AgentTimelineItem, { type: "tool_call" }>;
   provider: AgentProvider;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
 }
 
 type PendingAgentStreamEntry = PendingTextEntry | PendingToolCallEntry;
@@ -172,6 +181,11 @@ export class AgentStreamCoalescer {
   }
 
   private appendToBuffer(buffer: PendingAgentStreamBuffer, event: CoalescableTimelineEvent): void {
+    const attribution = {
+      ...(event.topicKey !== undefined ? { topicKey: event.topicKey } : {}),
+      ...(event.taskId !== undefined ? { taskId: event.taskId } : {}),
+      ...(event.rootMessageId !== undefined ? { rootMessageId: event.rootMessageId } : {}),
+    };
     if (isTextTimelineItem(event.item)) {
       buffer.entries.push({
         kind: "text",
@@ -179,6 +193,7 @@ export class AgentStreamCoalescer {
         text: event.item.text,
         provider: event.provider,
         ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+        ...attribution,
       });
       return;
     }
@@ -191,11 +206,23 @@ export class AgentStreamCoalescer {
     if (existing?.kind === "tool_call") {
       item = mergeToolCallItems(existing.item, event.item);
     }
+    const existingAttribution =
+      existing?.kind === "tool_call"
+        ? {
+            ...(existing.topicKey !== undefined ? { topicKey: existing.topicKey } : {}),
+            ...(existing.taskId !== undefined ? { taskId: existing.taskId } : {}),
+            ...(existing.rootMessageId !== undefined
+              ? { rootMessageId: existing.rootMessageId }
+              : {}),
+          }
+        : {};
     const entry: PendingToolCallEntry = {
       kind: "tool_call",
       item,
       provider: event.provider,
       ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+      ...existingAttribution,
+      ...attribution,
     };
 
     if (existingIndex !== undefined) {
@@ -259,6 +286,9 @@ export class AgentStreamCoalescer {
               : entry.item,
           provider: entry.provider,
           ...(entry.turnId !== undefined ? { turnId: entry.turnId } : {}),
+          ...(entry.topicKey !== undefined ? { topicKey: entry.topicKey } : {}),
+          ...(entry.taskId !== undefined ? { taskId: entry.taskId } : {}),
+          ...(entry.rootMessageId !== undefined ? { rootMessageId: entry.rootMessageId } : {}),
         });
       }
     } finally {
@@ -277,7 +307,10 @@ export class AgentStreamCoalescer {
         entry.kind === "text" &&
         isSameTextStream(previous, entry) &&
         previous.provider === entry.provider &&
-        previous.turnId === entry.turnId
+        previous.turnId === entry.turnId &&
+        previous.topicKey === entry.topicKey &&
+        previous.taskId === entry.taskId &&
+        previous.rootMessageId === entry.rootMessageId
       ) {
         previous.text += entry.text;
         continue;

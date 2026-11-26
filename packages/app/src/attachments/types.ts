@@ -103,7 +103,14 @@ export interface WorkspaceFileComposerAttachment {
   selection: WorkspaceFileSelection;
 }
 
-export interface QuoteComposerAttachment {
+export interface QuoteTopicSourceMetadata {
+  topicKey?: string;
+  rootMessageId?: string;
+  taskId?: string;
+  sourceMessageId?: string;
+}
+
+export interface QuoteComposerAttachment extends QuoteTopicSourceMetadata {
   kind: "quote";
   id: string;
   text: string;

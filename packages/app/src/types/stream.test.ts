@@ -2675,3 +2675,117 @@ it("retains agent-message provenance through live delivery and repeated history"
   expect(replay).toHaveLength(1);
   expect(replay[0]).toMatchObject({ payload: { data: { agentMessage } } });
 });
+
+describe("timeline topic attribution propagation", () => {
+  it("propagates topicKey, taskId, and rootMessageId through reduceStreamUpdate and applyStreamEvent", () => {
+    const attribution = {
+      topicKey: "task:T-42",
+      taskId: "T-42",
+      rootMessageId: "msg-root-42",
+    };
+
+    let state: StreamItem[] = [];
+    state = reduceStreamUpdate(
+      state,
+      {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-1",
+        ...attribution,
+        item: {
+          type: "user_message",
+          text: "Check reconnect timeout",
+          messageId: "msg-root-42",
+          clientMessageId: "client-42",
+        },
+      },
+      new Date(1000),
+    );
+    state = reduceStreamUpdate(
+      state,
+      {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-1",
+        ...attribution,
+        item: { type: "reasoning", text: "Checking reconnect backoff" },
+      },
+      new Date(1100),
+    );
+    state = reduceStreamUpdate(
+      state,
+      {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-1",
+        ...attribution,
+        item: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "read_file",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: {}, output: {} },
+        },
+      },
+      new Date(1200),
+    );
+    state = reduceStreamUpdate(
+      state,
+      {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-1",
+        ...attribution,
+        item: { type: "assistant_message", text: "Reconnect jitter added.", messageId: "a-1" },
+      },
+      new Date(1300),
+    );
+    state = reduceStreamUpdate(
+      state,
+      {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-1",
+        ...attribution,
+        item: { type: "notification", level: "info", message: "Done" },
+      },
+      new Date(1400),
+    );
+
+    expect(state.map((item) => item.kind)).toEqual([
+      "user_message",
+      "thought",
+      "tool_call",
+      "assistant_message",
+      "notification",
+    ]);
+    for (const item of state) {
+      expect(item).toMatchObject(attribution);
+    }
+
+    const applied = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "claude",
+        turnId: "turn-2",
+        ...attribution,
+        item: {
+          type: "user_message",
+          text: "Follow-up from main",
+          messageId: "msg-follow-1",
+          clientMessageId: "client-follow-1",
+        },
+      },
+      timestamp: new Date(2000),
+    });
+    expect(applied.tail).toHaveLength(1);
+    expect(applied.tail[0]).toMatchObject({
+      kind: "user_message",
+      messageId: "msg-follow-1",
+      ...attribution,
+    });
+  });
+});

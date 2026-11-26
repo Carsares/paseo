@@ -17,8 +17,10 @@ import {
   CreationSubscribeResponseSchema,
   AgentSnapshotPayloadSchema,
   AgentProviderSwitchRequestMessageSchema,
+  AgentFinishReportSchema,
   AgentStreamEventPayloadSchema,
   AgentTimelineItemPayloadSchema,
+  TopicAnchorSummarySchema,
   ServerInfoStatusPayloadSchema,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
@@ -1890,5 +1892,166 @@ describe("provider metrics", () => {
         turnMetrics: [{ label: "Cache", value: "82%", tone: "sparkly" }],
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("topic isolation attribution stamps and escalation fields", () => {
+  const timestamp = "2026-11-26T00:00:00.000Z";
+  const stamp = {
+    topicKey: "task:task-1",
+    taskId: "task-1",
+    rootMessageId: "msg-root-1",
+  };
+
+  test("authoritative topic stamps on stream events and timeline entries stay backward-compatible", () => {
+    const baseTurnStarted = {
+      type: "turn_started" as const,
+      provider: "codex" as const,
+      turnId: "t-1",
+    };
+    const baseTimelineEvent = {
+      type: "timeline" as const,
+      provider: "codex" as const,
+      turnId: "t-1",
+      item: { type: "assistant_message" as const, text: "Isolated reply" },
+    };
+    const baseEntry = {
+      provider: "codex" as const,
+      item: { type: "assistant_message" as const, text: "Isolated reply" },
+      turnId: "t-1",
+      timestamp,
+      seqStart: 1,
+      seqEnd: 1,
+      sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+      collapsed: [],
+    };
+
+    expect(AgentStreamEventPayloadSchema.parse({ ...baseTurnStarted, ...stamp })).toEqual({
+      ...baseTurnStarted,
+      ...stamp,
+    });
+    expect(AgentStreamEventPayloadSchema.parse({ ...baseTimelineEvent, ...stamp })).toEqual({
+      ...baseTimelineEvent,
+      ...stamp,
+    });
+    expect(AgentTimelineEntryPayloadSchema.parse({ ...baseEntry, ...stamp })).toEqual({
+      ...baseEntry,
+      ...stamp,
+    });
+
+    // Old daemons omit topic stamps
+    expect(AgentStreamEventPayloadSchema.parse(baseTimelineEvent)).toEqual(baseTimelineEvent);
+    expect(AgentTimelineEntryPayloadSchema.parse(baseEntry)).toEqual(baseEntry);
+
+    // Old clients strip unknown optional stamp fields
+    const legacyEntrySchema = AgentTimelineEntryPayloadSchema.omit({
+      topicKey: true,
+      taskId: true,
+      rootMessageId: true,
+    });
+    expect(legacyEntrySchema.parse({ ...baseEntry, ...stamp })).toEqual(baseEntry);
+
+    // Reject empty strings on topic stamp fields
+    expect(AgentTimelineEntryPayloadSchema.safeParse({ ...baseEntry, topicKey: "" }).success).toBe(
+      false,
+    );
+
+    // zod-aot outbound validator accepts stamped timeline stream events
+    const validated = validateWSOutboundMessage({
+      type: "session",
+      message: {
+        type: "agent_stream",
+        payload: {
+          agentId: "main-1",
+          event: { ...baseTimelineEvent, ...stamp },
+          timestamp,
+        },
+      },
+    });
+    expect(validated.success).toBe(true);
+  });
+
+  test("explicit topic attributions and escalateToParent stay backward-compatible", () => {
+    const baseAnchor = {
+      workspaceId: "ws-1",
+      mainAgentId: "main-1",
+      topicKey: "task:task-1",
+      taskId: "task-1",
+      rootMessageId: "msg-1",
+      rootPromptText: "Fix parser",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const attributedMessages = [
+      { sourceMessageId: "msg-2", mode: "attach" as const, attributedAt: timestamp },
+      { sourceMessageId: "msg-3", mode: "merge" as const },
+    ];
+    const anchorWithAttribution = { ...baseAnchor, attributedMessages };
+    expect(TopicAnchorSummarySchema.parse(baseAnchor)).toEqual(baseAnchor);
+    expect(TopicAnchorSummarySchema.parse(anchorWithAttribution)).toEqual(anchorWithAttribution);
+    expect(
+      TopicAnchorSummarySchema.omit({ attributedMessages: true }).parse(anchorWithAttribution),
+    ).toEqual(baseAnchor);
+
+    const baseEntry = {
+      entryId: "entry-1",
+      workspaceId: "ws-1",
+      mainAgentId: "main-1",
+      topicKey: "task:task-1",
+      role: "user_followup" as const,
+      routedAgentId: "main-1",
+      text: "Follow up on parser",
+      status: "completed" as const,
+      seq: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const entryWithAttribution = { ...baseEntry, attributedFromTopicKey: "msg:msg-2" };
+    expect(TopicThreadEntrySchema.parse(entryWithAttribution)).toEqual(entryWithAttribution);
+    expect(
+      TopicThreadEntrySchema.omit({ attributedFromTopicKey: true }).parse(entryWithAttribution),
+    ).toEqual(baseEntry);
+
+    const baseFinishReport = {
+      id: "rep-1",
+      prompt: "Need clarification",
+      title: "Worker",
+      event: "finished" as const,
+      parentReportStatus: "blocked" as const,
+    };
+    expect(AgentFinishReportSchema.parse({ ...baseFinishReport, escalateToParent: true })).toEqual({
+      ...baseFinishReport,
+      escalateToParent: true,
+    });
+    expect(
+      AgentFinishReportSchema.omit({ escalateToParent: true }).parse({
+        ...baseFinishReport,
+        escalateToParent: true,
+      }),
+    ).toEqual(baseFinishReport);
+
+    const baseAgentMessage = {
+      event: "finished" as const,
+      sender: { id: "child-1" },
+      text: "Need decision",
+      reportStatus: "blocked" as const,
+    };
+    expect(AgentMessageSchema.parse({ ...baseAgentMessage, escalateToParent: false })).toEqual({
+      ...baseAgentMessage,
+      escalateToParent: false,
+    });
+
+    const validatedAnchor = validateWSOutboundMessage({
+      type: "session",
+      message: {
+        type: "workspace.topic.anchor.updated",
+        payload: {
+          workspaceId: "ws-1",
+          mainAgentId: "main-1",
+          anchor: anchorWithAttribution,
+        },
+      },
+    });
+    expect(validatedAnchor.success).toBe(true);
   });
 });

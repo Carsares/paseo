@@ -331,6 +331,8 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           workspaceId,
           mainAgentId: request.mainAgentId,
           taskId: task?.taskId,
+          topicKey: entry.topicKey,
+          rootMessageId: entry.rootMessageId,
           humanInitiated: decision === undefined && humanInitiated === true,
         },
         prompt: buildAgentPrompt(

@@ -51,28 +51,81 @@ describe("task report wakeup", () => {
     expect(shouldBypassMainControlWakeup({ ...check, tasks: [task, peer] })).toBe(false);
   });
 
+  it("allows all four single-topic bypass categories", () => {
+    // 1. Lightweight untasked msg:<root> completion
+    expect(
+      shouldBypassMainControlWakeup({
+        ...eligible,
+        task: null,
+        tasks: [],
+        rootMessageId: "root-msg-1",
+      }),
+    ).toBe(true);
+    // 3. Verifying task single-lead completion (when verification did not fail)
+    expect(
+      shouldBypassMainControlWakeup({
+        ...eligible,
+        task: { ...task, status: "verifying" },
+      }),
+    ).toBe(true);
+    // 4. Routine single-lead blocked question without @主控 or escalateToParent
+    expect(
+      shouldBypassMainControlWakeup({
+        ...eligible,
+        status: "blocked",
+        summary: "Should we enable feature X by default?",
+      }),
+    ).toBe(true);
+  });
+
   const ineligible: Record<string, Partial<Parameters<typeof shouldBypassMainControlWakeup>[0]>> = {
     "parent in another workspace": { parentAgent: { ...parentAgent, workspaceId: "elsewhere" } },
     "archived parent": { parentAgent: { ...parentAgent, archivedAt: "archived" } },
     "regular workspace": { topicMainMatches: false },
     "parent without role": { parentAgent: { ...parentAgent, labels: {} } },
     "implicit report": { explicit: false },
-    "blocked report": { status: "blocked" },
     "error report": { status: "errored" },
     "permission-required report": { status: "permission-required" },
     "closed report": { status: "closed" },
-    "missing task": { task: null },
+    "missing task without rootMessageId": { task: null },
+    "untasked blocked report": { task: null, rootMessageId: "root-msg-1", status: "blocked" },
+    "untasked completion with active file conflict": {
+      task: null,
+      rootMessageId: "root-msg-1",
+      touchedFiles: ["src/shared.ts"],
+      tasks: [{ ...task, taskId: "peer", touchedFiles: ["src/shared.ts"] }],
+    },
     "different lead": { childAgentId: "other" },
     "remote ID collision": { childServerId: "another-host" },
     "existing question": { task: { ...task, blockingQuestion: "Who accepts?" } },
     "awaiting decision": { task: { ...task, status: "awaiting_decision" } },
-    "awaiting verification": { task: { ...task, status: "verifying" } },
     "busy sibling": { shouldHoldInbox: true },
     "previous sibling report held for merge": { hasBufferedTaskReports: true },
     "urgent resident": { childLabels: { [RESIDENT_INBOX_BYPASS_LABEL]: "true" } },
     "manual escalation": { summary: "I need @主控 to review" },
     "English escalation": { summary: "Please check @MAIN." },
+    "explicit escalateToParent flag on completion": { escalateToParent: true },
+    "explicit escalateToParent flag on blocked report": {
+      status: "blocked",
+      escalateToParent: true,
+    },
+    "manual escalation on blocked report": {
+      status: "blocked",
+      summary: "Need @主控 to resolve conflict",
+    },
+    "blocked report with cross-task file conflict": {
+      status: "blocked",
+      touchedFiles: ["src/shared.ts"],
+      tasks: [task, { ...task, taskId: "peer", touchedFiles: ["src/shared.ts"] }],
+    },
     "failed verification": { task: { ...task, closure: { verification: { state: "failed" } } } },
+    "verifying task with failed verification": {
+      task: {
+        ...task,
+        status: "verifying",
+        closure: { verification: { state: "failed" } },
+      },
+    },
     "peer workspace message": { sourceKind: "peer-workspace-message" },
   };
   it.each(Object.entries(ineligible))("keeps wakeup for %s", (_reason, patch) => {

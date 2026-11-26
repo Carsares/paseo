@@ -1,6 +1,8 @@
 export {
   TopicAnchorSummarySchema,
   TopicBlockingResolutionKindSchema,
+  TopicMessageAttributionModeSchema,
+  TopicMessageAttributionSchema,
   TopicThreadEntryOriginSchema,
   WorkspaceDurableItemUpdatedMessageSchema,
   WorkspaceTaskFileConflictPeerSchema,
@@ -11,6 +13,8 @@ export {
   WorkspaceTopicDecideResponseSchema,
   type TopicAnchorSummary,
   type TopicBlockingResolutionKind,
+  type TopicMessageAttribution,
+  type TopicMessageAttributionMode,
   type TopicThreadEntryOrigin,
   type WorkspaceDurableItemUpdatedMessage,
   type WorkspaceTaskFileConflictPeer,

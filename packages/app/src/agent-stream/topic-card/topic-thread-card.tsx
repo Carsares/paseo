@@ -1,6 +1,6 @@
 import type { ComposerAttachment } from "@/attachments/types";
 import { createQuoteAttachment, type QuoteComposerAttachment } from "@/attachments/quote";
-import type { ComposerQuote } from "@/assistant-selection-copy/composer-quote";
+import { QuoteTopicProvider, type ComposerQuote } from "@/assistant-selection-copy/composer-quote";
 import type { TopicRetryCandidate } from "./model";
 import type {
   TopicReplyRouteMode,
@@ -8,12 +8,14 @@ import type {
   WorkspaceTodoItem,
 } from "@getpaseo/protocol/messages";
 import {
+  ArrowUpRight,
   Check,
   CheckSquare,
   ChevronDown,
   ChevronRight,
   Clock,
   Columns2,
+  CornerDownRight,
   Inbox,
   Mail,
   MailOpen,
@@ -43,7 +45,7 @@ import type { Theme } from "@/styles/theme";
 import { formatTodoDueTimestamp, isTodoOverdue } from "@/todos/model";
 import { useDisclosureHold } from "../disclosure";
 import { HoverEnvelope } from "./hover-envelope";
-import type { TopicLifecycleStatus, TopicReplyItem, TopicUnit } from "./model";
+import type { TopicLifecycleStatus, TopicRedirectTarget, TopicReplyItem, TopicUnit } from "./model";
 import { TopicConflictBanner } from "./topic-conflict-banner";
 import {
   TopicDecisionSlot,
@@ -71,6 +73,8 @@ const ThemedSquare = withUnistyles(Square, mutedIconMapping);
 const ThemedCheck = withUnistyles(Check, successIconMapping);
 const ThemedClock = withUnistyles(Clock, dangerIconMapping);
 const ThemedRetry = withUnistyles(RotateCcw, mutedIconMapping);
+const ThemedCornerDownRight = withUnistyles(CornerDownRight, mutedIconMapping);
+const ThemedArrowUpRight = withUnistyles(ArrowUpRight, mutedIconMapping);
 
 const MAIL_ICON = <ThemedMail size={14} />;
 const MAIL_OPEN_ICON = <ThemedMailOpen size={14} />;
@@ -535,6 +539,7 @@ export interface TopicThreadCardProps {
   onRefreshDurableItems?: () => void;
   onOpenStandaloneDurableItem?: (item: WorkspaceDurableItem) => void;
   onJumpToPeerTopic?: (peerTaskId: string) => void;
+  onJumpToTopic?: (target: TopicRedirectTarget) => void;
   onSubmitTopicDecision?: (input: TopicDecisionSubmitInput) => Promise<TopicDecisionSubmitResult>;
   onResumeTopicDecision?: (topicKey: string) => void;
   onActivateCompactDecision?: (
@@ -677,7 +682,52 @@ function RetryUploadBar({
   );
 }
 
-export const TopicThreadCard = memo(function TopicThreadCard({
+const TopicRedirectCard = memo(function TopicRedirectCard({
+  topic,
+  redirectedTo,
+  onJumpToTopic,
+}: {
+  topic: TopicUnit;
+  redirectedTo: TopicRedirectTarget;
+  onJumpToTopic?: (target: TopicRedirectTarget) => void;
+}) {
+  const { t } = useTranslation();
+  const handlePress = useCallback(() => {
+    onJumpToTopic?.(redirectedTo);
+  }, [onJumpToTopic, redirectedTo]);
+
+  const label = t(
+    redirectedTo.mode === "merge"
+      ? "topicWorkbench.topicStream.mergedIntoTopic"
+      : "topicWorkbench.topicStream.attributedToTopic",
+    { target: redirectedTo.title },
+  );
+
+  return (
+    <View style={styles.redirectCard} testID={`topic-redirect-card-${topic.topicKey}`}>
+      <PressHighlight
+        accessibilityRole="button"
+        disabled={!onJumpToTopic}
+        onPress={handlePress}
+        style={styles.redirectRow}
+        testID={`topic-redirect-jump-${topic.topicKey}`}
+      >
+        <ThemedCornerDownRight size={13} />
+        <Text style={styles.redirectText} numberOfLines={1}>
+          {label}
+        </Text>
+        <View style={styles.redirectAction}>
+          <Text style={styles.redirectActionText} numberOfLines={1}>
+            {t("topicWorkbench.topicStream.viewTargetTopic")}
+          </Text>
+          <ThemedArrowUpRight size={13} />
+        </View>
+      </PressHighlight>
+    </View>
+  );
+});
+
+const TopicFullThreadCard = memo(function TopicFullThreadCard({
   agentKey,
   serverId,
   workspaceId,
@@ -844,9 +894,16 @@ export const TopicThreadCard = memo(function TopicThreadCard({
     [onActivateCompactReply, topic],
   );
   const handleQuote = useCallback(
-    ({ quote, label }: ComposerQuote) => {
+    ({ quote, label, topicKey, rootMessageId, taskId, sourceMessageId }: ComposerQuote) => {
       if (isReplying) return;
-      const attachment = createQuoteAttachment({ text: quote, label });
+      const attachment = createQuoteAttachment({
+        text: quote,
+        label,
+        topicKey: topicKey ?? topic.topicKey,
+        rootMessageId: rootMessageId ?? topic.rootMessageId,
+        taskId: taskId ?? topic.taskId,
+        sourceMessageId,
+      });
       if (!attachment.text) return;
       if (isCompact) {
         onActivateCompactReply(topic, "auto", attachment);
@@ -866,6 +923,14 @@ export const TopicThreadCard = memo(function TopicThreadCard({
     },
     [agentKey, isCompact, isReplying, onActivateCompactReply, serverId, topic, workspaceId],
   );
+  const topicQuoteContext = useMemo(
+    () => ({
+      topicKey: topic.topicKey,
+      rootMessageId: topic.rootMessageId,
+      taskId: topic.taskId,
+    }),
+    [topic.rootMessageId, topic.taskId, topic.topicKey],
+  );
 
   const flushableTaskId = resolveFlushableTaskId(topic);
   const handleFlushInbox = useCallback(() => {
@@ -881,167 +946,182 @@ export const TopicThreadCard = memo(function TopicThreadCard({
     Boolean(onRetryTopic);
 
   return (
-    <View
-      style={[styles.card, isHighlighted && styles.cardHighlighted]}
-      testID={`topic-thread-card-${topic.topicKey}`}
-    >
-      {accentBarStyle ? (
-        <View style={[styles.accentBar, accentBarStyle]} testID="topic-card-accent-bar" />
-      ) : null}
-
-      <TopicCardHeader
-        topic={topic}
-        onOpenLeadBeside={handleOpenLeadBeside}
-        onToggleReadMode={handleToggleReadMode}
-        onConvertPromptToTodo={handleConvertPromptToTodo}
-      />
-
-      <TopicRootPrompt topic={topic} imageReader={imageReader} />
-
-      <View style={styles.railBody} onLayout={handleRailBodyLayout}>
-        {topic.fileConflicts.length > 0 ? (
-          <TopicConflictBanner
-            agentKey={agentKey}
-            topicKey={topic.topicKey}
-            conflicts={topic.fileConflicts}
-            onJumpToPeerTopic={onJumpToPeerTopic}
-          />
+    <QuoteTopicProvider topic={topicQuoteContext}>
+      <View
+        style={[styles.card, isHighlighted && styles.cardHighlighted]}
+        testID={`topic-thread-card-${topic.topicKey}`}
+      >
+        {accentBarStyle ? (
+          <View style={[styles.accentBar, accentBarStyle]} testID="topic-card-accent-bar" />
         ) : null}
 
-        <TopicProcessDisclosure
-          topicKey={topic.topicKey}
-          processSteps={topic.processSteps}
-          expanded={processExpanded}
-          onToggle={toggleProcess}
+        <TopicCardHeader
+          topic={topic}
+          onOpenLeadBeside={handleOpenLeadBeside}
+          onToggleReadMode={handleToggleReadMode}
+          onConvertPromptToTodo={handleConvertPromptToTodo}
         />
 
-        {topic.replies.map((reply, index) => {
-          const uploadNames =
-            reply.kind === "thread_entry" && reply.entry.retryable === true
-              ? retryUploadNames?.get(reply.entry.entryId)
-              : undefined;
-          return (
-            <ReplyLayoutSlot
-              key={reply.id}
-              replyId={reply.id}
-              onRecordReplyLayout={handleRecordReplyLayout}
-            >
-              <TopicReplyRow
-                agentKey={agentKey}
-                topicKey={topic.topicKey}
-                reply={reply}
-                imageReader={imageReader}
-                showNewDivider={topic.firstUnreadReplyIndex === index}
-                unreadCountForDivider={topic.unreadReplyCount}
-                isRetrying={isReplying}
-                isStreaming={isStreamingMainReply(reply, streamingConclusionId) || undefined}
-                onQuote={handleQuote}
-                onOpenAgentBeside={handleOpenReplyAgentBeside}
-                onConvertToTodo={handleConvertReplyToTodo}
-                onRetryReply={
-                  onRetryTopic &&
-                  !uploadNames &&
-                  reply.kind === "thread_entry" &&
-                  reply.entry.retryable === true
-                    ? handleRetryReply
-                    : undefined
-                }
-              />
-              {uploadNames && onRetryTopic && reply.kind === "thread_entry" ? (
-                <RetryUploadBar
-                  names={uploadNames}
+        <TopicRootPrompt topic={topic} imageReader={imageReader} />
+
+        <View style={styles.railBody} onLayout={handleRailBodyLayout}>
+          {topic.fileConflicts.length > 0 ? (
+            <TopicConflictBanner
+              agentKey={agentKey}
+              topicKey={topic.topicKey}
+              conflicts={topic.fileConflicts}
+              onJumpToPeerTopic={onJumpToPeerTopic}
+            />
+          ) : null}
+
+          <TopicProcessDisclosure
+            topicKey={topic.topicKey}
+            processSteps={topic.processSteps}
+            expanded={processExpanded}
+            onToggle={toggleProcess}
+          />
+
+          {topic.replies.map((reply, index) => {
+            const uploadNames =
+              reply.kind === "thread_entry" && reply.entry.retryable === true
+                ? retryUploadNames?.get(reply.entry.entryId)
+                : undefined;
+            return (
+              <ReplyLayoutSlot
+                key={reply.id}
+                replyId={reply.id}
+                onRecordReplyLayout={handleRecordReplyLayout}
+              >
+                <TopicReplyRow
+                  agentKey={agentKey}
+                  topicKey={topic.topicKey}
                   reply={reply}
-                  disabled={isReplying}
-                  onRetry={handleRetryReply}
+                  imageReader={imageReader}
+                  showNewDivider={topic.firstUnreadReplyIndex === index}
+                  unreadCountForDivider={topic.unreadReplyCount}
+                  isRetrying={isReplying}
+                  isStreaming={isStreamingMainReply(reply, streamingConclusionId) || undefined}
+                  onQuote={handleQuote}
+                  onOpenAgentBeside={handleOpenReplyAgentBeside}
+                  onConvertToTodo={handleConvertReplyToTodo}
+                  onRetryReply={
+                    onRetryTopic &&
+                    !uploadNames &&
+                    reply.kind === "thread_entry" &&
+                    reply.entry.retryable === true
+                      ? handleRetryReply
+                      : undefined
+                  }
                 />
-              ) : null}
-            </ReplyLayoutSlot>
-          );
-        })}
+                {uploadNames && onRetryTopic && reply.kind === "thread_entry" ? (
+                  <RetryUploadBar
+                    names={uploadNames}
+                    reply={reply}
+                    disabled={isReplying}
+                    onRetry={handleRetryReply}
+                  />
+                ) : null}
+              </ReplyLayoutSlot>
+            );
+          })}
 
-        {showRetryBanner ? (
-          <View style={styles.retryBar} testID={`topic-card-retry-bar-${topic.topicKey}`}>
-            <Text style={styles.retryLabel} numberOfLines={1}>
-              {t(`topicWorkbench.topicStream.status.${topic.lifecycleStatus}`)}
-            </Text>
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={isReplying}
-              onPress={handleRetryTopic}
-              testID={`topic-card-retry-${topic.topicKey}`}
-            >
-              <ThemedRetry size={12} />
-              {t("topicWorkbench.topicStream.retryInTopic")}
-            </Button>
-          </View>
-        ) : null}
-
-        {topic.pendingInboxItems.length > 0 ? (
-          <View style={styles.aggregatingBar} testID={`topic-pending-inbox-${topic.topicKey}`}>
-            <ThemedInbox size={14} />
-            <Text style={styles.aggregatingText} numberOfLines={1}>
-              {t("topicWorkbench.topicStream.aggregatingPending", {
-                count: topic.pendingInboxItems.length,
-              })}
-            </Text>
-            {flushableTaskId ? (
+          {showRetryBanner ? (
+            <View style={styles.retryBar} testID={`topic-card-retry-bar-${topic.topicKey}`}>
+              <Text style={styles.retryLabel} numberOfLines={1}>
+                {t(`topicWorkbench.topicStream.status.${topic.lifecycleStatus}`)}
+              </Text>
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={isFlushingInbox}
-                onPress={handleFlushInbox}
-                testID={`topic-flush-inbox-${topic.topicKey}`}
+                disabled={isReplying}
+                onPress={handleRetryTopic}
+                testID={`topic-card-retry-${topic.topicKey}`}
               >
-                {t("topicWorkbench.topicStream.flushTopicNow")}
+                <ThemedRetry size={12} />
+                {t("topicWorkbench.topicStream.retryInTopic")}
               </Button>
-            ) : null}
-          </View>
-        ) : null}
+            </View>
+          ) : null}
 
-        {topic.linkedTodos.length > 0 ? (
-          <View style={styles.todoStrip} testID={`topic-linked-todos-${topic.topicKey}`}>
-            {topic.linkedTodos.map((todo) => (
-              <TopicLinkedTodoRow
-                key={todo.todoId}
-                todo={todo}
-                onToggleTodoStatus={onToggleTodoStatus}
-                onEditTodo={onEditTodo}
-              />
-            ))}
-          </View>
-        ) : null}
+          {topic.pendingInboxItems.length > 0 ? (
+            <View style={styles.aggregatingBar} testID={`topic-pending-inbox-${topic.topicKey}`}>
+              <ThemedInbox size={14} />
+              <Text style={styles.aggregatingText} numberOfLines={1}>
+                {t("topicWorkbench.topicStream.aggregatingPending", {
+                  count: topic.pendingInboxItems.length,
+                })}
+              </Text>
+              {flushableTaskId ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={isFlushingInbox}
+                  onPress={handleFlushInbox}
+                  testID={`topic-flush-inbox-${topic.topicKey}`}
+                >
+                  {t("topicWorkbench.topicStream.flushTopicNow")}
+                </Button>
+              ) : null}
+            </View>
+          ) : null}
 
-        <TopicCardDecision
-          agentKey={agentKey}
-          serverId={serverId}
-          workspaceId={workspaceId}
-          topic={topic}
-          supportsButlerV1={supportsButlerV1}
-          durableItemsOnline={durableItemsOnline}
-          durableItemsConfirmed={durableItemsConfirmed}
-          onRefreshDurableItems={onRefreshDurableItems}
-          onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
-          onSubmitTopicDecision={onSubmitTopicDecision}
-          onResumeTopicDecision={onResumeTopicDecision}
-          onActivateCompactDecision={onActivateCompactDecision}
-        />
+          {topic.linkedTodos.length > 0 ? (
+            <View style={styles.todoStrip} testID={`topic-linked-todos-${topic.topicKey}`}>
+              {topic.linkedTodos.map((todo) => (
+                <TopicLinkedTodoRow
+                  key={todo.todoId}
+                  todo={todo}
+                  onToggleTodoStatus={onToggleTodoStatus}
+                  onEditTodo={onEditTodo}
+                />
+              ))}
+            </View>
+          ) : null}
 
-        <TopicInlineComposer
-          agentKey={agentKey}
-          serverId={serverId}
-          workspaceId={workspaceId}
-          topicKey={topic.topicKey}
-          leadTitle={topic.leadTitle}
-          hasLeadAgent={Boolean(topic.leadAgentId)}
-          isSubmitting={isReplying}
-          quoteFocusId={quoteFocusId}
-          onSubmitDesktopReply={handleSubmitDesktop}
-          onActivateCompactReply={handleActivateCompact}
-        />
+          <TopicCardDecision
+            agentKey={agentKey}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            topic={topic}
+            supportsButlerV1={supportsButlerV1}
+            durableItemsOnline={durableItemsOnline}
+            durableItemsConfirmed={durableItemsConfirmed}
+            onRefreshDurableItems={onRefreshDurableItems}
+            onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
+            onSubmitTopicDecision={onSubmitTopicDecision}
+            onResumeTopicDecision={onResumeTopicDecision}
+            onActivateCompactDecision={onActivateCompactDecision}
+          />
+
+          <TopicInlineComposer
+            agentKey={agentKey}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            topicKey={topic.topicKey}
+            leadTitle={topic.leadTitle}
+            hasLeadAgent={Boolean(topic.leadAgentId)}
+            isSubmitting={isReplying}
+            quoteFocusId={quoteFocusId}
+            onSubmitDesktopReply={handleSubmitDesktop}
+            onActivateCompactReply={handleActivateCompact}
+          />
+        </View>
       </View>
-    </View>
+    </QuoteTopicProvider>
   );
+});
+
+export const TopicThreadCard = memo(function TopicThreadCard(props: TopicThreadCardProps) {
+  if (props.topic.redirectedTo) {
+    return (
+      <TopicRedirectCard
+        topic={props.topic}
+        redirectedTo={props.topic.redirectedTo}
+        onJumpToTopic={props.onJumpToTopic}
+      />
+    );
+  }
+  return <TopicFullThreadCard {...props} />;
 });
 
 const styles = StyleSheet.create((theme) => ({
@@ -1247,5 +1327,38 @@ const styles = StyleSheet.create((theme) => ({
   todoDueOverdueText: {
     color: theme.colors.statusDanger,
     fontWeight: theme.fontWeight.medium,
+  },
+  redirectCard: {
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
+    alignSelf: "center",
+    backgroundColor: theme.colors.surface0,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.border,
+    borderRadius: theme.borderRadius.lg,
+    overflow: "hidden",
+  },
+  redirectRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1.5],
+    paddingHorizontal: theme.spacing[3],
+    paddingVertical: theme.spacing[1.5],
+  },
+  redirectText: {
+    flex: 1,
+    minWidth: 0,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  redirectAction: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[0.5],
+  },
+  redirectActionText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
 }));

@@ -1,6 +1,7 @@
 import type { TopicDelegationScope } from "./topic-delegation.js";
 import { describeAgentMessage } from "../agent-messages/guidance.js";
 import {
+  TopicMessageAttributionModeSchema,
   WorkspaceTopicDecideRequestSchema,
   type AgentActiveTurnBehavior,
   type TopicThreadEntry,
@@ -62,6 +63,11 @@ import {
 import type { DurableItemStore } from "../../durable-items/store.js";
 import type { TopicAnchorInput } from "../../topic-threads/anchors.js";
 import type { TopicDecisionActor } from "../../topic-threads/decide.js";
+import {
+  TopicThreadStore,
+  type TopicMessageAttributionInput,
+  type TopicMessageAttributionResult,
+} from "../../topic-threads/store.js";
 import {
   WORKSPACE_SITUATION_MAX_BYTES,
   type WorkspaceSituation,
@@ -223,6 +229,7 @@ import {
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
+  isResidentAgentLabels,
   isSideChatAgent,
   AGENT_PROFILE_ID_MAX_LENGTH,
   RESIDENT_ROLE_MAX_LENGTH,
@@ -317,6 +324,9 @@ export interface PaseoToolHostDependencies {
     actor: ButlerTopicDecisionActor,
   ) => Promise<WorkspaceTopicDecideResponse["payload"]>;
   upsertTopicAnchor?: (input: TopicAnchorInput) => Promise<unknown>;
+  assignTopicAttribution?: (
+    input: TopicMessageAttributionInput,
+  ) => Promise<TopicMessageAttributionResult>;
   listTopicEntries?: (scope: {
     workspaceId: string;
     mainAgentId: string;
@@ -4698,6 +4708,149 @@ function createToolCatalog(
         };
       },
     );
+
+    const assignTopicAttributionInputSchema = z.strictObject({
+      workspaceId: workspaceIdSchema,
+      sourceMessageIds: z
+        .array(z.string().trim().min(1))
+        .min(1)
+        .describe("One or more unscoped user message IDs from the main composer to attribute."),
+      targetTopicKey: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe('Target existing topic key (e.g. "task:<taskId>" or "msg:<rootMessageId>").'),
+      targetTaskId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Target task ID (derives task:<targetTaskId>)."),
+      targetRootMessageId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Target root message ID (derives msg:<targetRootMessageId> when no task is given).",
+        ),
+      mode: TopicMessageAttributionModeSchema.optional().describe(
+        'Attribution mode: "attach" to file under an existing topic, or "merge" to combine multiple unscoped messages into one new topic.',
+      ),
+      title: z
+        .string()
+        .trim()
+        .min(1)
+        .max(160)
+        .optional()
+        .describe("Optional short title for a newly merged topic."),
+    });
+    async function resolveAttributionTargetMetadata(
+      workspaceId: string,
+      mainAgentId: string,
+      input: z.output<typeof assignTopicAttributionInputSchema>,
+    ) {
+      const resolvedTaskId =
+        input.targetTaskId ??
+        (input.targetTopicKey?.startsWith("task:")
+          ? input.targetTopicKey.slice("task:".length).trim() || undefined
+          : undefined);
+      let resolvedRootMessageId =
+        input.targetRootMessageId ??
+        (input.targetTopicKey?.startsWith("msg:")
+          ? input.targetTopicKey.slice("msg:".length).trim() || undefined
+          : undefined);
+      let resolvedTitle = input.title;
+      if (resolvedTaskId && taskLedger) {
+        const tasks = await taskLedger.list(workspaceId).catch(() => []);
+        const matchedTask = tasks.find((task) => task.taskId === resolvedTaskId);
+        if (matchedTask) {
+          resolvedRootMessageId ??= matchedTask.rootMessageId;
+          resolvedTitle ??= matchedTask.title;
+        }
+      }
+      const rootIdForText =
+        resolvedRootMessageId ??
+        (!input.targetTopicKey && !resolvedTaskId ? input.sourceMessageIds[0] : undefined);
+      const rootPromptText = rootIdForText
+        ? await readDelegationRootText(mainAgentId, rootIdForText).catch(() => "")
+        : "";
+      return { resolvedRootMessageId, resolvedTitle, rootPromptText };
+    }
+
+    function resolveAssignTopicAttributionFn() {
+      if (options.assignTopicAttribution) return options.assignTopicAttribution;
+      if (options.paseoHome) {
+        const home = options.paseoHome;
+        return (input: TopicMessageAttributionInput) =>
+          new TopicThreadStore(home).recordMessageAttributions(input);
+      }
+      throw new PaseoToolInputError("Topic attribution is unavailable on this host.");
+    }
+
+    registerTool(
+      "assign_topic_attribution",
+      {
+        title: "Assign topic attribution",
+        description:
+          "Attribute one or more unscoped main-composer user messages to an existing topic card or merge them into a single new topic, and align the current Main Control turn with that topic.",
+        inputSchema: assignTopicAttributionInputSchema,
+        outputSchema: {
+          topicKey: z.string(),
+          taskId: z.string().optional(),
+          rootMessageId: z.string().optional(),
+          attributedMessageIds: z.array(z.string()),
+          mode: TopicMessageAttributionModeSchema,
+        },
+      },
+      async (args: z.output<typeof assignTopicAttributionInputSchema>) => {
+        const { workspaceId, mainAgentId } = await requireButlerCaller(args.workspaceId);
+        if (getActivePeerTurnContext(mainAgentId)) {
+          throw new PaseoToolInputError(
+            "Cross-workspace peer messages are read-only and cannot change topic attribution.",
+          );
+        }
+        const assignFn = resolveAssignTopicAttributionFn();
+        const { resolvedRootMessageId, resolvedTitle, rootPromptText } =
+          await resolveAttributionTargetMetadata(workspaceId, mainAgentId, args);
+        await requireButlerCaller(workspaceId);
+        let persisted: TopicMessageAttributionResult;
+        try {
+          persisted = await assignFn({
+            workspaceId,
+            mainAgentId,
+            sourceMessageIds: args.sourceMessageIds,
+            ...(args.targetTopicKey ? { targetTopicKey: args.targetTopicKey } : {}),
+            ...(args.targetTaskId ? { targetTaskId: args.targetTaskId } : {}),
+            ...(resolvedRootMessageId ? { targetRootMessageId: resolvedRootMessageId } : {}),
+            ...(args.mode ? { mode: args.mode } : {}),
+            ...(resolvedTitle ? { title: resolvedTitle } : {}),
+            ...(rootPromptText ? { rootPromptText } : {}),
+          });
+        } catch (error) {
+          throw new PaseoToolInputError(
+            error instanceof Error ? error.message : "Failed to persist topic attribution.",
+          );
+        }
+        const { anchor } = persisted;
+        agentManager.setActiveTurnTopicAttribution(mainAgentId, {
+          topicKey: anchor.topicKey,
+          taskId: anchor.taskId,
+          rootMessageId: anchor.rootMessageId,
+        });
+        return {
+          content: [],
+          structuredContent: ensureValidJson({
+            topicKey: anchor.topicKey,
+            ...(anchor.taskId ? { taskId: anchor.taskId } : {}),
+            ...(anchor.rootMessageId ? { rootMessageId: anchor.rootMessageId } : {}),
+            attributedMessageIds: persisted.attributedMessageIds,
+            mode: persisted.mode,
+          }),
+        };
+      },
+    );
   }
   registerButlerTools();
 
@@ -4773,8 +4926,58 @@ function createToolCatalog(
     taskId: z.string().optional(),
   });
 
+  async function resolveInheritedTaskDelegationTopic(
+    callerId: string,
+    workspaceId: string,
+    turnId: string,
+    inheritedTarget: { taskId: string; rootMessageId?: string },
+  ): Promise<{ rootMessageId?: string; taskId?: string } | undefined> {
+    let inheritedRootMessageId = inheritedTarget.rootMessageId?.trim() || undefined;
+    if (!inheritedRootMessageId && taskLedger) {
+      const tasks = await taskLedger.list(workspaceId).catch((err) => {
+        childLogger.warn(
+          { err, callerAgentId: callerId, workspaceId, taskId: inheritedTarget.taskId },
+          "Failed to read inherited task rootMessageId",
+        );
+        return [];
+      });
+      inheritedRootMessageId = tasks.find(
+        (task) => task.taskId === inheritedTarget.taskId,
+      )?.rootMessageId;
+    }
+    if (inheritedRootMessageId) {
+      return { rootMessageId: inheritedRootMessageId, taskId: inheritedTarget.taskId };
+    }
+    const currentTopic = await readDurableItemTopic(callerId, workspaceId, turnId).catch((err) => {
+      childLogger.warn({ err, callerAgentId: callerId, turnId }, "Failed to read delegation topic");
+      return undefined;
+    });
+    if (!currentTopic?.rootMessageId) return undefined;
+    return { rootMessageId: currentTopic.rootMessageId, taskId: inheritedTarget.taskId };
+  }
+
+  async function resolveDelegationTopic(
+    callerId: string,
+    workspaceId: string,
+    turnId: string,
+    binding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
+    inheritedTarget?: { taskId: string; rootMessageId?: string },
+  ): Promise<{ rootMessageId?: string; taskId?: string } | undefined> {
+    if (binding?.rootMessageId) {
+      return { rootMessageId: binding.rootMessageId, taskId: undefined };
+    }
+    if (!binding && inheritedTarget?.taskId) {
+      return resolveInheritedTaskDelegationTopic(callerId, workspaceId, turnId, inheritedTarget);
+    }
+    return readDurableItemTopic(callerId, workspaceId, turnId).catch((err) => {
+      childLogger.warn({ err, callerAgentId: callerId, turnId }, "Failed to read delegation topic");
+      return undefined;
+    });
+  }
+
   async function readDelegationScope(
     binding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
+    inheritedTarget?: { taskId: string; rootMessageId?: string },
   ): Promise<TopicDelegationScope | undefined> {
     if (!callerAgentId || callerAgentId !== options.verifiedCallerAgentId || !options.serverId)
       return;
@@ -4783,12 +4986,13 @@ function createToolCatalog(
     if (!main?.workspaceId || !isMainControlAgentLabels(main.labels) || !turnId) return;
     if (getActivePeerTurnContext(callerAgentId)) return;
     const workspaceId = main.workspaceId;
-    const topic = binding?.rootMessageId
-      ? { rootMessageId: binding.rootMessageId, taskId: undefined }
-      : await readDurableItemTopic(callerAgentId, workspaceId, turnId).catch((err) => {
-          childLogger.warn({ err, callerAgentId, turnId }, "Failed to read delegation topic");
-          return undefined;
-        });
+    const topic = await resolveDelegationTopic(
+      callerAgentId,
+      workspaceId,
+      turnId,
+      binding,
+      inheritedTarget,
+    );
     if (!topic?.rootMessageId) return;
     const { rootMessageId } = topic;
     const rootPromptText = await readDelegationRootText(callerAgentId, rootMessageId).catch(
@@ -5851,6 +6055,17 @@ function createToolCatalog(
     return behavior ?? "queue";
   }
 
+  function resolveInheritedTargetTask(
+    labels: Record<string, string> | undefined,
+    taskBinding: Awaited<ReturnType<typeof prepareTaskBinding>> | undefined,
+  ): { taskId: string; rootMessageId?: string } | undefined {
+    if (taskBinding || isResidentAgentLabels(labels)) return undefined;
+    const taskId = labels?.[TASK_ID_LABEL]?.trim();
+    if (!taskId) return undefined;
+    const rootMessageId = labels?.[TOPIC_ROOT_MESSAGE_ID_LABEL]?.trim() || undefined;
+    return { taskId, rootMessageId };
+  }
+
   async function sendLocalAgentPrompt(
     senderId: string,
     {
@@ -5874,7 +6089,10 @@ function createToolCatalog(
     if (taskBinding && !requireParentOwnership) {
       throw new PaseoToolInputError("Task binding requires a local direct subagent.");
     }
-    const delegationScope = mainControl ? await readDelegationScope(taskBinding) : undefined;
+    const inheritedTargetTask = resolveInheritedTargetTask(target.labels, taskBinding);
+    const delegationScope = mainControl
+      ? await readDelegationScope(taskBinding, inheritedTargetTask)
+      : undefined;
     await taskBinding?.validateDispatch(agentId);
     taskBinding?.prepareRecipient(agentId);
     const notifying = notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels);
@@ -7379,25 +7597,43 @@ function createToolCatalog(
     rootMessageId?: string;
   }
 
+  function reportTopicFromScope(
+    caller: HierarchyAgent,
+    localParent: HierarchyAgent | undefined,
+    topicTask: NonNullable<ReturnType<AgentManager["captureTaskReport"]>>["topicTask"],
+    verified: boolean,
+  ): ReportTopic {
+    if (
+      !topicTask ||
+      !verified ||
+      localParent?.id !== topicTask.mainAgentId ||
+      localParent.workspaceId !== topicTask.workspaceId ||
+      caller.workspaceId !== topicTask.workspaceId ||
+      !isMainControlAgentLabels(localParent.labels)
+    ) {
+      return {};
+    }
+    return {
+      taskId: topicTask.taskId,
+      ...(topicTask.rootMessageId ? { rootMessageId: topicTask.rootMessageId } : {}),
+    };
+  }
+
   function reportTopic(
     caller: HierarchyAgent,
     localParent: HierarchyAgent | undefined,
     taskReport: ReturnType<AgentManager["captureTaskReport"]>,
     verified: boolean,
   ): ReportTopic {
-    const topicTask = taskReport?.topicTask;
-    if (topicTask) {
-      const matchesScope =
-        verified &&
-        localParent?.id === topicTask.mainAgentId &&
-        localParent.workspaceId === topicTask.workspaceId &&
-        caller.workspaceId === topicTask.workspaceId &&
-        isMainControlAgentLabels(localParent.labels);
-      return { taskId: matchesScope ? topicTask.taskId : undefined };
+    if (taskReport?.topicTask) {
+      return reportTopicFromScope(caller, localParent, taskReport.topicTask, verified);
     }
     let taskLabels = taskReport?.agent.labels ?? caller.labels;
-    if (!taskLabels?.[TASK_ID_LABEL] && localParent) {
-      taskLabels = localParent.workspaceId === caller.workspaceId ? localParent.labels : undefined;
+    if (!taskLabels?.[TASK_ID_LABEL] && !taskLabels?.[TOPIC_ROOT_MESSAGE_ID_LABEL]) {
+      taskLabels =
+        localParent && localParent.workspaceId === caller.workspaceId
+          ? localParent.labels
+          : undefined;
     }
     return {
       taskId: taskLabels?.[TASK_ID_LABEL] || undefined,
@@ -7507,10 +7743,15 @@ function createToolCatalog(
   ): ReportTopic {
     const taskTopic = reportTopicForDelivery(caller, localParent, taskReport, verified);
     if (!delegation) return taskTopic;
+    const inheritedNonResidentTask =
+      !delegation.taskId && !isResidentAgentLabels(caller.labels) && taskTopic.taskId
+        ? taskTopic
+        : undefined;
     return {
-      rootMessageId: delegation.rootMessageId,
+      rootMessageId: inheritedNonResidentTask?.rootMessageId ?? delegation.rootMessageId,
       taskId:
         delegation.taskId ??
+        inheritedNonResidentTask?.taskId ??
         (taskTopic.rootMessageId === delegation.rootMessageId ? taskTopic.taskId : undefined),
     };
   }
@@ -7564,6 +7805,12 @@ function createToolCatalog(
           .trim()
           .min(1)
           .describe("Concise final report or blocking question for your direct parent agent."),
+        escalateToParent: z
+          .boolean()
+          .optional()
+          .describe(
+            "Set true only when parent/Main Control intervention is needed (cross-track coordination, conflict escalation, re-dispatch, or technical escalation). Omit or set false for routine user-facing completion or business decision questions.",
+          ),
       },
       outputSchema: {
         success: z.boolean(),
@@ -7571,7 +7818,7 @@ function createToolCatalog(
         messageId: z.string().optional(),
       },
     },
-    async ({ status, summary }) => {
+    async ({ status, summary, escalateToParent }) => {
       if (!callerAgentId) throw new PaseoToolInputError("Only subagents can report to a parent.");
       const taskReport = agentManager.captureTaskReport(callerAgentId);
       const dispatch = agentManager.captureDelegationReport(callerAgentId);
@@ -7603,6 +7850,7 @@ function createToolCatalog(
       const topic = resolveParentReportTopic(caller, localParent, taskReport, verified, delegation);
       const report = {
         status,
+        ...(escalateToParent === true ? { escalateToParent: true } : {}),
         summary: neutralizePeerWorkspacePromptMarker(summary),
         title: resolveReportTitle(callerAgentId, caller.title),
         turnId: delegation?.turnId ?? turnId,

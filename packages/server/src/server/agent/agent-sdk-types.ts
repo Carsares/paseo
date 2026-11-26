@@ -483,7 +483,14 @@ export interface AgentConversationLimit {
 
 export type AgentStreamEvent =
   | { type: "thread_started"; sessionId: string; provider: AgentProvider }
-  | { type: "turn_started"; provider: AgentProvider; turnId?: string }
+  | {
+      type: "turn_started";
+      provider: AgentProvider;
+      turnId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
+    }
   | {
       type: "turn_completed";
       provider: AgentProvider;
@@ -537,6 +544,9 @@ export type AgentStreamEvent =
       item: AgentTimelineItem;
       provider: AgentProvider;
       turnId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
       timestamp?: string;
       /** Model message ID when a history row displays a separate transcript ID. */
       historyAssistantMessageId?: string;

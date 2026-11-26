@@ -19,6 +19,7 @@ import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
 import { OmpProviderOptionsSchema } from "./providers/omp/provider-config.js";
 import { PiProviderOptionsSchema } from "./providers/pi/agent.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
+import type { TimelineTopicAttribution } from "@getpaseo/protocol/agent-types";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
 import {
   AgentNotFoundError,
@@ -349,6 +350,70 @@ interface TopicTaskScope {
   workspaceId: string;
   mainAgentId: string;
   taskId?: string;
+  topicKey?: string;
+  rootMessageId?: string;
+}
+
+export interface AuthoritativeTopicAttribution {
+  topicKey: string;
+  taskId?: string;
+  rootMessageId?: string;
+}
+
+const MAX_RETAINED_TURN_TOPIC_ATTRIBUTIONS = 64;
+
+function normalizeTopicAttribution(
+  input: TimelineTopicAttribution | null | undefined,
+): AuthoritativeTopicAttribution | undefined {
+  if (!input) return undefined;
+  let taskId = input.taskId?.trim() || undefined;
+  let rootMessageId = input.rootMessageId?.trim() || undefined;
+  const explicitTopicKey = input.topicKey?.trim() || undefined;
+  let topicKey: string | undefined;
+  if (taskId) {
+    topicKey = `task:${taskId}`;
+  } else if (explicitTopicKey) {
+    if (explicitTopicKey.startsWith("task:")) {
+      const derivedTaskId = explicitTopicKey.slice("task:".length).trim();
+      if (!derivedTaskId) return undefined;
+      taskId = derivedTaskId;
+      topicKey = `task:${derivedTaskId}`;
+    } else if (explicitTopicKey.startsWith("msg:")) {
+      const derivedRoot = explicitTopicKey.slice("msg:".length).trim();
+      if (!derivedRoot) return undefined;
+      rootMessageId = rootMessageId ?? derivedRoot;
+      topicKey = `msg:${derivedRoot}`;
+    } else {
+      topicKey = explicitTopicKey;
+    }
+  } else if (rootMessageId) {
+    topicKey = `msg:${rootMessageId}`;
+  }
+  if (!topicKey) return undefined;
+  return {
+    topicKey,
+    ...(taskId ? { taskId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
+  };
+}
+
+function isSlashCommandPromptText(text: string): boolean {
+  return /^\/[^\s/]+(\s|$)/.test(text.trim());
+}
+
+function attachTurnTopicAttributionToEvent(
+  event: AgentStreamEvent,
+  attribution: AuthoritativeTopicAttribution | undefined,
+): AgentStreamEvent {
+  if (!attribution) return event;
+  if (event.type !== "turn_started" && event.type !== "timeline") return event;
+  if (event.topicKey) return event;
+  return {
+    ...event,
+    topicKey: attribution.topicKey,
+    ...(attribution.taskId ? { taskId: attribution.taskId } : {}),
+    ...(attribution.rootMessageId ? { rootMessageId: attribution.rootMessageId } : {}),
+  };
 }
 
 type ForegroundRunMetadata = AgentRunOptions & {
@@ -1851,6 +1916,14 @@ export class AgentManager {
     { session: AgentSession; scope: TopicTaskScope }
   >();
   private readonly foregroundDispatchIds = new WeakMap<PendingForegroundRun, string>();
+  private readonly foregroundDelegationTopics = new WeakMap<
+    PendingForegroundRun,
+    AuthoritativeTopicAttribution
+  >();
+  private readonly turnTopicAttributions = new Map<
+    string,
+    Map<string, AuthoritativeTopicAttribution>
+  >();
   private readonly foregroundTaskIntent = new WeakMap<
     PendingForegroundRun,
     "unbound" | "binding" | "recovery"
@@ -1936,8 +2009,12 @@ export class AgentManager {
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
-      onFlush: ({ agentId, item, provider, turnId }) => {
-        const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
+      onFlush: ({ agentId, item, provider, turnId, topicKey, taskId, rootMessageId }) => {
+        const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId, {
+          ...(topicKey ? { topicKey } : {}),
+          ...(taskId ? { taskId } : {}),
+          ...(rootMessageId ? { rootMessageId } : {}),
+        });
         this.notifyForegroundTurnWaiters(agentId, event);
       },
     });
@@ -8507,6 +8584,144 @@ export class AgentManager {
     };
   }
 
+  getTurnTopicAttribution(
+    agentId: string,
+    turnId: string | undefined,
+  ): AuthoritativeTopicAttribution | undefined {
+    if (!turnId) return undefined;
+    return this.turnTopicAttributions.get(agentId)?.get(turnId);
+  }
+
+  setActiveTurnTopicAttribution(
+    agentId: string,
+    attribution: TimelineTopicAttribution,
+    expectedTurnId?: string,
+  ): AuthoritativeTopicAttribution | null {
+    const normalized = normalizeTopicAttribution(attribution);
+    if (!normalized) return null;
+    const agent = this.agents.get(agentId);
+    const activeTurnId = agent?.activeForegroundTurnId ?? agent?.activeTurnId ?? undefined;
+    if (!agent || !activeTurnId) return null;
+    if (expectedTurnId !== undefined && activeTurnId !== expectedTurnId) return null;
+    this.agentStreamCoalescer.flushFor(agentId);
+    this.setTurnTopicAttribution(agentId, activeTurnId, normalized);
+    return normalized;
+  }
+
+  private setTurnTopicAttribution(
+    agentId: string,
+    turnId: string,
+    attribution: AuthoritativeTopicAttribution,
+  ): void {
+    let byTurn = this.turnTopicAttributions.get(agentId);
+    if (!byTurn) {
+      byTurn = new Map();
+      this.turnTopicAttributions.set(agentId, byTurn);
+    }
+    byTurn.delete(turnId);
+    byTurn.set(turnId, attribution);
+    while (byTurn.size > MAX_RETAINED_TURN_TOPIC_ATTRIBUTIONS) {
+      const oldest = byTurn.keys().next().value;
+      if (oldest === undefined) break;
+      byTurn.delete(oldest);
+    }
+  }
+
+  private resolveEnvelopesTopicAttribution(
+    agent: ActiveManagedAgent,
+    envelopes: NonNullable<ReturnType<typeof parseAgentMessages>>,
+  ): AuthoritativeTopicAttribution | undefined {
+    if (envelopes.length === 0) return undefined;
+    let shared: AuthoritativeTopicAttribution | undefined;
+    for (const message of envelopes) {
+      let candidate: AuthoritativeTopicAttribution | undefined;
+      if (message.source?.kind === "agent-message") {
+        candidate = normalizeTopicAttribution({
+          taskId: message.source.taskId,
+          rootMessageId: message.source.rootMessageId,
+        });
+      } else if (
+        message.source === null &&
+        envelopes.length === 1 &&
+        isMainControlAgentLabels(agent.labels) &&
+        !isSlashCommandPromptText(message.text)
+      ) {
+        candidate = normalizeTopicAttribution({ rootMessageId: message.id });
+      }
+      if (!candidate) return undefined;
+      if (!shared) {
+        shared = candidate;
+      } else if (shared.topicKey !== candidate.topicKey) {
+        return undefined;
+      } else if (!shared.rootMessageId && candidate.rootMessageId) {
+        shared = { ...shared, rootMessageId: candidate.rootMessageId };
+      }
+    }
+    return shared;
+  }
+
+  private resolveForegroundTurnTopicAttribution(
+    agent: ActiveManagedAgent,
+    pendingRun: PendingForegroundRun,
+    prompt: AgentPromptInput,
+    options?: ForegroundRunMetadata,
+  ): AuthoritativeTopicAttribution | undefined {
+    const topicFollowupScope = options?.[topicFollowup];
+    if (topicFollowupScope) {
+      return normalizeTopicAttribution({
+        topicKey: topicFollowupScope.topicKey,
+        taskId: topicFollowupScope.taskId,
+        rootMessageId: topicFollowupScope.rootMessageId,
+      });
+    }
+    const delegationAttribution = this.foregroundDelegationTopics.get(pendingRun);
+    if (delegationAttribution) return delegationAttribution;
+    if (options?.turnAuthorization === "peer-read-only") return undefined;
+
+    const text = submittedPromptText(prompt);
+    const envelopes = parseAgentMessages(text);
+    if (envelopes) return this.resolveEnvelopesTopicAttribution(agent, envelopes);
+
+    if (
+      isMainControlAgentLabels(agent.labels) &&
+      options?.clientMessageId &&
+      !isSlashCommandPromptText(text)
+    ) {
+      return normalizeTopicAttribution({ rootMessageId: options.clientMessageId });
+    }
+    return undefined;
+  }
+
+  private recordTurnTopicAttribution(
+    agent: ActiveManagedAgent,
+    turnId: string,
+    pendingRun: PendingForegroundRun,
+    prompt: AgentPromptInput,
+    options?: ForegroundRunMetadata,
+  ): AuthoritativeTopicAttribution | undefined {
+    const attribution = this.resolveForegroundTurnTopicAttribution(
+      agent,
+      pendingRun,
+      prompt,
+      options,
+    );
+    if (attribution) this.setTurnTopicAttribution(agent.id, turnId, attribution);
+    return attribution;
+  }
+
+  private attachLiveStreamTopicAttribution(
+    agentId: string,
+    event: AgentStreamEvent,
+    eventTurnId: string | undefined,
+    fromHistory: boolean,
+  ): AgentStreamEvent {
+    if (fromHistory || !eventTurnId) return event;
+    return attachTurnTopicAttributionToEvent(
+      event,
+      this.getTurnTopicAttribution(agentId, eventTurnId),
+    );
+  }
+
   private async recordPendingDelegation(
     agent: ActiveManagedAgent,
     pendingRun: PendingForegroundRun,
@@ -8532,7 +8747,15 @@ export class AgentManager {
       const associated = original
         ? await this.topicDelegations.associateRecoveryRun(original, pendingRun.token)
         : await this.topicDelegations.associateRun(dispatch, pendingRun.token);
-      if (associated) this.foregroundDispatchIds.set(pendingRun, messageId);
+      if (associated) {
+        this.foregroundDispatchIds.set(pendingRun, messageId);
+        const scope = await this.topicDelegations.readDispatch(original ?? dispatch);
+        const attribution = normalizeTopicAttribution({
+          taskId: scope?.taskId,
+          rootMessageId: scope?.rootMessageId,
+        });
+        if (attribution) this.foregroundDelegationTopics.set(pendingRun, attribution);
+      }
     } catch (err) {
       this.logger.warn(
         { err, agentId: agent.id, messageId },
@@ -9771,12 +9994,24 @@ export class AgentManager {
       const messageId = options?.clientMessageId;
       this.recordDelegationStart(agent, turnId, pendingRun, options);
       this.recordTaskDispatch(agent, messageId, turnId, pendingRun);
+      const turnTopicAttribution = this.recordTurnTopicAttribution(
+        agent,
+        turnId,
+        pendingRun,
+        prompt,
+        options,
+      );
       // AgentManager owns the accepted-turn boundary. Publish liveness before the canonical
       // prompt so clients can retire optimistic activity without painting an idle frame.
       // The provider's duplicate start for this turn is suppressed at the ingestion boundary.
       this.dispatchStream(
         agent.id,
-        { type: "turn_started", provider: agent.provider, turnId },
+        {
+          type: "turn_started",
+          provider: agent.provider,
+          turnId,
+          ...turnTopicAttribution,
+        },
         { timestamp: turnStartedAt.toISOString() },
       );
       const stagedSubmittedPromptEcho = options?.clientMessageId
@@ -9828,6 +10063,7 @@ export class AgentManager {
           type: "turn_started",
           provider: agent.provider,
           turnId,
+          ...turnTopicAttribution,
         };
         yield acceptedTurnStartedEvent;
         for await (const event of turnStream.events(isTurnTerminalEvent)) {
@@ -12192,6 +12428,7 @@ export class AgentManager {
     this.unprimedRetainedTimelines.delete(agentId);
     this.cancelContextHandoff(agentId);
     this.timelineStore.delete(agentId);
+    this.turnTopicAttributions.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     this.detachPluginTools(agentId);
     for (const event of this.providerSubagents.deleteParent(agentId)) {
@@ -12837,8 +13074,13 @@ export class AgentManager {
   ): Promise<boolean> {
     event = limitAgentStreamEventContent(event, agent.id);
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
-    event = identified.event;
     const eventTurnId = identified.turnId;
+    event = this.attachLiveStreamTopicAttribution(
+      agent.id,
+      identified.event,
+      eventTurnId,
+      options?.fromHistory === true,
+    );
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
@@ -13259,7 +13501,11 @@ export class AgentManager {
         continue;
       }
 
-      this.recordAndDispatchTimelineItem(agent.id, item, event.provider, event.turnId);
+      this.recordAndDispatchTimelineItem(agent.id, item, event.provider, event.turnId, {
+        ...(event.topicKey ? { topicKey: event.topicKey } : {}),
+        ...(event.taskId ? { taskId: event.taskId } : {}),
+        ...(event.rootMessageId ? { rootMessageId: event.rootMessageId } : {}),
+      });
       if (item.type === "user_message") {
         agent.lastUserMessageAt = new Date();
         this.emitState(agent);
@@ -13383,7 +13629,7 @@ export class AgentManager {
       agent,
       event.provider,
       this.formatTurnFailedMessage(event),
-      options,
+      { ...options, turnId: eventTurnId },
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
   }
@@ -13552,7 +13798,12 @@ export class AgentManager {
     item: AgentTimelineItem,
     provider: AgentProvider,
     turnId?: string,
-    options?: { providerMessageId?: string },
+    options?: {
+      providerMessageId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
+    },
   ): AgentStreamEvent {
     const row = this.recordTimeline(agentId, item, { ...options, turnId });
     const event: AgentStreamEvent = {
@@ -13560,6 +13811,9 @@ export class AgentManager {
       item: row.item,
       provider,
       ...(turnId !== undefined ? { turnId } : {}),
+      ...(row.topicKey ? { topicKey: row.topicKey } : {}),
+      ...(row.taskId ? { taskId: row.taskId } : {}),
+      ...(row.rootMessageId ? { rootMessageId: row.rootMessageId } : {}),
     };
     this.dispatchStream(agentId, event, {
       seq: row.seq,
@@ -13665,7 +13919,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     provider: AgentProvider,
     message: string,
-    options?: { fromHistory?: boolean },
+    options?: { fromHistory?: boolean; turnId?: string },
   ): Promise<void> {
     if (options?.fromHistory) {
       return;
@@ -13683,13 +13937,21 @@ export class AgentManager {
     }
 
     const item: AgentTimelineItem = { type: "assistant_message", text };
-    const row = this.recordTimeline(agent.id, item);
+    const attribution = this.getTurnTopicAttribution(agent.id, options?.turnId);
+    const row = this.recordTimeline(agent.id, item, {
+      ...(options?.turnId ? { turnId: options.turnId } : {}),
+      ...attribution,
+    });
     this.dispatchStream(
       agent.id,
       {
         type: "timeline",
         item,
         provider,
+        ...(row.turnId ? { turnId: row.turnId } : {}),
+        ...(row.topicKey ? { topicKey: row.topicKey } : {}),
+        ...(row.taskId ? { taskId: row.taskId } : {}),
+        ...(row.rootMessageId ? { rootMessageId: row.rootMessageId } : {}),
       },
       {
         seq: row.seq,
@@ -13722,10 +13984,18 @@ export class AgentManager {
       timestamp?: string;
       providerMessageId?: string;
       turnId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
     },
   ): AgentTimelineRow {
     item = limitAgentTimelineItemContent(item);
-    const row = this.timelineStore.append(agentId, item, options);
+    const attribution =
+      normalizeTopicAttribution(options) ?? this.getTurnTopicAttribution(agentId, options?.turnId);
+    const row = this.timelineStore.append(agentId, item, {
+      ...options,
+      ...attribution,
+    });
     this.enqueueDurableTimelineAppend(agentId, row);
     return row;
   }

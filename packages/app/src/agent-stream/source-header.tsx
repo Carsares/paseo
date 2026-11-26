@@ -199,8 +199,16 @@ const SourceEntry = memo(function SourceEntry({
   ]);
   const quoteReply = useCallback(() => {
     const quote = extractReplyQuoteSummary(source.text, { sourceTitle: title });
-    if (quote) composerQuote?.addQuote({ quote, label: title });
-  }, [composerQuote, source.text, title]);
+    if (!quote) return;
+    const topicKey = resolveSourceTopicKey(source);
+    composerQuote?.addQuote({
+      quote,
+      label: title,
+      ...(topicKey ? { topicKey } : {}),
+      ...(source.rootMessageId ? { rootMessageId: source.rootMessageId } : {}),
+      ...(source.taskId ? { taskId: source.taskId } : {}),
+    });
+  }, [composerQuote, source, title]);
 
   return (
     <View style={styles.entry} testID="agent-source-entry">

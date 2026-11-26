@@ -7,8 +7,15 @@ import type {
   AgentMessageDelivery,
   AgentPromptSource,
 } from "./agent/agent-messages/index.js";
-import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
-import { hasMandatoryPeerDispatchMarker } from "./agent/agent-messages/envelope.js";
+import {
+  AgentMessageAdmissionError,
+  type InterruptedBackgroundBatch,
+} from "./agent/agent-messages/delivery.js";
+import {
+  hasMandatoryPeerDispatchMarker,
+  isSystemInjectedEnvelope,
+  parseAgentMessages,
+} from "./agent/agent-messages/envelope.js";
 import { coversFinishedAttention } from "./topic-read-state/attention.js";
 import type { TopicThreadStore } from "./topic-threads/store.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
@@ -920,6 +927,19 @@ export async function enqueueRecoverableAgentMessage(
   }
 }
 
+export const DEFAULT_BACKGROUND_REPORT_GRACE_WAIT_MS = 4_000;
+
+function resolveBackgroundReportGraceWaitMs(value?: number): number {
+  return value ?? DEFAULT_BACKGROUND_REPORT_GRACE_WAIT_MS;
+}
+
+function isSlashCommandPrompt(prompt: AgentPromptInput): boolean {
+  const first = typeof prompt === "string" ? prompt : prompt[0];
+  if (typeof first !== "string" && first?.type !== "text") return false;
+  const text = typeof first === "string" ? first : first.text;
+  return /^\/[^\s/]+(\s|$)/.test(text.trim());
+}
+
 export interface SessionFileSystem {
   isDirectory(path: string): Promise<boolean>;
 }
@@ -966,6 +986,8 @@ export interface SessionOptions {
   agentStorage: AgentStorage;
   messageReceipts: Pick<MessageReceipts, "send"> & Partial<Pick<MessageReceipts, "outcome">>;
   agentMessages: AgentMessageDelivery;
+  /** Grace wait before interrupting a Main Control background report turn for a human prompt. */
+  backgroundReportGraceWaitMs?: number;
   finishSubscriptions?: FinishSubscriptions;
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
@@ -1421,6 +1443,7 @@ export class Session {
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: SessionOptions["messageReceipts"];
   private readonly agentMessages: AgentMessageDelivery;
+  private readonly backgroundReportGraceWaitMs: number;
   private readonly finishSubscriptions?: FinishSubscriptions;
   private readonly connectedHosts?: ConnectedHosts;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
@@ -1527,6 +1550,9 @@ export class Session {
     this.taskLedger = new WorkspaceTaskLedgerStore(paseoHome);
     this.messageReceipts = options.messageReceipts;
     this.agentMessages = options.agentMessages;
+    this.backgroundReportGraceWaitMs = resolveBackgroundReportGraceWaitMs(
+      options.backgroundReportGraceWaitMs,
+    );
     this.finishSubscriptions = options.finishSubscriptions;
     this.creationService = options.creationService;
     this.projectIcons = new ProjectIconReader(paseoHome);
@@ -6651,30 +6677,46 @@ export class Session {
     );
   }
 
+  private async isMainControlAgent(agentId: string): Promise<boolean> {
+    const live = this.agentManager.getAgent(agentId);
+    if (live) return isMainControlAgentLabels(live.labels);
+    const stored = await this.agentStorage?.get?.(agentId).catch(() => null);
+    return isMainControlAgentLabels(stored?.labels);
+  }
+
   private async sendHumanPrompt(
     params: Omit<
       Parameters<typeof sendPromptToAgent>[0],
       "agentManager" | "agentStorage" | "agentMessages" | "logger" | "source"
-    >,
+    > & { isolateFromSourcedRiders?: boolean },
     allowHumanAuthority = true,
   ): ReturnType<typeof sendPromptToAgent> {
+    const { isolateFromSourcedRiders: requestedIsolation, ...sendParams } = params;
+    const isolateFromSourcedRiders =
+      requestedIsolation ?? (await this.isMainControlAgent(sendParams.agentId));
+    const agentMessages: Pick<AgentMessageDelivery, "sendDirect"> = isolateFromSourcedRiders
+      ? {
+          sendDirect: (direct, send) =>
+            this.agentMessages.sendDirect({ ...direct, isolateFromSourcedRiders: true }, send),
+        }
+      : this.agentMessages;
     let registration: FinishRegistration | undefined;
     let dispatched = false;
     try {
       return await sendPromptToAgent({
-        ...params,
+        ...sendParams,
         runOptions:
           allowHumanAuthority && this.isDirectHumanPromptIngress()
-            ? directHumanPromptRunOptions(params.runOptions)
-            : params.runOptions,
-        agentMessages: this.agentMessages,
+            ? directHumanPromptRunOptions(sendParams.runOptions)
+            : sendParams.runOptions,
+        agentMessages,
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
         beforeDispatch: async () => {
-          this.agentManager.notifyHumanWorkspaceMessage(params.agentId);
+          this.agentManager.notifyHumanWorkspaceMessage(sendParams.agentId);
           registration = await registerParentFinishSubscription({
-            agentId: params.agentId,
+            agentId: sendParams.agentId,
             serverId: this.serverId,
             agentManager: this.agentManager,
             agentStorage: this.agentStorage,
@@ -6682,21 +6724,21 @@ export class Session {
             humanPrompt: true,
             logger: this.sessionLogger,
           });
-          await params.beforeDispatch?.();
+          await sendParams.beforeDispatch?.();
         },
         onDispatch: (disposition) => {
           if (disposition !== "out_of_band") {
             dispatched = true;
             registration?.accept();
           }
-          params.onDispatch?.(disposition);
+          sendParams.onDispatch?.(disposition);
         },
       });
     } finally {
       if (!dispatched) {
         await registration?.reject().catch((error) => {
           this.sessionLogger.warn(
-            { err: error, agentId: params.agentId },
+            { err: error, agentId: sendParams.agentId },
             "Failed to reject parent finish subscription",
           );
         });
@@ -11808,7 +11850,20 @@ export class Session {
             hasNewer: selectedTimeline.hasNewer,
             ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
             entries: entries.map((entry) => {
-              const payloadEntry = {
+              const payloadEntry: {
+                provider: typeof agentPayload.provider;
+                item: typeof entry.item;
+                timestamp: string;
+                seqStart: number;
+                seqEnd: number;
+                sourceSeqRanges: typeof entry.sourceSeqRanges;
+                turnMetrics: typeof entry.turnMetrics;
+                turnId: string | undefined;
+                topicKey?: string;
+                taskId?: string;
+                rootMessageId?: string;
+                collapsed: typeof entry.collapsed;
+              } = {
                 provider: agentPayload.provider,
                 item: entry.item,
                 timestamp: entry.timestamp,
@@ -11816,7 +11871,7 @@ export class Session {
                 seqEnd: entry.seqEnd,
                 sourceSeqRanges: entry.sourceSeqRanges,
                 turnMetrics: entry.turnMetrics,
-                turnId: undefined as string | undefined,
+                turnId: entry.turnId,
                 collapsed: (
                   source
                     ? this.supportsForSource(CLIENT_CAPS.reasoningMergeEnum, source)
@@ -11825,7 +11880,9 @@ export class Session {
                   ? entry.collapsed
                   : entry.collapsed.filter((value) => value !== "reasoning_merge"),
               };
-              payloadEntry.turnId = entry.turnId;
+              if (entry.topicKey) payloadEntry.topicKey = entry.topicKey;
+              if (entry.taskId) payloadEntry.taskId = entry.taskId;
+              if (entry.rootMessageId) payloadEntry.rootMessageId = entry.rootMessageId;
               return payloadEntry;
             }),
             error: null,
@@ -12468,6 +12525,199 @@ export class Session {
     }
   }
 
+  private async readActiveTurnBackgroundMessages(
+    agentId: string,
+    turnId: string | undefined,
+  ): Promise<Array<{ messageId: string; source: AgentPromptSource; prompt: string }>> {
+    let rows: Array<{ item: { type: string; text?: string }; turnId?: string }> = [];
+    if (typeof this.agentManager.getTimelineRows === "function") {
+      rows = await this.agentManager.getTimelineRows(agentId).catch(() => []);
+    } else if (typeof this.agentManager.getTimeline === "function") {
+      rows = this.agentManager.getTimeline(agentId).map((item) => ({ item }));
+    }
+    const matchingRow = turnId
+      ? rows.findLast(
+          (row) =>
+            row.turnId === turnId &&
+            row.item.type === "user_message" &&
+            typeof row.item.text === "string",
+        )
+      : rows.findLast(
+          (row) => row.item.type === "user_message" && typeof row.item.text === "string",
+        );
+    const text = matchingRow?.item.text;
+    if (!text || !isSystemInjectedEnvelope(text)) return [];
+    const parsed = parseAgentMessages(text);
+    if (!parsed?.length || !parsed.every((entry) => entry.source !== null)) return [];
+    return parsed.flatMap((entry) =>
+      entry.source ? [{ messageId: entry.id, source: entry.source, prompt: entry.text }] : [],
+    );
+  }
+
+  private async inspectRunningBackgroundReportTurn(agentId: string): Promise<{
+    turnId: string | undefined;
+    fallbackMessages: Array<{ messageId: string; source: AgentPromptSource; prompt: string }>;
+  } | null> {
+    if (!this.agentManager.hasInFlightRun(agentId)) return null;
+    if (this.agentManager.isActiveTurnHumanInitiated?.(agentId) === true) return null;
+    const live = this.agentManager.getAgent(agentId);
+    const turnId = live?.activeForegroundTurnId ?? live?.activeTurnId ?? undefined;
+    const trackedByDelivery = this.agentMessages.hasActiveBackgroundTurn?.(agentId) === true;
+    const fallbackMessages = await this.readActiveTurnBackgroundMessages(agentId, turnId);
+    if (!trackedByDelivery && !fallbackMessages.length) return null;
+    return { turnId, fallbackMessages };
+  }
+
+  private waitForBackgroundReportTurnToFinish(
+    agentId: string,
+    timeoutMs: number,
+  ): Promise<"finished" | "timed_out"> {
+    if (!this.agentManager.hasInFlightRun(agentId)) return Promise.resolve("finished");
+    if (timeoutMs <= 0) return Promise.resolve("timed_out");
+    const signal = this.delivery.requestSignal;
+    if (signal.aborted) {
+      return Promise.reject(new DOMException("Wait aborted", "AbortError"));
+    }
+    return new Promise<"finished" | "timed_out">((resolveWait, rejectWait) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let unsubscribe: (() => void) | null = null;
+      const cleanup = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsubscribe?.();
+        unsubscribe = null;
+        signal.removeEventListener("abort", onAbort);
+      };
+      const finish = (outcome: "finished" | "timed_out") => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolveWait(outcome);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        rejectWait(new DOMException("Wait aborted", "AbortError"));
+      };
+      const checkIdle = () => {
+        if (!this.agentManager.hasInFlightRun(agentId)) finish("finished");
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (typeof this.agentManager.subscribe === "function") {
+        unsubscribe = this.agentManager.subscribe(
+          (event) => {
+            if (event.type === "agent_removed" && event.agentId === agentId) {
+              finish("finished");
+              return;
+            }
+            if (event.type === "agent_state" && event.agent.id === agentId) {
+              checkIdle();
+              return;
+            }
+            if (
+              event.type === "agent_stream" &&
+              event.agentId === agentId &&
+              (event.event.type === "turn_completed" ||
+                event.event.type === "turn_canceled" ||
+                event.event.type === "turn_failed")
+            ) {
+              checkIdle();
+            }
+          },
+          { agentId, replayState: false },
+        );
+      }
+      timer = setTimeout(() => finish("timed_out"), timeoutMs);
+      checkIdle();
+    });
+  }
+
+  private resolveHumanActiveTurnBehavior(
+    requested: AgentActiveTurnBehavior | undefined,
+    backgroundTurnRunning: boolean,
+  ): "steer" | "interrupt" {
+    if (backgroundTurnRunning) return "interrupt";
+    return requested === "steer" ? "steer" : "interrupt";
+  }
+
+  private async resolveTopicPromptImages(
+    targetAgent: { workspaceId?: string | null; internal?: boolean } | null | undefined,
+    isMainControl: boolean,
+    images: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>["images"],
+  ) {
+    if (!images?.length || !targetAgent?.workspaceId || targetAgent.internal || !isMainControl) {
+      return undefined;
+    }
+    if (!(await this.workspaceRegistry.get(targetAgent.workspaceId))?.topic) {
+      return undefined;
+    }
+    return this.persistTopicPromptImages(images);
+  }
+
+  private async waitAndCaptureInterruptedBackgroundReports(
+    agentId: string,
+    backgroundTurn: {
+      turnId: string | undefined;
+      fallbackMessages: Array<{ messageId: string; source: AgentPromptSource; prompt: string }>;
+    },
+  ): Promise<{
+    interruptedDeliveryBatch?: InterruptedBackgroundBatch;
+    fallbackRequeueMessages: Array<{
+      messageId: string;
+      source: AgentPromptSource;
+      prompt: string;
+    }>;
+  }> {
+    await this.waitForBackgroundReportTurnToFinish(agentId, this.backgroundReportGraceWaitMs);
+    const liveAfterWait = this.agentManager.getAgent(agentId);
+    const turnIdAfterWait =
+      liveAfterWait?.activeForegroundTurnId ?? liveAfterWait?.activeTurnId ?? undefined;
+    const stillRunningBackgroundTurn =
+      this.agentManager.hasInFlightRun(agentId) &&
+      this.agentManager.isActiveTurnHumanInitiated?.(agentId) !== true &&
+      (backgroundTurn.turnId === undefined ||
+        turnIdAfterWait === undefined ||
+        turnIdAfterWait === backgroundTurn.turnId);
+    if (!stillRunningBackgroundTurn) {
+      return { fallbackRequeueMessages: [] };
+    }
+    const interruptedDeliveryBatch = this.agentMessages.captureActiveBackgroundTurn?.(agentId);
+    return {
+      interruptedDeliveryBatch,
+      fallbackRequeueMessages: interruptedDeliveryBatch ? [] : backgroundTurn.fallbackMessages,
+    };
+  }
+
+  private requeueInterruptedBackgroundReports(
+    agentId: string,
+    captured: {
+      interruptedDeliveryBatch?: InterruptedBackgroundBatch;
+      fallbackRequeueMessages: Array<{
+        messageId: string;
+        source: AgentPromptSource;
+        prompt: string;
+      }>;
+    },
+  ): void {
+    if (captured.interruptedDeliveryBatch) {
+      this.agentMessages.requeueBackgroundBatch?.(captured.interruptedDeliveryBatch);
+      return;
+    }
+    for (const entry of captured.fallbackRequeueMessages) {
+      this.agentMessages.enqueue({
+        recipientId: agentId,
+        messageId: entry.messageId,
+        source: entry.source,
+        prompt: entry.prompt,
+        activeTurnBehavior: "queue",
+      });
+    }
+  }
+
   private async dispatchHumanAgentMessage(
     agentId: string,
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
@@ -12475,39 +12725,59 @@ export class Session {
     allowHumanAuthority: boolean,
     beforeDispatch?: QueueHandoff["begin"],
   ) {
-    const imageAgent = msg.images?.length
-      ? (this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId)))
-      : undefined;
-    const imageAttachments =
-      imageAgent?.workspaceId &&
-      !imageAgent.internal &&
-      isMainControlAgentLabels(imageAgent.labels) &&
-      (await this.workspaceRegistry.get(imageAgent.workspaceId))?.topic
-        ? await this.persistTopicPromptImages(msg.images)
-        : undefined;
-    const result = await this.sendHumanPrompt(
-      {
-        agentId,
-        prompt,
-        messageId: msg.messageId,
-        activeTurnBehavior: msg.activeTurnBehavior === "steer" ? "steer" : "interrupt",
-        sessionMode: msg.sessionMode,
-        runOptions: imageAttachments ? { imageAttachments } : undefined,
-        clearPendingPermissions: true,
-        beforeDispatch,
-      },
-      allowHumanAuthority,
+    const targetAgent =
+      this.agentManager.getAgent(agentId) ??
+      (await this.agentStorage?.get?.(agentId).catch(() => null));
+    const isMainControl = isMainControlAgentLabels(targetAgent?.labels);
+    const imageAttachments = await this.resolveTopicPromptImages(
+      targetAgent,
+      isMainControl,
+      msg.images,
     );
-    if (result.disposition === "turn_started") {
-      await waitForAgentRunStartWithTimeout(
-        this.agentManager,
-        agentId,
-        result.started,
-        this.delivery.requestSignal,
+    const backgroundTurn = isSlashCommandPrompt(prompt)
+      ? null
+      : await this.inspectRunningBackgroundReportTurn(agentId);
+    const activeTurnBehavior = this.resolveHumanActiveTurnBehavior(
+      msg.activeTurnBehavior,
+      backgroundTurn !== null,
+    );
+    const shouldGraceWait = isMainControl && backgroundTurn !== null;
+    const releaseBackgroundHold = shouldGraceWait
+      ? this.agentMessages.holdBackgroundDelivery?.(agentId)
+      : undefined;
+    try {
+      const captured = shouldGraceWait
+        ? await this.waitAndCaptureInterruptedBackgroundReports(agentId, backgroundTurn)
+        : { fallbackRequeueMessages: [] };
+      const result = await this.sendHumanPrompt(
+        {
+          agentId,
+          prompt,
+          messageId: msg.messageId,
+          activeTurnBehavior,
+          sessionMode: msg.sessionMode,
+          runOptions: imageAttachments ? { imageAttachments } : undefined,
+          clearPendingPermissions: true,
+          beforeDispatch,
+          isolateFromSourcedRiders: isMainControl,
+        },
+        allowHumanAuthority,
       );
+      if (result.disposition === "turn_started") {
+        await waitForAgentRunStartWithTimeout(
+          this.agentManager,
+          agentId,
+          result.started,
+          this.delivery.requestSignal,
+        );
+      }
+      if (result.disposition !== "out_of_band") {
+        this.requeueInterruptedBackgroundReports(agentId, captured);
+        await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text, imageAttachments);
+      }
+    } finally {
+      releaseBackgroundHold?.();
     }
-    if (result.disposition !== "out_of_band")
-      await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text, imageAttachments);
   }
 
   private recoverableAgentMessage(

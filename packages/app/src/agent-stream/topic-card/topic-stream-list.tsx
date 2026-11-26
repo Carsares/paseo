@@ -89,6 +89,7 @@ import {
   projectTopicUnits,
   getTopicProjectionAgentAddresses,
   type TopicAgentRuntime,
+  type TopicRedirectTarget,
   type TopicUnit,
 } from "./model";
 import type { TopicDecisionSubmitInput, TopicDecisionSubmitResult } from "./topic-decision-slot";
@@ -136,6 +137,7 @@ function topicMatchesJumpIntent(
   topic: TopicUnit,
   jump: { itemId: string | null; messageId: string | null; seq: number | null },
 ): boolean {
+  if (topic.redirectedTo) return false;
   if (jump.itemId) {
     if (topic.rootItemId === jump.itemId) return true;
     if (topic.replies.some((reply) => reply.id === jump.itemId)) return true;
@@ -147,7 +149,8 @@ function topicMatchesJumpIntent(
         (reply) =>
           ((reply.kind === "main_conclusion" || reply.kind === "main_progress") &&
             reply.messageId === jump.messageId) ||
-          (reply.kind === "thread_entry" && reply.entry.sourceMessageId === jump.messageId),
+          (reply.kind === "thread_entry" && reply.entry.sourceMessageId === jump.messageId) ||
+          (reply.kind === "attributed_user_message" && reply.sourceMessageId === jump.messageId),
       )
     ) {
       return true;
@@ -169,6 +172,7 @@ export function topicMatchesScrollTarget(
   topic: TopicUnit,
   target: Pick<PendingTopicScrollTarget, "topicKey" | "taskId" | "rootMessageId">,
 ): boolean {
+  if (topic.redirectedTo) return false;
   if (topic.topicKey === target.topicKey) return true;
   const targetTaskId =
     target.taskId ?? (target.topicKey.startsWith("task:") ? target.topicKey.slice(5) : undefined);
@@ -1259,6 +1263,16 @@ export const TopicStreamList = memo(function TopicStreamList({
     [agentKey, requestScrollToTopic],
   );
 
+  const handleJumpToRedirectTarget = useCallback(
+    (target: TopicRedirectTarget) => {
+      requestScrollToTopic(agentKey, target.topicKey, true, {
+        taskId: target.taskId,
+        rootMessageId: target.rootMessageId,
+      });
+    },
+    [agentKey, requestScrollToTopic],
+  );
+
   const handleRefreshDurableItems = useCallback(() => {
     void durableResult.refetch?.();
   }, [durableResult]);
@@ -1516,6 +1530,7 @@ export const TopicStreamList = memo(function TopicStreamList({
                   onRefreshDurableItems={handleRefreshDurableItems}
                   onOpenStandaloneDurableItem={handleOpenStandaloneDurableItem}
                   onJumpToPeerTopic={handleJumpToPeerTopic}
+                  onJumpToTopic={handleJumpToRedirectTarget}
                   onSubmitTopicDecision={handleSubmitTopicDecision}
                   onResumeTopicDecision={handleResumeTopicDecision}
                   onActivateCompactDecision={handleActivateCompactDecision}

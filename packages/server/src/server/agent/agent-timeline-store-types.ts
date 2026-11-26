@@ -7,6 +7,9 @@ export interface AgentTimelineRow {
   item: AgentTimelineItem;
   readonly turnId?: string;
   readonly providerMessageId?: string;
+  readonly topicKey?: string;
+  readonly taskId?: string;
+  readonly rootMessageId?: string;
   /** Metrics of the turn this row carries the footer for. */
   readonly turnMetrics?: AgentMetric[];
 }
@@ -56,7 +59,13 @@ export interface AgentTimelineStore {
   appendCommitted(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string; turnId?: string },
+    options?: {
+      timestamp?: string;
+      turnId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
+    },
   ): Promise<AgentTimelineRow>;
   fetchCommitted(
     agentId: string,

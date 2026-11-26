@@ -1,4 +1,4 @@
-import type { QueuedTopicReply } from "@/composer/actions";
+import { resolveQuotedTopicRoutingTarget, type QueuedTopicReply } from "@/composer/actions";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
@@ -98,7 +98,7 @@ import {
   useDraftStore,
   type RecoveredTopicReplyTarget,
 } from "@/stores/draft-store";
-import type { WorkspaceComposerAttachment } from "@/attachments/types";
+import type { QuoteTopicSourceMetadata, WorkspaceComposerAttachment } from "@/attachments/types";
 import { useWorkspaceAttachmentScopeKey } from "@/attachments/workspace-attachments-store";
 import { COMPACT_CONTENT_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
@@ -1393,6 +1393,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         isSubmitLoading={false}
         agentInputDraft={agentInputDraft}
         editingSession={composerEditingSession}
+        isMainControlStream={isMainControlStream}
         hidePendingInboxBar={useTopicCards}
         onAttentionInputFocus={onAttentionInputFocus}
         onAttentionPromptSend={onAttentionPromptSend}
@@ -1459,7 +1460,11 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     () =>
       showsComposer && hasActiveComposer && !draft
         ? {
-            addQuoteAttachment: (quoteText: string, label?: string) => {
+            addQuoteAttachment: (
+              quoteText: string,
+              label?: string,
+              metadata?: QuoteTopicSourceMetadata,
+            ) => {
               if (sideChatSourceId) {
                 void quoteSideChatReply(quoteText).catch(() =>
                   toastApi.error(t("message.actions.forkFailed")),
@@ -1467,7 +1472,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
                 return;
               }
               if (isHandoffInputLocked(serverId, agentId)) return;
-              const quote = createQuoteAttachment({ text: quoteText, label });
+              const quote = createQuoteAttachment({ text: quoteText, label, ...metadata });
               if (!quote.text) return;
               const draftKey = resolveVisibleReplyDraftKey(serverId, workspaceId, agentId);
               if (isTopicComposerDraftSubmitting(draftKey)) {
@@ -2004,6 +2009,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   isSubmitLoading,
   agentInputDraft,
   editingSession,
+  isMainControlStream = false,
   hidePendingInboxBar = false,
   onAttentionInputFocus,
   onAttentionPromptSend,
@@ -2020,6 +2026,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   isSubmitLoading: boolean;
   agentInputDraft: AgentInputDraft;
   editingSession: ComposerEditingSession;
+  isMainControlStream?: boolean;
   hidePendingInboxBar?: boolean;
   onAttentionInputFocus: () => void;
   onAttentionPromptSend: () => void;
@@ -2046,6 +2053,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
       isSubmitLoading={isSubmitLoading}
       agentInputDraft={agentInputDraft}
       editingSession={editingSession}
+      isMainControlStream={isMainControlStream}
       hidePendingInboxBar={hidePendingInboxBar}
       onAttentionInputFocus={onAttentionInputFocus}
       onAttentionPromptSend={onAttentionPromptSend}
@@ -2068,6 +2076,7 @@ function ActiveAgentComposer({
   isSubmitLoading,
   agentInputDraft,
   editingSession,
+  isMainControlStream = false,
   hidePendingInboxBar = false,
   onAttentionInputFocus,
   onAttentionPromptSend,
@@ -2082,6 +2091,7 @@ function ActiveAgentComposer({
   isSubmitLoading: boolean;
   agentInputDraft: AgentInputDraft;
   editingSession: ComposerEditingSession;
+  isMainControlStream?: boolean;
   hidePendingInboxBar?: boolean;
   onAttentionInputFocus: () => void;
   onAttentionPromptSend: () => void;
@@ -2204,7 +2214,9 @@ function ActiveAgentComposer({
 
   const {
     activeReplyTopic,
+    quotedReplyTopic,
     topicDraftKey,
+    ordinaryDraftKey,
     submittingTopicDraftKey,
     topicQueue,
     recoveredTopicDecisions,
@@ -2212,16 +2224,24 @@ function ActiveAgentComposer({
     handleToggleReplyRouteMode,
     handleCancelReplyTopic,
     handleSubmitTopicReply,
+    handleSubmitQuotedTopicReply,
     sendQueuedTopicReply,
   } = useActiveTopicComposer({
     serverId,
     workspaceId,
     agentId,
+    isMainControlStream,
     agentInputDraft,
     onErrorToast,
     onMessageSent,
   });
   const DraftComposer = topicDraftKey ? ScopedTopicDraftComposer : Composer;
+  let onSubmitMessageOverride: ((payload: MessagePayload) => Promise<void>) | undefined;
+  if (activeReplyTopic) {
+    onSubmitMessageOverride = handleSubmitTopicReply;
+  } else if (quotedReplyTopic) {
+    onSubmitMessageOverride = handleSubmitQuotedTopicReply;
+  }
 
   return (
     <View style={animatedStaticStyles.inputAreaWrapper} onLayout={onInputAreaLayout}>
@@ -2273,13 +2293,17 @@ function ActiveAgentComposer({
         autoFocus
         autoFocusKey={String(agentInputDraft.attachmentFocusRequestId)}
         isSubmitLoading={
-          isSubmitLoading || Boolean(topicDraftKey && submittingTopicDraftKey === topicDraftKey)
+          isSubmitLoading ||
+          Boolean(
+            (topicDraftKey && submittingTopicDraftKey === topicDraftKey) ||
+            (quotedReplyTopic && submittingTopicDraftKey === ordinaryDraftKey),
+          )
         }
         onAttentionInputFocus={onAttentionInputFocus}
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={onComposerHeightChange}
         onMessageSent={onMessageSent}
-        onSubmitMessage={activeReplyTopic ? handleSubmitTopicReply : undefined}
+        onSubmitMessage={onSubmitMessageOverride}
         onClientSlashCommand={handleClientSlashCommand}
         allowSideChat={allowSideChat}
         isCompactLayout={isCompactComposerLayout}
@@ -2391,6 +2415,7 @@ function useActiveTopicComposer({
   serverId,
   workspaceId,
   agentId,
+  isMainControlStream,
   agentInputDraft,
   onErrorToast,
   onMessageSent,
@@ -2398,6 +2423,7 @@ function useActiveTopicComposer({
   serverId: string;
   workspaceId: string;
   agentId: string;
+  isMainControlStream: boolean;
   agentInputDraft: AgentInputDraft;
   onErrorToast?: (message: string) => void;
   onMessageSent: () => void;
@@ -2409,9 +2435,25 @@ function useActiveTopicComposer({
   const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
   const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
   const topicAgentKey = buildTopicAgentKey(serverId, agentId);
+  const ordinaryDraftKey = buildDraftStoreKey({ serverId, agentId });
   const activeReplyTopic = useTopicStreamViewStore(
     (state) => state.activeReplyTopicByAgentKey[topicAgentKey] ?? null,
   );
+  const quotedReplyTopic = useMemo(() => {
+    if (activeReplyTopic || !isMainControlStream || !supportsTopicThreads || !workspaceId) {
+      return null;
+    }
+    return resolveQuotedTopicRoutingTarget({
+      attachments: agentInputDraft.attachments,
+      activeReplyTopic,
+    });
+  }, [
+    activeReplyTopic,
+    agentInputDraft.attachments,
+    isMainControlStream,
+    supportsTopicThreads,
+    workspaceId,
+  ]);
   const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
   const clearActiveReplyTopicIfMatches = useTopicStreamViewStore(
     (state) => state.clearActiveReplyTopicIfMatches,
@@ -2549,31 +2591,95 @@ function useActiveTopicComposer({
     ],
   );
 
-  const topicQueue = useMemo(
-    () =>
-      activeReplyTopic && topicDraftKey
-        ? {
-            draftKey: topicDraftKey,
-            target: activeReplyTopic,
-            onQueued: clearSubmittedTarget,
-            onEditOrdinary: (text: string, attachments: AgentInputDraft["attachments"]) => {
-              agentInputDraft.replaceText(text);
-              agentInputDraft.setAttachments(attachments);
-              handleCancelReplyTopic();
-            },
-          }
-        : undefined,
+  const handleSubmitQuotedTopicReply = useCallback(
+    async (payload: MessagePayload) => {
+      const submittedTarget = resolveQuotedTopicRoutingTarget({
+        attachments: payload.attachments,
+        activeReplyTopic: null,
+      });
+      if (!submittedTarget || !workspaceId) {
+        throw new Error(t("composer.errors.failedToSend"));
+      }
+      const clientMessageId = rememberTopicSubmission(ordinaryDraftKey, submittedTarget, payload);
+      setSubmittingTopicDraftKey(ordinaryDraftKey);
+      try {
+        const sent = await submitActiveTopicReply({
+          queryClient,
+          serverId,
+          workspaceId,
+          agentId,
+          activeReplyTopic: submittedTarget,
+          payload,
+          supportsTopicThreads,
+          supportsButlerV1,
+          supportsForgeAttachments,
+          clientMessageId,
+          disconnectedMessage: t("workspace.terminal.hostDisconnected"),
+        });
+        if (!sent) throw new Error(t("composer.errors.failedToSend"));
+        finishTopicSubmission(ordinaryDraftKey, clientMessageId);
+      } catch (err) {
+        onErrorToast?.(err instanceof Error ? err.message : String(err));
+        throw err;
+      } finally {
+        setSubmittingTopicDraftKey((key) => (key === ordinaryDraftKey ? undefined : key));
+      }
+    },
     [
-      activeReplyTopic,
-      agentInputDraft,
-      clearSubmittedTarget,
-      handleCancelReplyTopic,
-      topicDraftKey,
+      agentId,
+      onErrorToast,
+      ordinaryDraftKey,
+      queryClient,
+      serverId,
+      supportsButlerV1,
+      supportsForgeAttachments,
+      supportsTopicThreads,
+      t,
+      workspaceId,
     ],
   );
+
+  const topicQueue = useMemo(() => {
+    if (activeReplyTopic && topicDraftKey) {
+      return {
+        draftKey: topicDraftKey,
+        target: activeReplyTopic,
+        onQueued: clearSubmittedTarget,
+        onEditOrdinary: (text: string, attachments: AgentInputDraft["attachments"]) => {
+          agentInputDraft.replaceText(text);
+          agentInputDraft.setAttachments(attachments);
+          handleCancelReplyTopic();
+        },
+      };
+    }
+    if (quotedReplyTopic) {
+      return {
+        draftKey: ordinaryDraftKey,
+        target: quotedReplyTopic,
+        onQueued: (clientMessageId: string) => {
+          finishTopicSubmission(ordinaryDraftKey, clientMessageId);
+        },
+        onEditOrdinary: (text: string, attachments: AgentInputDraft["attachments"]) => {
+          agentInputDraft.replaceText(text);
+          agentInputDraft.setAttachments(attachments);
+        },
+      };
+    }
+    return undefined;
+  }, [
+    activeReplyTopic,
+    agentInputDraft,
+    clearSubmittedTarget,
+    handleCancelReplyTopic,
+    ordinaryDraftKey,
+    quotedReplyTopic,
+    topicDraftKey,
+  ]);
   return {
     activeReplyTopic,
+    quotedReplyTopic,
     topicDraftKey,
+    ordinaryDraftKey,
     submittingTopicDraftKey,
     topicQueue,
     recoveredTopicDecisions,
@@ -2581,6 +2687,7 @@ function useActiveTopicComposer({
     handleToggleReplyRouteMode,
     handleCancelReplyTopic,
     handleSubmitTopicReply,
+    handleSubmitQuotedTopicReply,
     sendQueuedTopicReply,
   };
 }

@@ -197,6 +197,20 @@ export class TopicDelegationStore {
     ).then(() => associated);
   }
 
+  readDispatch(dispatch: Dispatch): Promise<TopicDelegationScope | undefined> {
+    return this.run(dispatch.workspaceId, (records) => {
+      const found = records.find((entry) => sameDispatch(entry, dispatch));
+      if (!found) return undefined;
+      return {
+        workspaceId: found.workspaceId,
+        mainAgentId: found.mainAgentId,
+        rootMessageId: found.rootMessageId,
+        rootPromptText: found.rootPromptText,
+        ...(found.taskId ? { taskId: found.taskId } : {}),
+      };
+    });
+  }
+
   private matchesRecovery(entry: Record, original: TopicDelegationTurn) {
     return (
       sameDispatch(entry, original) &&

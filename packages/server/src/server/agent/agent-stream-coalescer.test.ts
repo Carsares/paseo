@@ -805,4 +805,64 @@ describe("AgentStreamCoalescer", () => {
       { type: "assistant_message", text: "b" },
     ]);
   });
+
+  test("preserves topic attribution across coalesced text and tool calls without merging across topics", async () => {
+    const { coalescer, flushes } = createHarness();
+    primeLeadingEdge(coalescer, flushes);
+
+    coalescer.handle("agent-1", {
+      ...assistant("hello "),
+      turnId: "turn-1",
+      topicKey: "task:t1",
+      taskId: "t1",
+      rootMessageId: "m1",
+    });
+    coalescer.handle("agent-1", {
+      ...assistant("world"),
+      turnId: "turn-1",
+      topicKey: "task:t1",
+      taskId: "t1",
+      rootMessageId: "m1",
+    });
+    coalescer.handle("agent-1", {
+      ...assistant("reattributed"),
+      turnId: "turn-1",
+      topicKey: "task:t2",
+      taskId: "t2",
+      rootMessageId: "m2",
+    });
+    coalescer.handle("agent-1", {
+      ...toolCall({ output: "step 1" }),
+      turnId: "turn-1",
+      topicKey: "task:t2",
+      taskId: "t2",
+      rootMessageId: "m2",
+    });
+
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(flushes).toEqual([
+      expect.objectContaining({
+        item: { type: "assistant_message", text: "hello world" },
+        turnId: "turn-1",
+        topicKey: "task:t1",
+        taskId: "t1",
+        rootMessageId: "m1",
+      }),
+      expect.objectContaining({
+        item: { type: "assistant_message", text: "reattributed" },
+        turnId: "turn-1",
+        topicKey: "task:t2",
+        taskId: "t2",
+        rootMessageId: "m2",
+      }),
+      expect.objectContaining({
+        item: expect.objectContaining({ type: "tool_call", callId: "tool-1" }),
+        turnId: "turn-1",
+        topicKey: "task:t2",
+        taskId: "t2",
+        rootMessageId: "m2",
+      }),
+    ]);
+  });
 });

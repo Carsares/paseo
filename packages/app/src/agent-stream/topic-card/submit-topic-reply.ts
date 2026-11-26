@@ -1,4 +1,4 @@
-import type { QueuedTopicReply } from "@/composer/actions";
+import { resolveQuotedTopicRoutingTarget, type QueuedTopicReply } from "@/composer/actions";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceTaskSummary } from "@getpaseo/protocol/messages";
 import type { QueryClient } from "@tanstack/react-query";
@@ -96,6 +96,9 @@ async function sendLegacyQuotedTopicReply(input: {
   const topicQuote = createQuoteAttachment({
     text: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
     label: activeReplyTopic.leadTitle || activeReplyTopic.topicKey,
+    topicKey: activeReplyTopic.topicKey,
+    rootMessageId: activeReplyTopic.rootMessageId,
+    taskId: activeReplyTopic.taskId,
   });
   const combinedAttachments = topicQuote.text
     ? [topicQuote, ...payload.attachments]
@@ -317,6 +320,48 @@ export async function submitActiveTopicReply(input: {
     attachments: attachmentsToSend,
   });
   return true;
+}
+
+export async function submitQuotedTopicReplyIfMatched(input: {
+  queryClient: QueryClient;
+  serverId: string;
+  workspaceId?: string | null;
+  agentId: string;
+  isMainControlStream: boolean;
+  activeReplyTopic?: ActiveTopicReplyTarget | null;
+  payload: MessagePayload;
+  supportsTopicThreads: boolean;
+  supportsButlerV1?: boolean;
+  supportsForgeAttachments: boolean;
+  disconnectedMessage: string;
+  onPersistSubmissionIntent?: (signature: string, clientMessageId: string) => void;
+  clientMessageId?: string;
+}): Promise<{ routed: false } | { routed: true; target: ActiveTopicReplyTarget; sent: boolean }> {
+  if (!input.isMainControlStream || !input.supportsTopicThreads || !input.workspaceId) {
+    return { routed: false };
+  }
+  const target = resolveQuotedTopicRoutingTarget({
+    attachments: input.payload.attachments,
+    activeReplyTopic: input.activeReplyTopic,
+  });
+  if (!target) {
+    return { routed: false };
+  }
+  const sent = await submitActiveTopicReply({
+    queryClient: input.queryClient,
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    agentId: input.agentId,
+    activeReplyTopic: target,
+    payload: input.payload,
+    supportsTopicThreads: input.supportsTopicThreads,
+    supportsButlerV1: input.supportsButlerV1,
+    supportsForgeAttachments: input.supportsForgeAttachments,
+    disconnectedMessage: input.disconnectedMessage,
+    onPersistSubmissionIntent: input.onPersistSubmissionIntent,
+    clientMessageId: input.clientMessageId,
+  });
+  return { routed: true, target, sent };
 }
 
 export function getTopicReplyRecoveryId(target: ActiveTopicReplyTarget): string | undefined {

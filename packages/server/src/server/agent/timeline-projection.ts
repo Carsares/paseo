@@ -22,6 +22,9 @@ export interface TimelineProjectionEntry {
   item: AgentTimelineItem;
   turnId?: string;
   providerMessageId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   turnMetrics?: AgentMetric[];
   timestamp: string;
   seqStart: number;
@@ -116,6 +119,9 @@ function makeCanonicalEntries(rows: readonly AgentTimelineRow[]): WorkingEntry[]
       timestamp: row.timestamp,
       ...(row.turnId ? { turnId: row.turnId } : {}),
       ...(row.providerMessageId ? { providerMessageId: row.providerMessageId } : {}),
+      ...(row.topicKey ? { topicKey: row.topicKey } : {}),
+      ...(row.taskId ? { taskId: row.taskId } : {}),
+      ...(row.rootMessageId ? { rootMessageId: row.rootMessageId } : {}),
       ...(row.turnMetrics ? { turnMetrics: row.turnMetrics } : {}),
       seqStart: row.seq,
       seqEnd: row.seq,
@@ -147,6 +153,9 @@ function mergeIdentityEntries(existing: WorkingEntry, entry: WorkingEntry): Work
         item: mergeToolCallItems(existing.item, entry.item),
         timestamp: entry.timestamp,
         seqEnd: Math.max(existing.seqEnd, entry.seqEnd),
+        ...(entry.topicKey ? { topicKey: entry.topicKey } : {}),
+        ...(entry.taskId ? { taskId: entry.taskId } : {}),
+        ...(entry.rootMessageId ? { rootMessageId: entry.rootMessageId } : {}),
         ...(entry.turnMetrics ? { turnMetrics: entry.turnMetrics } : {}),
         ...mergeIdentityMetadata(existing, entry, "tool_lifecycle"),
       };
@@ -203,7 +212,10 @@ function mergeReasoningChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
       previous.item.type === "reasoning" &&
       entry.item.type === "reasoning" &&
       previous.seqEnd + 1 === entry.seqStart &&
-      previous.turnId === entry.turnId;
+      previous.turnId === entry.turnId &&
+      previous.topicKey === entry.topicKey &&
+      previous.taskId === entry.taskId &&
+      previous.rootMessageId === entry.rootMessageId;
 
     if (!shouldMerge || !previous) {
       output.push(entry);
@@ -259,7 +271,10 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
     const shouldMerge =
       previous &&
       previous.seqEnd + 1 === entry.seqStart &&
-      continuesAssistantMessage(previous, entry);
+      continuesAssistantMessage(previous, entry) &&
+      previous.topicKey === entry.topicKey &&
+      previous.taskId === entry.taskId &&
+      previous.rootMessageId === entry.rootMessageId;
 
     if (!shouldMerge || !previous) {
       output.push(entry);

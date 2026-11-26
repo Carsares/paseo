@@ -132,6 +132,9 @@ interface TimelineResponseEntry {
   collapsed?: string[];
   provider: string;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   item: AgentTimelineItem;
   timestamp: string;
   turnMetrics?: AgentMetric[];
@@ -777,11 +780,43 @@ function replaceLiveAssistantWithProjectedText(params: {
   const next = [...head];
   next[index] = {
     ...current,
+    ...(event.topicKey ? { topicKey: event.topicKey } : {}),
+    ...(event.taskId ? { taskId: event.taskId } : {}),
+    ...(event.rootMessageId ? { rootMessageId: event.rootMessageId } : {}),
     text: event.item.text,
     timestamp,
     timelineCursor,
   };
   return next;
+}
+
+function buildProjectedAssistantReplacement(params: {
+  current: AssistantMessageItem;
+  event: Extract<AgentStreamEventPayload, { type: "timeline" }>;
+  projectedText: string;
+  projectedMessageId?: string;
+  timestamp: Date;
+  epoch: string;
+  seqEnd: number;
+}): AssistantMessageItem {
+  const { current, event, projectedText, projectedMessageId, timestamp, epoch, seqEnd } = params;
+  const messageId = projectedMessageId ?? current.messageId;
+  const turnId = event.turnId ?? current.turnId;
+  const topicKey = event.topicKey ?? current.topicKey;
+  const taskId = event.taskId ?? current.taskId;
+  const rootMessageId = event.rootMessageId ?? current.rootMessageId;
+  return {
+    kind: "assistant_message",
+    id: current.id,
+    ...(messageId !== undefined ? { messageId } : {}),
+    ...(turnId !== undefined ? { turnId } : {}),
+    ...(topicKey !== undefined ? { topicKey } : {}),
+    ...(taskId !== undefined ? { taskId } : {}),
+    ...(rootMessageId !== undefined ? { rootMessageId } : {}),
+    text: projectedText,
+    timestamp,
+    timelineCursor: { epoch, seq: seqEnd },
+  };
 }
 
 function reconcileOverlappingProjectedAssistant(params: {
@@ -822,15 +857,15 @@ function reconcileOverlappingProjectedAssistant(params: {
     return { tail: params.tail, head: params.head, reconciled: false };
   }
 
-  const messageId = projectedMessageId ?? match.current.messageId;
-  const replacement: AssistantMessageItem = {
-    kind: "assistant_message",
-    id: match.current.id,
-    ...(messageId !== undefined ? { messageId } : {}),
-    text: projectedText,
+  const replacement = buildProjectedAssistantReplacement({
+    current: match.current,
+    event: unit.event,
+    projectedText,
+    projectedMessageId,
     timestamp: unit.timestamp,
-    timelineCursor: { epoch: params.epoch, seq: unit.seqEnd },
-  };
+    epoch: params.epoch,
+    seqEnd: unit.seqEnd,
+  });
   const replaceMatch = (items: StreamItem[], index: number) => {
     const next = [...items];
     next[index] = replacement;
@@ -880,6 +915,7 @@ function reconcileOverlappingProjectedReasoning(params: {
     return { tail: params.tail, head: params.head, reconciled: false };
   }
 
+  const { topicKey, taskId, rootMessageId } = unit.event;
   const projectedText = unit.event.item.text;
   const replaceIn = (items: StreamItem[]): StreamItem[] | null => {
     const index = items.findLastIndex(
@@ -890,6 +926,9 @@ function reconcileOverlappingProjectedReasoning(params: {
     const next = [...items];
     next[index] = {
       ...current,
+      ...(topicKey ? { topicKey } : {}),
+      ...(taskId ? { taskId } : {}),
+      ...(rootMessageId ? { rootMessageId } : {}),
       text: projectedText,
       timestamp: unit.timestamp,
       status: "loading",
@@ -1283,6 +1322,9 @@ export function processTimelineResponse(
       provider: entry.provider,
       item: entry.item,
       ...(entry.turnId ? { turnId: entry.turnId } : {}),
+      ...(entry.topicKey ? { topicKey: entry.topicKey } : {}),
+      ...(entry.taskId ? { taskId: entry.taskId } : {}),
+      ...(entry.rootMessageId ? { rootMessageId: entry.rootMessageId } : {}),
     } as AgentStreamEventPayload,
     timestamp: new Date(entry.timestamp),
   }));

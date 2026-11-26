@@ -1936,6 +1936,10 @@ export async function createPaseoDaemon(
       return wsServer.decideTopicAction(request, actor);
     },
     upsertTopicAnchor: async (anchor) => wsServer?.persistTopicAnchor(anchor),
+    assignTopicAttribution: (input) => {
+      if (!wsServer) throw new Error("Topic attribution is unavailable on this host.");
+      return wsServer.assignTopicAttribution(input);
+    },
     listTopicEntries: async (scope) => (await wsServer?.listTopicEntries(scope)) ?? [],
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,

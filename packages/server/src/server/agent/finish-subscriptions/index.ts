@@ -94,6 +94,7 @@ export interface FinishSubscriptions {
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
     content: {
       status: NonNullable<AgentFinishReport["parentReportStatus"]>;
+      escalateToParent?: boolean;
       title?: string;
       summary: string;
       turnId?: string;
@@ -1356,7 +1357,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         await deps.followups.watches.put(record);
         startFollowupWatch(record);
       }),
-    queueParentReport: (address, { status, title, summary, turnId, taskId, rootMessageId }) =>
+    queueParentReport: (
+      address,
+      { status, escalateToParent, title, summary, turnId, taskId, rootMessageId },
+    ) =>
       serialize(async () => {
         if (closed || !deps.followups) throw new Error("Parent report delivery is unavailable");
         const id = randomUUID();
@@ -1366,6 +1370,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           prompt: `Report to parent (${status}):\n\n${summary}`,
           event: "finished",
           parentReportStatus: status,
+          ...(escalateToParent === true ? { escalateToParent: true } : {}),
         };
         const group = watches.get(key(address));
         const covered = [...(group ?? [])]

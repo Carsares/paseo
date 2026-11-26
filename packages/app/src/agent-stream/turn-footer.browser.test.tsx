@@ -5,6 +5,7 @@ import type { AgentMetric } from "@getpaseo/protocol/agent-types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { ComposerQuoteProvider } from "@/assistant-selection-copy/composer-quote";
+import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { FloatingPanelPortalHost } from "@/components/ui/floating-panel-portal";
 import { i18n } from "@/i18n/i18next";
 import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
@@ -47,9 +48,14 @@ const reply: StreamItem = {
 };
 
 // A module-level target keeps the provider's `target` prop identity stable across renders.
-let quoteSink: ((quoteText: string, label?: string) => void) | undefined;
+let quoteSink:
+  | ((quoteText: string, label?: string, metadata?: QuoteTopicSourceMetadata) => void)
+  | undefined;
 const quoteTarget = {
-  addQuoteAttachment: (quoteText: string, label?: string) => quoteSink?.(quoteText, label),
+  addQuoteAttachment: (quoteText: string, label?: string, metadata?: QuoteTopicSourceMetadata) =>
+    metadata !== undefined
+      ? quoteSink?.(quoteText, label, metadata)
+      : quoteSink?.(quoteText, label),
 };
 
 function renderCompletedFooter(
@@ -59,7 +65,11 @@ function renderCompletedFooter(
     items?: StreamItem[];
     turnMetrics?: AgentMetric[];
     startIndex?: number;
-    addQuoteAttachment?: (quoteText: string, label?: string) => void;
+    addQuoteAttachment?: (
+      quoteText: string,
+      label?: string,
+      metadata?: QuoteTopicSourceMetadata,
+    ) => void;
     wrapInStreamRoot?: boolean;
     streamChildren?: React.ReactNode;
   } = {},
@@ -391,5 +401,42 @@ describe("turn stats", () => {
     expect(host.getBoundingClientRect().height).toBe(without);
     act(() => quoteButton()?.click());
     expect(addQuoteAttachment).toHaveBeenCalledExactlyOnceWith("Done.", "Quote reply");
+  });
+
+  it("attaches turn topic metadata when quoting a completed turn linked to a root prompt", () => {
+    const addQuoteAttachment = vi.fn();
+    const userPrompt: StreamItem = {
+      kind: "user_message",
+      id: "u-1",
+      messageId: "m-1",
+      turnId: "turn-1",
+      text: "Check reconnect backoff",
+      timestamp: FRIDAY_NIGHT,
+    };
+    const answer: StreamItem = {
+      kind: "assistant_message",
+      id: "a-1",
+      messageId: "a-1",
+      turnId: "turn-1",
+      text: "Backoff jitter is fixed.",
+      timestamp: FRIDAY_NIGHT,
+    };
+    renderCompletedFooter(TIMING, {
+      items: [userPrompt, answer],
+      startIndex: 1,
+      addQuoteAttachment,
+    });
+
+    act(() => quoteButton()?.click());
+
+    expect(addQuoteAttachment).toHaveBeenCalledExactlyOnceWith(
+      "Backoff jitter is fixed.",
+      "Quote reply",
+      {
+        topicKey: "msg:m-1",
+        rootMessageId: "m-1",
+        sourceMessageId: "a-1",
+      },
+    );
   });
 });

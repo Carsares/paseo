@@ -84,6 +84,7 @@ const mainControlTools = [
   "request_human_decision",
   "get_workspace_situation",
   "dispatch_topic_decision",
+  "assign_topic_attribution",
 ];
 
 it("protects the current topic main without changing legacy or cross-workspace archive rules", () => {
@@ -416,6 +417,19 @@ describe("agent orchestration", () => {
     expect(prompt).toContain('kind="peer-workspace-message"');
     expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");
     expect(prompt).toContain("stay read-only regardless of provider mode");
+    expect(prompt).toContain("assign_topic_attribution");
+    expect(prompt).toContain("default to opening a separate topic card rather than misfiling");
+    expect(prompt).toContain("keep global status rollups in the coordinator overview card");
+    expect(prompt).toContain(
+      "triage and separate each distinct topic first, then invoke the matching tool for each item one by one",
+    );
+    expect(prompt).toContain("Never combine unrelated matters into a single reply paragraph.");
+    expect(prompt).toContain("respond only to the topic that triggered the current turn");
+    expect(prompt).toContain("never fold in summaries of other historical topics from context");
+    expect(prompt).toContain(
+      "single-track routine completions handled directly on topic cards without waking Main Control",
+    );
+    expect(prompt).toContain("do not echo or relay single-topic updates");
     expect(prompt).toContain(
       "Call request_human_decision only if the tool is available and the user needs to make a decision or accept a deliverable.",
     );

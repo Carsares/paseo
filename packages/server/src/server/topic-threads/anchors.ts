@@ -1,4 +1,8 @@
-import { TopicAnchorSummarySchema, type TopicAnchorSummary } from "@getpaseo/protocol/messages";
+import {
+  TopicAnchorSummarySchema,
+  type TopicAnchorSummary,
+  type TopicMessageAttribution,
+} from "@getpaseo/protocol/messages";
 import { createHash } from "node:crypto";
 import { projectAgentMessages } from "../agent/agent-messages/envelope.js";
 import type { AgentTimelineRow } from "../agent/agent-timeline-store-types.js";
@@ -100,19 +104,28 @@ function findBoundRoot(inScope: TopicAnchorSummary[], rootMessageId: string | un
   );
 }
 
-function buildAnchor(
+function mergeAttributedMessages(
+  ...lists: readonly (readonly TopicMessageAttribution[] | undefined)[]
+): TopicMessageAttribution[] | undefined {
+  const byId = new Map<string, TopicMessageAttribution>();
+  for (const list of lists) {
+    if (!list) continue;
+    for (const entry of list) {
+      byId.set(entry.sourceMessageId, entry);
+    }
+  }
+  return byId.size > 0 ? [...byId.values()] : undefined;
+}
+
+function pickAnchorMetadata(
   parsed: TopicAnchorInput,
   existing: TopicAnchorSummary | undefined,
   firstMessage: TopicAnchorSummary | undefined,
   now: string,
-): TopicAnchorSummary {
-  const rootPromptText = selectRootPrompt(parsed, existing, firstMessage);
+) {
   return {
-    ...existing,
-    ...parsed,
-    taskId: parsed.taskId,
     rootMessageId: existing?.rootMessageId ?? parsed.rootMessageId,
-    rootPromptText,
+    rootPromptText: selectRootPrompt(parsed, existing, firstMessage),
     imageAttachments:
       firstMessage?.imageAttachments ?? parsed.imageAttachments ?? existing?.imageAttachments,
     title: parsed.title ?? existing?.title,
@@ -122,6 +135,27 @@ function buildAnchor(
     createdAt: existing?.createdAt ?? firstMessage?.createdAt ?? now,
     updatedAt: now,
   };
+}
+
+function buildAnchor(
+  parsed: TopicAnchorInput,
+  existing: TopicAnchorSummary | undefined,
+  firstMessage: TopicAnchorSummary | undefined,
+  now: string,
+): TopicAnchorSummary {
+  const attributedMessages = mergeAttributedMessages(
+    firstMessage?.attributedMessages,
+    existing?.attributedMessages,
+    parsed.attributedMessages,
+  );
+  const anchor: TopicAnchorSummary = {
+    ...existing,
+    ...parsed,
+    taskId: parsed.taskId,
+    ...pickAnchorMetadata(parsed, existing, firstMessage, now),
+  };
+  if (attributedMessages) anchor.attributedMessages = attributedMessages;
+  return anchor;
 }
 
 function selectRootPrompt(

@@ -1796,3 +1796,402 @@ describe("projectTopicUnits", () => {
     }
   });
 });
+
+describe("authoritative topic stamps, tightened dispatching, and attribution", () => {
+  it("routes interleaved thought, tool_call, and assistant_message back to Topic A using authoritative stamps instead of letting Topic B absorb them", () => {
+    const items: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-a",
+        messageId: "m-a",
+        turnId: "turn-a",
+        text: "Audit WebSocket reconnect",
+        seq: 1,
+        ts: 1_000,
+      }),
+      makeHumanPrompt({
+        id: "u-b",
+        messageId: "m-b",
+        turnId: "turn-b",
+        text: "Adjust dark theme token",
+        seq: 2,
+        ts: 2_000,
+      }),
+      {
+        kind: "thought",
+        id: "th-a",
+        turnId: "turn-a-followup",
+        topicKey: "msg:m-a",
+        rootMessageId: "m-a",
+        text: "Checking WebSocket backoff",
+        status: "ready",
+        timestamp: new Date(3_000),
+        timelineCursor: { epoch: "ep-1", seq: 3 },
+      },
+      {
+        kind: "tool_call",
+        id: "tc-a",
+        turnId: "turn-a-followup",
+        topicKey: "msg:m-a",
+        rootMessageId: "m-a",
+        timestamp: new Date(3_500),
+        timelineCursor: { epoch: "ep-1", seq: 4 },
+        payload: {
+          source: "agent",
+          data: {
+            provider: "claude",
+            callId: "tc-a",
+            name: "read_file",
+            status: "completed",
+            error: null,
+            detail: { type: "unknown", input: {}, output: {} },
+          },
+        },
+      },
+      {
+        kind: "assistant_message",
+        id: "ans-a",
+        messageId: "ans-a",
+        turnId: "turn-a-followup",
+        topicKey: "msg:m-a",
+        rootMessageId: "m-a",
+        text: "WebSocket reconnect jitter fixed.",
+        timestamp: new Date(4_000),
+        timelineCursor: { epoch: "ep-1", seq: 5 },
+      },
+    ];
+
+    const result = projectTopicUnits({ items });
+    expect(result.topics).toHaveLength(2);
+    expect(result.topics[0]!.topicKey).toBe("msg:m-a");
+    expect(result.topics[0]!.processSteps.map((s) => s.id)).toEqual(["th-a", "tc-a"]);
+    expect(result.topics[0]!.replies.map((r) => r.id)).toEqual(["ans-a"]);
+
+    expect(result.topics[1]!.topicKey).toBe("msg:m-b");
+    expect(result.topics[1]!.processSteps).toEqual([]);
+    expect(result.topics[1]!.replies).toEqual([]);
+  });
+
+  it("keeps legacy turnId/order fallback when host omits authoritative topic stamps", () => {
+    const items: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-1",
+        messageId: "m-1",
+        turnId: "t-1",
+        text: "First",
+        seq: 1,
+        ts: 1000,
+      }),
+      {
+        kind: "assistant_message",
+        id: "a-1",
+        turnId: "t-1",
+        text: "First answer",
+        timestamp: new Date(1500),
+        timelineCursor: { epoch: "ep-1", seq: 2 },
+      },
+      makeHumanPrompt({
+        id: "u-2",
+        messageId: "m-2",
+        turnId: "t-2",
+        text: "Second",
+        seq: 3,
+        ts: 2000,
+      }),
+      {
+        kind: "thought",
+        id: "th-2",
+        turnId: "t-2",
+        text: "Thinking on second",
+        status: "ready",
+        timestamp: new Date(2200),
+        timelineCursor: { epoch: "ep-1", seq: 4 },
+      },
+      {
+        kind: "assistant_message",
+        id: "a-2",
+        turnId: "t-2",
+        text: "Second answer",
+        timestamp: new Date(2500),
+        timelineCursor: { epoch: "ep-1", seq: 5 },
+      },
+    ];
+
+    const result = projectTopicUnits({ items });
+    expect(result.topics[0]!.replies.map((r) => r.id)).toEqual(["a-1"]);
+    expect(result.topics[1]!.processSteps.map((s) => s.id)).toEqual(["th-2"]);
+    expect(result.topics[1]!.replies.map((r) => r.id)).toEqual(["a-2"]);
+  });
+
+  it("never marks latest Topic B as dispatching while Topic A is running a background report turn", () => {
+    const items: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-a",
+        messageId: "m-a",
+        turnId: "t-a",
+        text: "Topic A",
+        seq: 1,
+        ts: 1000,
+      }),
+      makeHumanPrompt({
+        id: "u-b",
+        messageId: "m-b",
+        turnId: "t-b",
+        text: "Topic B",
+        seq: 2,
+        ts: 2000,
+      }),
+      {
+        kind: "assistant_message",
+        id: "ans-b",
+        turnId: "t-b",
+        text: "Topic B answered directly.",
+        timestamp: new Date(2500),
+        timelineCursor: { epoch: "ep-1", seq: 3 },
+      },
+      makeSubagentReport({
+        id: "rep-a",
+        turnId: "t-report-a",
+        senderId: "worker-a",
+        senderTitle: "Worker A",
+        rootMessageId: "m-a",
+        text: "Topic A background work finished.",
+        seq: 4,
+        ts: 3000,
+      }),
+      {
+        kind: "thought",
+        id: "th-report-a",
+        turnId: "t-report-a",
+        topicKey: "msg:m-a",
+        rootMessageId: "m-a",
+        text: "Summarizing Topic A report",
+        status: "loading",
+        timestamp: new Date(3200),
+        timelineCursor: { epoch: "ep-1", seq: 5 },
+      },
+    ];
+
+    const result = projectTopicUnits({
+      items,
+      isTurnActive: true,
+      readSnapshot: {
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        watermarkEpoch: "ep-1",
+        watermarkSeq: 10,
+        watermarkTimestampMs: 10_000,
+        topics: [],
+        revision: 1,
+      },
+    });
+
+    expect(result.topics[0]!.topicKey).toBe("msg:m-a");
+    expect(result.topics[0]!.lifecycleStatus).toBe("dispatching");
+    expect(result.topics[1]!.topicKey).toBe("msg:m-b");
+    expect(result.topics[1]!.lifecycleStatus).toBe("replied");
+  });
+
+  it("marks a topic dispatching only when the active turn belongs to it and has no conclusion yet", () => {
+    const activeTurnOnB: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-a",
+        messageId: "m-a",
+        turnId: "t-a",
+        text: "Topic A",
+        seq: 1,
+        ts: 1000,
+      }),
+      makeHumanPrompt({
+        id: "u-b",
+        messageId: "m-b",
+        turnId: "t-b",
+        text: "Topic B",
+        seq: 2,
+        ts: 2000,
+      }),
+    ];
+    const activeResult = projectTopicUnits({ items: activeTurnOnB, isTurnActive: true });
+    expect(activeResult.topics[0]!.lifecycleStatus).toBeNull();
+    expect(activeResult.topics[1]!.lifecycleStatus).toBe("dispatching");
+
+    // Once Topic B already emitted a main_conclusion, a new active turn without items must not flip B back to dispatching.
+    const settledB: StreamItem[] = [
+      ...activeTurnOnB,
+      {
+        kind: "assistant_message",
+        id: "ans-b",
+        turnId: "t-b",
+        text: "Done with B.",
+        timestamp: new Date(2500),
+        timelineCursor: { epoch: "ep-1", seq: 3 },
+      },
+    ];
+    const settledResult = projectTopicUnits({ items: settledB, isTurnActive: true });
+    expect(settledResult.topics[1]!.lifecycleStatus).toBe("replied");
+  });
+
+  it("merges attributed bottom-bar messages (attach & merge) into target Topic A with lightweight redirect placeholders and preserves images", () => {
+    const anchors: TopicAnchorSummary[] = [
+      {
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        rootMessageId: "m-a",
+        rootPromptText: "Audit WebSocket reconnect",
+        title: "WebSocket reconnect audit",
+        attributedMessages: [
+          {
+            sourceMessageId: "m-followup-main",
+            mode: "attach",
+            attributedAt: "2026-06-01T00:00:05.000Z",
+          },
+          {
+            sourceMessageId: "m-merged-main",
+            mode: "merge",
+            attributedAt: "2026-06-01T00:00:07.000Z",
+          },
+        ],
+        createdAt: "2026-06-01T00:00:01.000Z",
+        updatedAt: "2026-06-01T00:00:07.000Z",
+      },
+      {
+        // Stale standalone msg: anchor for an attributed message should not create a duplicate full card.
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "msg:m-followup-main",
+        rootMessageId: "m-followup-main",
+        rootPromptText: "Also check heartbeat timeout",
+        createdAt: "2026-06-01T00:00:05.000Z",
+        updatedAt: "2026-06-01T00:00:05.000Z",
+      },
+    ];
+
+    const imageAttachment = {
+      id: "img-1",
+      mimeType: "image/png",
+      storageType: "desktop-file" as const,
+      storageKey: "/tmp/trace.png",
+      fileName: "trace.png",
+      byteSize: 1024,
+      createdAt: 5_000,
+    };
+
+    const items: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-a",
+        messageId: "m-a",
+        turnId: "t-1",
+        text: "Audit WebSocket reconnect",
+        seq: 1,
+        ts: 1_000,
+      }),
+      makeHumanPrompt({
+        id: "u-b",
+        messageId: "m-b",
+        turnId: "t-2",
+        text: "Unrelated theme tweak",
+        seq: 2,
+        ts: 2_000,
+      }),
+      {
+        kind: "user_message",
+        id: "u-follow",
+        messageId: "m-followup-main",
+        turnId: "t-3",
+        text: "Also check heartbeat timeout",
+        images: [imageAttachment],
+        timestamp: new Date(5_000),
+        timelineCursor: { epoch: "ep-1", seq: 3 },
+      },
+      {
+        kind: "assistant_message",
+        id: "ans-a-follow",
+        messageId: "ans-a-follow",
+        turnId: "t-3",
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        rootMessageId: "m-a",
+        text: "Heartbeat timeout checked and updated.",
+        timestamp: new Date(6_000),
+        timelineCursor: { epoch: "ep-1", seq: 4 },
+      },
+      {
+        kind: "user_message",
+        id: "u-merge",
+        messageId: "m-merged-main",
+        turnId: "t-4",
+        text: "And add unit test for backoff cap",
+        timestamp: new Date(7_000),
+        timelineCursor: { epoch: "ep-1", seq: 5 },
+      },
+      {
+        kind: "assistant_message",
+        id: "ans-a-merge",
+        messageId: "ans-a-merge",
+        turnId: "t-4",
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        rootMessageId: "m-a",
+        text: "Added backoff cap test.",
+        timestamp: new Date(8_000),
+        timelineCursor: { epoch: "ep-1", seq: 6 },
+      },
+    ];
+
+    const result = projectTopicUnits({ items, topicAnchors: anchors });
+    expect(result.topics.map((topic) => topic.topicKey)).toEqual([
+      "task:T-A",
+      "msg:m-b",
+      "msg:m-followup-main",
+      "msg:m-merged-main",
+    ]);
+
+    const topicA = result.topics[0]!;
+    expect(topicA.redirectedTo).toBeUndefined();
+    expect(topicA.replies.map((reply) => reply.kind)).toEqual([
+      "attributed_user_message",
+      "main_conclusion",
+      "attributed_user_message",
+      "main_conclusion",
+    ]);
+    const attachedReply = topicA.replies[0];
+    expect(attachedReply).toMatchObject({
+      kind: "attributed_user_message",
+      sourceMessageId: "m-followup-main",
+      mode: "attach",
+      text: "Also check heartbeat timeout",
+      images: [imageAttachment],
+      isUnread: false,
+    });
+    expect(topicA.replies[2]).toMatchObject({
+      kind: "attributed_user_message",
+      sourceMessageId: "m-merged-main",
+      mode: "merge",
+      text: "And add unit test for backoff cap",
+      isUnread: false,
+    });
+
+    const attachRedirect = result.topics[2]!;
+    expect(attachRedirect.redirectedTo).toEqual({
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      rootMessageId: "m-a",
+      title: "Audit WebSocket reconnect",
+      mode: "attach",
+    });
+    expect(attachRedirect.hasUnread).toBe(false);
+    expect(attachRedirect.lifecycleStatus).toBeNull();
+    expect(attachRedirect.replies).toEqual([]);
+
+    const mergeRedirect = result.topics[3]!;
+    expect(mergeRedirect.redirectedTo).toEqual({
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      rootMessageId: "m-a",
+      title: "Audit WebSocket reconnect",
+      mode: "merge",
+    });
+    expect(mergeRedirect.hasUnread).toBe(false);
+  });
+});

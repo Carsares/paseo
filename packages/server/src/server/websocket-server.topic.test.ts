@@ -22,7 +22,7 @@ import type { AgentPromptInput } from "./agent/agent-sdk-types.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import { QueuedPromptLoadError } from "./agent/agent-prompt.js";
-import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
+import { TASK_ID_LABEL, TOPIC_ROOT_MESSAGE_ID_LABEL } from "./agent/hierarchy-policy.js";
 import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { openDurableItemStore } from "./durable-items/requests.js";
 import { resetInMemoryPeerDispatchStateForTest } from "./agent/agent-messages/envelope.js";
@@ -1803,8 +1803,19 @@ async function prepareCompletedReport(
     ),
   );
   const summary = "Sole lead finished the requested work.";
-  const report = (status: "completed" | "blocked" = "completed", text = summary) =>
-    tools.callTool({ name: "report_to_parent", arguments: { status, summary: text } });
+  const report = (
+    status: "completed" | "blocked" = "completed",
+    text = summary,
+    escalateToParent?: boolean,
+  ) =>
+    tools.callTool({
+      name: "report_to_parent",
+      arguments: {
+        status,
+        summary: text,
+        ...(escalateToParent !== undefined ? { escalateToParent } : {}),
+      },
+    });
   const manager = daemon.daemon.agentManager;
   return {
     daemon,
@@ -2064,7 +2075,7 @@ test(
       },
     );
     const question = "Which rollout should we use?";
-    expect((await report("blocked", question)).isError).not.toBe(true);
+    expect((await report("blocked", question, true)).isError).not.toBe(true);
     const generation = await applied.promise;
     const cleared = await ledger.syncFromTurnOutcome(workspaceId, taskId, {
       status: "in_progress",
@@ -2255,6 +2266,512 @@ test.for(["card", "butler"] as const)(
     expect(list.payload.items).toContainEqual(item);
     expect(legacyMessages).not.toContain("workspace.durable_item.updated");
     await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgentId)).toBe(false));
+  },
+  TEST_TIMEOUT,
+);
+
+test(
+  "bypasses Main Control wakeup for lightweight msg:<root>, archived collaborator, verifying task, and routine blocked reports",
+  async (context) => {
+    const push = vi.fn(async () => {});
+    const daemon = await startDaemon(context, {
+      mcpEnabled: true,
+      agentClients: createTestAgentClients(),
+      pushNotificationSender: { send: push },
+    });
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+      [CLIENT_CAPS.workspaceTopicThreads]: true,
+    });
+    const config = { provider: "codex" as const, cwd: daemon.staticDir };
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Four bypass cases",
+        topic: { summary: "Four bypass cases" },
+        mainAgent: { config },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const manager = daemon.daemon.agentManager;
+    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+    const threadStore = new TopicThreadStore(daemon.paseoHome);
+
+    async function connectChildTools(childId: string) {
+      const client = new Client({ name: `child-${childId}`, version: "1" });
+      context.onTestFinished(() => client.close());
+      await client.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${childId}`),
+        ),
+      );
+      return client;
+    }
+
+    // Case 1: Lightweight untasked msg:<root> completion ensures anchor and lands silently.
+    const lightRootId = "root-light-1";
+    const lightChild = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TOPIC_ROOT_MESSAGE_ID_LABEL]: lightRootId,
+      },
+    });
+    const lightTools = await connectChildTools(lightChild.id);
+    const lightAnchorUpdated = waitForSession(socket, "light anchor", (message) =>
+      message.type === "workspace.topic.anchor.updated" &&
+      message.payload.anchor.topicKey === `msg:${lightRootId}`
+        ? message.payload.anchor
+        : undefined,
+    );
+    const lightThreadUpdated = waitForSession(socket, "light thread", (message) =>
+      message.type === "workspace.topic.thread.updated" &&
+      message.payload.entry.topicKey === `msg:${lightRootId}`
+        ? message.payload.entry
+        : undefined,
+    );
+    const lightResult = await lightTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary: "Lightweight research complete." },
+    });
+    expect(lightResult.isError, JSON.stringify(lightResult)).not.toBe(true);
+    const [lightAnchor, lightEntry] = await Promise.all([lightAnchorUpdated, lightThreadUpdated]);
+    expect(lightAnchor.rootMessageId).toBe(lightRootId);
+    expect(lightEntry).toMatchObject({
+      topicKey: `msg:${lightRootId}`,
+      rootMessageId: lightRootId,
+      origin: "subagent_report",
+      reportStatus: "completed",
+      text: "Lightweight research complete.",
+    });
+    expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+
+    // Case 2: Archived old collaborator does not block sole active lead completion.
+    const archivedTaskId = "archived-collab-task";
+    const oldCollab = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [TASK_ID_LABEL]: archivedTaskId,
+      },
+    });
+    const oldCollabStored = await daemon.daemon.agentStorage.get(oldCollab.id);
+    if (!oldCollabStored) throw new Error("Expected stored collaborator record");
+    await daemon.daemon.agentStorage.upsert({
+      ...oldCollabStored,
+      archivedAt: new Date().toISOString(),
+    });
+    const activeLead = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TASK_ID_LABEL]: archivedTaskId,
+      },
+    });
+    await ledger.upsert(workspaceId, {
+      taskId: archivedTaskId,
+      title: "Archived collaborator task",
+      status: "in_progress",
+      leadAgentId: activeLead.id,
+      participants: [
+        { agentId: oldCollab.id, boundBy: mainAgentId },
+        { agentId: activeLead.id, boundBy: mainAgentId },
+      ],
+    });
+    const activeLeadTools = await connectChildTools(activeLead.id);
+    const archivedThreadUpdated = waitForSession(socket, "archived collab thread", (message) =>
+      message.type === "workspace.topic.thread.updated" &&
+      message.payload.entry.taskId === archivedTaskId
+        ? message.payload.entry
+        : undefined,
+    );
+    const archivedResult = await activeLeadTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary: "Sole active lead finished." },
+    });
+    expect(archivedResult.isError, JSON.stringify(archivedResult)).not.toBe(true);
+    expect(await archivedThreadUpdated).toMatchObject({
+      taskId: archivedTaskId,
+      reportStatus: "completed",
+      text: "Sole active lead finished.",
+    });
+    expect(await ledger.list(workspaceId)).toContainEqual(
+      expect.objectContaining({ taskId: archivedTaskId, status: "completed" }),
+    );
+    expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+
+    // Case 3: Verifying task single-lead completion bypasses Main Control wakeup.
+    const verifyingTaskId = "verifying-task";
+    const verifyingLead = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TASK_ID_LABEL]: verifyingTaskId,
+      },
+    });
+    await ledger.upsert(workspaceId, {
+      taskId: verifyingTaskId,
+      title: "Verifying task",
+      status: "verifying",
+      leadAgentId: verifyingLead.id,
+      participants: [{ agentId: verifyingLead.id, boundBy: mainAgentId }],
+    });
+    const verifyingTools = await connectChildTools(verifyingLead.id);
+    const verifyingThreadUpdated = waitForSession(socket, "verifying thread", (message) =>
+      message.type === "workspace.topic.thread.updated" &&
+      message.payload.entry.taskId === verifyingTaskId
+        ? message.payload.entry
+        : undefined,
+    );
+    const verifyingResult = await verifyingTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary: "Verification passed." },
+    });
+    expect(verifyingResult.isError, JSON.stringify(verifyingResult)).not.toBe(true);
+    expect(await verifyingThreadUpdated).toMatchObject({
+      taskId: verifyingTaskId,
+      reportStatus: "completed",
+    });
+    expect(await ledger.list(workspaceId)).toContainEqual(
+      expect.objectContaining({ taskId: verifyingTaskId, status: "completed" }),
+    );
+    expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+
+    // Case 4: Routine single-lead blocked question lands on topic card without waking Main Control,
+    // while keeping notifyPersistedBlockedSubagentReport and blockingQuestionGeneration.
+    const blockedTaskId = "routine-blocked-task";
+    const blockedLead = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TASK_ID_LABEL]: blockedTaskId,
+      },
+    });
+    await ledger.upsert(workspaceId, {
+      taskId: blockedTaskId,
+      title: "Routine blocked task",
+      status: "in_progress",
+      leadAgentId: blockedLead.id,
+      participants: [{ agentId: blockedLead.id, boundBy: mainAgentId }],
+    });
+    const blockedNotifySpy = vi.spyOn(manager, "notifyPersistedBlockedSubagentReport");
+    context.onTestFinished(() => blockedNotifySpy.mockRestore());
+    const blockedTools = await connectChildTools(blockedLead.id);
+    const blockedThreadUpdated = waitForSession(socket, "blocked thread", (message) =>
+      message.type === "workspace.topic.thread.updated" &&
+      message.payload.entry.taskId === blockedTaskId
+        ? message.payload.entry
+        : undefined,
+    );
+    const blockedResult = await blockedTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "blocked", summary: "Should we keep backward compat flag?" },
+    });
+    expect(blockedResult.isError, JSON.stringify(blockedResult)).not.toBe(true);
+    expect(await blockedThreadUpdated).toMatchObject({
+      taskId: blockedTaskId,
+      origin: "subagent_report",
+      reportStatus: "blocked",
+      text: "Should we keep backward compat flag?",
+    });
+    const blockedTask = (await ledger.list(workspaceId)).find((t) => t.taskId === blockedTaskId);
+    expect(blockedTask).toMatchObject({
+      status: "awaiting_decision",
+      blockingQuestion: "Should we keep backward compat flag?",
+      blockingQuestionGeneration: expect.any(String),
+    });
+    expect(blockedNotifySpy).toHaveBeenCalledTimes(1);
+    expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+    const mainStored = await daemon.daemon.agentStorage.get(mainAgentId);
+    expect(mainStored && (await manager.readStoredTimeline(mainStored, { limit: 0 })).rows).toEqual(
+      [],
+    );
+    expect(await threadStore.list({ workspaceId, mainAgentId }, `task:${blockedTaskId}`)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reportStatus: "blocked", origin: "subagent_report" }),
+      ]),
+    );
+
+    // Escalated blocked report (escalateToParent: true) DOES wake Main Control.
+    await openInteractiveAgent(socket, mainAgentId);
+    const escalatedResult = await blockedTools.callTool({
+      name: "report_to_parent",
+      arguments: {
+        status: "blocked",
+        summary: "Need cross-track reprioritization.",
+        escalateToParent: true,
+      },
+    });
+    expect(escalatedResult.isError, JSON.stringify(escalatedResult)).not.toBe(true);
+    await vi.waitFor(
+      () =>
+        expect(manager.getTimeline(mainAgentId)).toContainEqual(
+          expect.objectContaining({
+            type: "tool_call",
+            agentMessage: expect.objectContaining({
+              reportStatus: "blocked",
+              escalateToParent: true,
+              text: expect.stringContaining("Need cross-track reprioritization."),
+            }),
+          }),
+        ),
+      { timeout: 8_000 },
+    );
+  },
+  TEST_TIMEOUT,
+);
+
+test(
+  "stamps authoritative turn topic attribution on live stream and timeline fetch and updates mid-turn via assign_topic_attribution",
+  async (context) => {
+    const turnReady = Promise.withResolvers<void>();
+    const releaseReply = Promise.withResolvers<void>();
+    let turnNumber = 0;
+    const baseClients = createTestAgentClients();
+    const baseCodex = baseClients.codex;
+    if (!baseCodex) throw new Error("Expected fake codex client");
+    const wrapSession = (
+      session: Awaited<ReturnType<typeof baseCodex.createSession>>,
+    ): typeof session => {
+      const listeners = new Set<
+        (event: import("./agent/agent-sdk-types.js").AgentStreamEvent) => void
+      >();
+      const baseSubscribe = session.subscribe.bind(session);
+      return Object.assign(Object.create(Object.getPrototypeOf(session)), session, {
+        subscribe(
+          listener: (event: import("./agent/agent-sdk-types.js").AgentStreamEvent) => void,
+        ) {
+          listeners.add(listener);
+          const unsub = baseSubscribe(listener);
+          return () => {
+            listeners.delete(listener);
+            unsub();
+          };
+        },
+        async startTurn(
+          prompt: AgentPromptInput,
+          options?: import("./agent/agent-sdk-types.js").AgentRunOptions,
+        ) {
+          turnNumber += 1;
+          const currentTurn = turnNumber;
+          const turnId = `custom-turn-${currentTurn}`;
+          const emit = (event: import("./agent/agent-sdk-types.js").AgentStreamEvent) => {
+            for (const listener of listeners) listener(event);
+          };
+          void (async () => {
+            emit({ type: "turn_started", provider: "codex", turnId });
+            if (currentTurn === 1) {
+              emit({
+                type: "timeline",
+                provider: "codex",
+                turnId,
+                item: { type: "assistant_message", text: "Topic A opened." },
+              });
+              emit({ type: "turn_completed", provider: "codex", turnId });
+              return;
+            }
+            turnReady.resolve();
+            await releaseReply.promise;
+            emit({
+              type: "timeline",
+              provider: "codex",
+              turnId,
+              item: { type: "assistant_message", text: "Reply routed to topic A." },
+            });
+            emit({ type: "turn_completed", provider: "codex", turnId });
+          })();
+          void prompt;
+          void options;
+          return { turnId };
+        },
+      });
+    };
+    const customCodex: typeof baseCodex = Object.assign(
+      Object.create(Object.getPrototypeOf(baseCodex)),
+      baseCodex,
+      {
+        createSession: async (...args: Parameters<typeof baseCodex.createSession>) =>
+          wrapSession(await baseCodex.createSession(...args)),
+        resumeSession: async (...args: Parameters<typeof baseCodex.resumeSession>) =>
+          wrapSession(await baseCodex.resumeSession(...args)),
+      },
+    );
+    const daemon = await startDaemon(context, {
+      mcpEnabled: true,
+      agentClients: { ...baseClients, codex: customCodex },
+    });
+    context.onTestFinished(() => releaseReply.resolve());
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+      [CLIENT_CAPS.workspaceTopicThreads]: true,
+    });
+    const config = { provider: "codex" as const, cwd: daemon.staticDir };
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Attribution workspace",
+        topic: { summary: "Attribution workspace" },
+        mainAgent: { config },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const manager = daemon.daemon.agentManager;
+    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+    await openInteractiveAgent(socket, mainAgentId);
+
+    const streamEvents: Array<Response<"agent_stream">["payload"]["event"]> = [];
+    const onMessage = (raw: RawData) => {
+      const parsed = WSOutboundMessageSchema.safeParse(JSON.parse(raw.toString()));
+      if (!parsed.success || parsed.data.type !== "session") return;
+      const msg = parsed.data.message;
+      if (msg.type === "agent_stream" && msg.payload.agentId === mainAgentId) {
+        streamEvents.push(msg.payload.event);
+      }
+    };
+    socket.on("message", onMessage);
+    context.onTestFinished(() => socket.off("message", onMessage));
+
+    const firstMsgId = "msg-topic-a";
+    const firstResp = await request(
+      socket,
+      {
+        type: "send_agent_message_request",
+        agentId: mainAgentId,
+        messageId: firstMsgId,
+        text: "Start topic A",
+      },
+      "send_agent_message_response",
+    );
+    expect(firstResp.payload.accepted).toBe(true);
+    await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgentId)).toBe(false));
+    await ledger.upsert(workspaceId, {
+      taskId: "task-a",
+      title: "Topic A",
+      status: "in_progress",
+      rootMessageId: firstMsgId,
+    });
+    await new TopicThreadStore(daemon.paseoHome).upsertAnchor({
+      workspaceId,
+      mainAgentId,
+      topicKey: "task:task-a",
+      taskId: "task-a",
+      rootMessageId: firstMsgId,
+      rootPromptText: "Start topic A",
+      title: "Topic A",
+    });
+
+    // Send an unscoped second user message; during its turn, Main Control attributes it to task:task-a.
+    const secondMsgId = "msg-followup-a";
+    const secondResp = await request(
+      socket,
+      {
+        type: "send_agent_message_request",
+        agentId: mainAgentId,
+        messageId: secondMsgId,
+        text: "Continue topic A with one more detail",
+      },
+      "send_agent_message_response",
+    );
+    expect(secondResp.payload.accepted).toBe(true);
+    await turnReady.promise;
+
+    const mainTools = new Client({ name: "main", version: "1" });
+    context.onTestFinished(() => mainTools.close());
+    await mainTools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${mainAgentId}`),
+        {
+          requestInit: {
+            headers: { Authorization: `Bearer ${manager.getMcpAuthToken(mainAgentId)}` },
+          },
+        },
+      ),
+    );
+    const anchorUpdated = waitForSession(socket, "attributed anchor", (message) =>
+      message.type === "workspace.topic.anchor.updated" &&
+      message.payload.anchor.topicKey === "task:task-a" &&
+      message.payload.anchor.attributedMessages?.some(
+        (entry) => entry.sourceMessageId === secondMsgId,
+      )
+        ? message.payload.anchor
+        : undefined,
+    );
+    const assignResult = await mainTools.callTool({
+      name: "assign_topic_attribution",
+      arguments: {
+        sourceMessageIds: [secondMsgId],
+        targetTopicKey: "task:task-a",
+      },
+    });
+    expect(assignResult.isError, JSON.stringify(assignResult)).not.toBe(true);
+    expect(assignResult.structuredContent).toEqual({
+      topicKey: "task:task-a",
+      taskId: "task-a",
+      rootMessageId: firstMsgId,
+      attributedMessageIds: [secondMsgId],
+      mode: "attach",
+    });
+    const updatedAnchor = await anchorUpdated;
+    expect(updatedAnchor.attributedMessages).toEqual([
+      { sourceMessageId: secondMsgId, mode: "attach", attributedAt: expect.any(String) },
+    ]);
+
+    releaseReply.resolve();
+    await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgentId)).toBe(false));
+
+    // Verify live agent_stream carried authoritative topic stamps.
+    expect(streamEvents).toContainEqual(
+      expect.objectContaining({
+        type: "turn_started",
+        topicKey: `msg:${firstMsgId}`,
+        rootMessageId: firstMsgId,
+      }),
+    );
+    expect(streamEvents).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        topicKey: "task:task-a",
+        taskId: "task-a",
+        rootMessageId: firstMsgId,
+        item: expect.objectContaining({
+          type: "assistant_message",
+          text: "Reply routed to topic A.",
+        }),
+      }),
+    );
+
+    // Verify fetch_agent_timeline_response carries the same authoritative topic stamps.
+    const timelineResp = await request(
+      socket,
+      { type: "fetch_agent_timeline_request", agentId: mainAgentId },
+      "fetch_agent_timeline_response",
+    );
+    expect(timelineResp.payload.entries).toContainEqual(
+      expect.objectContaining({
+        topicKey: `msg:${firstMsgId}`,
+        rootMessageId: firstMsgId,
+        item: expect.objectContaining({ type: "assistant_message", text: "Topic A opened." }),
+      }),
+    );
+    expect(timelineResp.payload.entries).toContainEqual(
+      expect.objectContaining({
+        topicKey: "task:task-a",
+        taskId: "task-a",
+        rootMessageId: firstMsgId,
+        item: expect.objectContaining({
+          type: "assistant_message",
+          text: "Reply routed to topic A.",
+        }),
+      }),
+    );
   },
   TEST_TIMEOUT,
 );

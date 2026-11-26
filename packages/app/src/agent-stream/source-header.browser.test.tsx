@@ -262,3 +262,34 @@ it("hides quote reply for a report with nothing but the template", () => {
   expect(view().queryByTestId("agent-source-quote")).toBeNull();
   expect(view().queryByTestId("agent-source-preview")).toBeNull();
 });
+
+it("forwards source topic metadata when quoting a topic-linked subagent report", () => {
+  const group = sourceGroup([
+    source({
+      sender: { id: "child-1", title: "Reviewer" },
+      text: "Report to parent (completed):\n\nReviewed the change.",
+      status: "completed",
+      taskId: "T-42",
+      rootMessageId: "m-42",
+    }),
+  ]);
+  act(() =>
+    root.render(
+      <KeyboardActionDispatcherProvider>
+        <ComposerQuoteProvider target={quoteTarget}>
+          <AgentSourceHeader group={group} fallbackServerId="server-1" />
+        </ComposerQuoteProvider>
+      </KeyboardActionDispatcherProvider>,
+    ),
+  );
+  act(() => view().getByTestId("agent-source-quote").click());
+  expect(addQuoteAttachment).toHaveBeenCalledExactlyOnceWith(
+    "[Reviewer] Reviewed the change.",
+    "Reviewer",
+    {
+      topicKey: "task:T-42",
+      taskId: "T-42",
+      rootMessageId: "m-42",
+    },
+  );
+});

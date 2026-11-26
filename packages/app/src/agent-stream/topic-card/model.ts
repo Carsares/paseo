@@ -3,6 +3,8 @@ import type {
   PendingSubagentInboxItem,
   TopicAnchorSummary,
   TopicDelegationSummary,
+  TopicMessageAttribution,
+  TopicMessageAttributionMode,
   TopicThreadEntry,
   WorkspaceDurableItem,
   WorkspaceTaskFileConflict,
@@ -113,6 +115,21 @@ export type TopicReplyItem =
       seq: null;
       timestampMs: number;
       isUnread: boolean;
+    }
+  | {
+      kind: "attributed_user_message";
+      id: string;
+      sourceMessageId: string;
+      mode: TopicMessageAttributionMode;
+      attributedFromTopicKey?: string;
+      text: string;
+      images?: readonly UserMessageImageAttachment[];
+      epoch: string | null;
+      /** Main timeline sequence number (null when unavailable). */
+      seq: number | null;
+      timestampMs: number;
+      isUnread: boolean;
+      item: UserMessageItem;
     };
 
 type TopicMainReply = (
@@ -176,6 +193,14 @@ export function canDecideDurableItemInTopic(
   return hasExactDurableItemTaskBinding(item, topicTaskId);
 }
 
+export interface TopicRedirectTarget {
+  topicKey: string;
+  taskId?: string;
+  rootMessageId?: string;
+  title: string;
+  mode: TopicMessageAttributionMode;
+}
+
 export interface TopicUnit {
   topicKey: string;
   taskId?: string;
@@ -213,6 +238,8 @@ export interface TopicUnit {
   latestEpoch: string | null;
   lifecycleStatus: TopicLifecycleStatus | null;
   retryCandidate: TopicRetryCandidate | null;
+  /** Set on lightweight redirect placeholders when a main-bar prompt was attributed to another topic. */
+  redirectedTo?: TopicRedirectTarget;
 }
 
 export interface TopicWatermarkSnapshot {
@@ -269,6 +296,13 @@ interface MutableTopicUnit {
   linkedPermissions: PendingPermission[];
   /** Timestamp of the latest canceled main-timeline item belonging to this topic (for taskless turns). */
   latestCanceledTurnTimestampMs: number | null;
+  redirectedTargetUnit?: MutableTopicUnit;
+  redirectedMode?: TopicMessageAttributionMode;
+}
+
+interface AnchorAttributionRecord {
+  anchor: TopicAnchorSummary;
+  attribution: TopicMessageAttribution;
 }
 
 interface TopicBuilderState {
@@ -276,6 +310,9 @@ interface TopicBuilderState {
   byTaskId: Map<string, MutableTopicUnit>;
   unitsByRootMessageId: Map<string, MutableTopicUnit[]>;
   byTopicKey: Map<string, MutableTopicUnit>;
+  attributedBySourceMessageId: Map<string, AnchorAttributionRecord>;
+  attributedFromTopicKeys: Set<string>;
+  redirectedToUnit: Map<string, MutableTopicUnit>;
   taskById: Map<string, WorkspaceTaskSummary>;
   tasksByRootMessageId: Map<string, WorkspaceTaskSummary[]>;
   userFollowupBySourceMessageId: Map<string, TopicThreadEntry>;
@@ -292,6 +329,7 @@ interface TopicBuilderState {
   unmatchedExplicitRefs: TopicUnmatchedRef[];
   activeTopic: MutableTopicUnit | undefined;
   activeMainFollowup: TopicThreadEntry | undefined;
+  lastTurn: TopicTurn | undefined;
   fallbackSenderTitle: string;
   agentTitleById?: ReadonlyMap<string, string>;
   localServerId?: string;
@@ -593,8 +631,19 @@ function registerTopic(state: TopicBuilderState, unit: MutableTopicUnit): void {
   addUnitToRootIndex(state, unit.rootItemId, unit);
 }
 
+function readItemTopicStamp(
+  item: StreamItem,
+): { topicKey?: string; taskId?: string; rootMessageId?: string } | undefined {
+  if (!item.topicKey && !item.taskId && !item.rootMessageId) return undefined;
+  return {
+    ...(item.topicKey ? { topicKey: item.topicKey } : {}),
+    ...(item.taskId ? { taskId: item.taskId } : {}),
+    ...(item.rootMessageId ? { rootMessageId: item.rootMessageId } : {}),
+  };
+}
+
 function ensureFallbackTopic(state: TopicBuilderState, item: StreamItem): MutableTopicUnit {
-  const existing = state.topics.at(-1);
+  const existing = state.topics.findLast((unit) => !unit.redirectedTargetUnit);
   if (existing) return existing;
   const messageId = getStreamItemMessageId(item);
   const synthetic: MutableTopicUnit = {
@@ -679,19 +728,22 @@ function findMatchingTopic(
     return (
       state.byTaskId.get(explicitTaskId) ??
       state.byTopicKey.get(`task:${explicitTaskId}`) ??
-      findUnboundUnitByRoot(state, explicitRootId)
+      findUnboundUnitByRoot(state, explicitRootId) ??
+      (explicitRootId ? state.redirectedToUnit.get(explicitRootId) : undefined)
     );
   }
   if (hint.topicKey) {
-    const exact = state.byTopicKey.get(hint.topicKey);
+    const exact = state.byTopicKey.get(hint.topicKey) ?? state.redirectedToUnit.get(hint.topicKey);
     if (exact) return exact;
   }
-  const byRoot = findUnitByRootFallback(state, explicitRootId);
+  const byRoot =
+    findUnitByRootFallback(state, explicitRootId) ??
+    (explicitRootId ? state.redirectedToUnit.get(explicitRootId) : undefined);
   if (byRoot) return byRoot;
   if (hasExplicitRef) {
     return undefined;
   }
-  return state.activeTopic ?? state.topics.at(-1);
+  return state.activeTopic ?? state.topics.findLast((unit) => !unit.redirectedTargetUnit);
 }
 
 function entryBelongsToUnit(entry: TopicThreadEntry, unit: MutableTopicUnit): boolean {
@@ -743,6 +795,13 @@ function findTasksForHumanPrompt(
       if (seen.has(task.taskId)) continue;
       seen.add(task.taskId);
       found.push(task);
+    }
+  }
+  if (item.taskId && !seen.has(item.taskId)) {
+    const stampedTask = state.taskById.get(item.taskId);
+    if (stampedTask && (!stampedTask.rootMessageId || keys.includes(stampedTask.rootMessageId))) {
+      seen.add(stampedTask.taskId);
+      found.push(stampedTask);
     }
   }
   return found;
@@ -839,7 +898,60 @@ function findMirroredReply(
   return undefined;
 }
 
-function ingestMirroredPrompt(state: TopicBuilderState, item: UserMessageItem): boolean {
+function registerRedirectAliases(
+  state: TopicBuilderState,
+  target: MutableTopicUnit,
+  keys: readonly (string | undefined)[],
+): void {
+  for (const key of keys) {
+    if (!key) continue;
+    state.redirectedToUnit.set(key, target);
+    if (!key.startsWith("msg:") && !key.startsWith("task:")) {
+      state.redirectedToUnit.set(`msg:${key}`, target);
+    }
+  }
+}
+
+function appendRedirectPlaceholder(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  target: MutableTopicUnit,
+  mode: TopicMessageAttributionMode,
+): void {
+  const sourceMessageId = item.messageId ?? item.clientMessageId ?? item.id;
+  const cursor = item.timelineCursor;
+  const placeholder: MutableTopicUnit = {
+    topicKey: `msg:${sourceMessageId}`,
+    rootItemId: item.id,
+    rootMessageId: sourceMessageId,
+    rootPrompt: {
+      id: item.id,
+      messageId: item.messageId,
+      text: item.text,
+      timestampMs: item.timestamp.getTime(),
+      seq: cursor?.seq ?? null,
+      epoch: cursor?.epoch ?? null,
+      item,
+    },
+    task: null,
+    processSteps: [],
+    replies: [],
+    pendingInboxItems: [],
+    linkedTodos: [],
+    linkedDurableItems: [],
+    linkedPermissions: [],
+    latestCanceledTurnTimestampMs: null,
+    redirectedTargetUnit: target,
+    redirectedMode: mode,
+  };
+  state.topics.push(placeholder);
+}
+
+function ingestMirroredPrompt(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  turn: TopicTurn,
+): boolean {
   // Keep the provider's turn on the original card instead of creating a second topic.
   const followup = findMirroredUserFollowup(state, item);
   state.activeMainFollowup = undefined;
@@ -847,9 +959,23 @@ function ingestMirroredPrompt(state: TopicBuilderState, item: UserMessageItem): 
   if (followup.routedAgentId === followup.mainAgentId) state.activeMainFollowup = followup;
   if (item.images?.length) state.followupImages.set(followup.entryId, item.images);
   const topic = findMatchingTopic(state, followup);
-  if (topic) markTopicCanceledIfStamped(topic, item);
-  else recordUnmatchedRef(state, followup);
+  if (topic) {
+    markTopicCanceledIfStamped(topic, item);
+    if (followup.attributedFromTopicKey) {
+      registerRedirectAliases(state, topic, [
+        followup.attributedFromTopicKey,
+        followup.sourceMessageId,
+        item.messageId,
+        item.clientMessageId,
+        item.id,
+      ]);
+      appendRedirectPlaceholder(state, item, topic, "attach");
+    }
+  } else {
+    recordUnmatchedRef(state, followup);
+  }
   state.activeTopic = topic;
+  turn.humanTriggerTopic = topic;
   return true;
 }
 
@@ -973,6 +1099,42 @@ function backfillBoundUnitsPrompt(
   return true;
 }
 
+function indexAnchorAttributions(
+  anchors: readonly TopicAnchorSummary[],
+): Map<string, AnchorAttributionRecord> {
+  const attributed = new Map<string, AnchorAttributionRecord>();
+  const ordered = [...anchors].sort((left, right) => {
+    const diff = parseIsoMs(left.updatedAt) - parseIsoMs(right.updatedAt);
+    return diff !== 0 ? diff : left.topicKey.localeCompare(right.topicKey);
+  });
+  for (const anchor of ordered) {
+    for (const attribution of anchor.attributedMessages ?? []) {
+      const sourceId = attribution.sourceMessageId.trim();
+      if (!sourceId) continue;
+      if (anchor.rootMessageId === sourceId || anchor.topicKey === `msg:${sourceId}`) continue;
+      attributed.set(sourceId, { anchor, attribution });
+    }
+  }
+  return attributed;
+}
+
+function isAnchorClaimedByOtherTopic(
+  state: TopicBuilderState,
+  anchor: TopicAnchorSummary,
+): boolean {
+  if (anchor.rootMessageId) {
+    const claimed = state.attributedBySourceMessageId.get(anchor.rootMessageId);
+    if (claimed && claimed.anchor.topicKey !== anchor.topicKey) return true;
+  }
+  if (anchor.topicKey.startsWith("msg:")) {
+    const rawMsgId = anchor.topicKey.slice(4);
+    const claimed = state.attributedBySourceMessageId.get(rawMsgId);
+    if (claimed && claimed.anchor.topicKey !== anchor.topicKey) return true;
+    if (state.attributedFromTopicKeys.has(anchor.topicKey)) return true;
+  }
+  return false;
+}
+
 function seedTopicsFromAnchors(
   state: TopicBuilderState,
   anchors: readonly TopicAnchorSummary[],
@@ -985,6 +1147,9 @@ function seedTopicsFromAnchors(
   for (const anchor of ordered) {
     const anchorTaskId = extractHintTaskId(anchor);
     if (!anchorTaskId) {
+      if (isAnchorClaimedByOtherTopic(state, anchor)) {
+        continue;
+      }
       if (
         anchor.rootMessageId &&
         backfillBoundUnitsPrompt(
@@ -1008,6 +1173,17 @@ function seedTopicsFromAnchors(
       continue;
     }
     registerTopic(state, createUnitFromAnchor(state, anchor));
+  }
+
+  for (const [sourceMessageId, { anchor }] of state.attributedBySourceMessageId) {
+    const target = findMatchingTopic(state, {
+      topicKey: anchor.topicKey,
+      taskId: anchor.taskId,
+      rootMessageId: anchor.rootMessageId,
+    });
+    if (target) {
+      registerRedirectAliases(state, target, [sourceMessageId]);
+    }
   }
 }
 
@@ -1128,8 +1304,92 @@ function hydrateRemainingAnchorUnitsForRoot(
   return lastUnit;
 }
 
-function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): void {
-  if (ingestMirroredPrompt(state, item)) return;
+function findAnchorAttributionForPrompt(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+): AnchorAttributionRecord | undefined {
+  for (const key of [item.messageId, item.clientMessageId, item.id]) {
+    if (!key) continue;
+    const record = state.attributedBySourceMessageId.get(key);
+    if (record) return record;
+  }
+  return undefined;
+}
+
+function ingestAttributedPrompt(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  turn: TopicTurn,
+): boolean {
+  const record = findAnchorAttributionForPrompt(state, item);
+  if (!record) return false;
+  const { anchor, attribution } = record;
+  let target = findMatchingTopic(state, {
+    topicKey: anchor.topicKey,
+    taskId: anchor.taskId,
+    rootMessageId: anchor.rootMessageId,
+  });
+  if (!target) {
+    target = createUnitFromAnchor(state, anchor);
+    registerTopic(state, target);
+  }
+  const sourceMessageId = item.messageId ?? item.clientMessageId ?? item.id;
+  if (
+    target.rootMessageId === sourceMessageId ||
+    target.rootItemId === item.id ||
+    target.topicKey === `msg:${sourceMessageId}`
+  ) {
+    return false;
+  }
+
+  const mode: TopicMessageAttributionMode = attribution.mode ?? "attach";
+  registerRedirectAliases(state, target, [
+    attribution.sourceMessageId,
+    item.messageId,
+    item.clientMessageId,
+    item.id,
+  ]);
+
+  const mirroredFollowup = findMirroredUserFollowup(state, item);
+  state.activeMainFollowup = undefined;
+  if (mirroredFollowup) {
+    if (mirroredFollowup.routedAgentId === mirroredFollowup.mainAgentId) {
+      state.activeMainFollowup = mirroredFollowup;
+    }
+    if (item.images?.length) {
+      state.followupImages.set(mirroredFollowup.entryId, item.images);
+    }
+  } else {
+    target.replies.push({
+      kind: "attributed_user_message",
+      id: `attributed:${item.id}`,
+      sourceMessageId,
+      mode,
+      attributedFromTopicKey: `msg:${sourceMessageId}`,
+      text: item.text,
+      ...(item.images && item.images.length > 0 ? { images: item.images } : {}),
+      epoch: item.timelineCursor?.epoch ?? null,
+      seq: item.timelineCursor?.seq ?? null,
+      timestampMs: item.timestamp.getTime(),
+      isUnread: false,
+      item,
+    });
+  }
+
+  markTopicCanceledIfStamped(target, item);
+  appendRedirectPlaceholder(state, item, target, mode);
+  state.activeTopic = target;
+  turn.humanTriggerTopic = target;
+  if (readItemTopicStamp(item)) {
+    turn.hasAuthoritativeStamp = true;
+    turn.stampedTopics.add(target);
+  }
+  return true;
+}
+
+function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem, turn: TopicTurn): void {
+  if (ingestAttributedPrompt(state, item, turn)) return;
+  if (ingestMirroredPrompt(state, item, turn)) return;
 
   const messageId = item.messageId ?? item.clientMessageId ?? item.id;
   const matchedTasks = findTasksForHumanPrompt(state, item);
@@ -1155,13 +1415,28 @@ function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): voi
       lastUnit = unit;
     }
     const extraHydrated = hydrateRemainingAnchorUnitsForRoot(state, item, messageId);
-    state.activeTopic = extraHydrated ?? lastUnit;
+    const active = extraHydrated ?? lastUnit;
+    state.activeTopic = active;
+    turn.humanTriggerTopic = active;
+    if (active) {
+      turn.initialPromptUnits.add(active);
+      if (readItemTopicStamp(item)) {
+        turn.hasAuthoritativeStamp = true;
+        turn.stampedTopics.add(active);
+      }
+    }
     return;
   }
 
   const hydratedAnchor = hydrateRemainingAnchorUnitsForRoot(state, item, messageId);
   if (hydratedAnchor) {
     state.activeTopic = hydratedAnchor;
+    turn.humanTriggerTopic = hydratedAnchor;
+    turn.initialPromptUnits.add(hydratedAnchor);
+    if (readItemTopicStamp(item)) {
+      turn.hasAuthoritativeStamp = true;
+      turn.stampedTopics.add(hydratedAnchor);
+    }
     return;
   }
 
@@ -1169,6 +1444,12 @@ function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): voi
   markTopicCanceledIfStamped(unit, item);
   registerTopic(state, unit);
   state.activeTopic = unit;
+  turn.humanTriggerTopic = unit;
+  turn.initialPromptUnits.add(unit);
+  if (readItemTopicStamp(item)) {
+    turn.hasAuthoritativeStamp = true;
+    turn.stampedTopics.add(unit);
+  }
 }
 
 function updateTopicReportSender(
@@ -1204,6 +1485,24 @@ function updateTopicReportSender(
   return senderTitle;
 }
 
+function buildReportTopicHint(
+  item: StreamItem,
+  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
+): { hint: TopicUnmatchedRef; hasExplicitRef: boolean } {
+  const itemStamp = readItemTopicStamp(item);
+  const topicKey = itemStamp?.topicKey;
+  const taskId = agentMessage.taskId ?? itemStamp?.taskId;
+  const rootMessageId = agentMessage.rootMessageId ?? itemStamp?.rootMessageId;
+  return {
+    hint: {
+      ...(topicKey ? { topicKey } : {}),
+      ...(taskId ? { taskId } : {}),
+      ...(rootMessageId ? { rootMessageId } : {}),
+    },
+    hasExplicitRef: Boolean(topicKey || taskId || rootMessageId),
+  };
+}
+
 function matchTopicReport(
   state: TopicBuilderState,
   item: StreamItem,
@@ -1226,13 +1525,13 @@ function matchTopicReport(
   const linkedDelegations = senderDelegations.filter(
     (delegation) => reportMessageId && delegation.explicitReportIds.has(reportMessageId),
   );
-  const hasExplicitRef = Boolean(agentMessage.taskId || agentMessage.rootMessageId);
+  const { hint: explicitHint, hasExplicitRef } = buildReportTopicHint(item, agentMessage);
   if (
     linkedDelegations.length > 0 &&
     !linkedDelegations.some(
       (delegation) =>
-        (!agentMessage.rootMessageId || agentMessage.rootMessageId === delegation.rootMessageId) &&
-        (!agentMessage.taskId || agentMessage.taskId === delegation.taskId),
+        (!explicitHint.rootMessageId || explicitHint.rootMessageId === delegation.rootMessageId) &&
+        (!explicitHint.taskId || explicitHint.taskId === delegation.taskId),
     )
   )
     return;
@@ -1242,9 +1541,9 @@ function matchTopicReport(
     return matched ? { matched, reportMessageId, scoped: true, exactDispatch: true } : undefined;
   }
   if (hasExplicitRef) {
-    const matched = findMatchingTopic(state, agentMessage);
+    const matched = findMatchingTopic(state, explicitHint);
     if (!matched) {
-      if (recordUnmatched) recordUnmatchedRef(state, agentMessage);
+      if (recordUnmatched) recordUnmatchedRef(state, explicitHint);
       return;
     }
     return { matched, reportMessageId, scoped: true, exactDispatch: false };
@@ -1306,7 +1605,11 @@ function acceptFormalReport(
   }
 }
 
-function ingestAgentMessageItem(state: TopicBuilderState, item: StreamItem): boolean {
+function ingestAgentMessageItem(
+  state: TopicBuilderState,
+  item: StreamItem,
+  turn: TopicTurn,
+): boolean {
   const agentMessage = getAgentMessage(item);
   if (!agentMessage) return false;
   if (findExactMirroredReply(state, item)) return true;
@@ -1315,6 +1618,10 @@ function ingestAgentMessageItem(state: TopicBuilderState, item: StreamItem): boo
   const { matched, reportMessageId, scoped } = match;
 
   const target = matched ?? ensureFallbackTopic(state, item);
+  if (readItemTopicStamp(item)) {
+    turn.hasAuthoritativeStamp = true;
+    turn.stampedTopics.add(target);
+  }
 
   const senderTitle = updateTopicReportSender(state, target, agentMessage);
   acceptFormalReport(state, target, agentMessage, reportMessageId, scoped);
@@ -1347,10 +1654,26 @@ function resolveSenderTitle(
   return state.agentTitleById?.get(senderId) ?? senderTitle?.trim() ?? state.fallbackSenderTitle;
 }
 
-function ingestLegacySubagentUserMessage(state: TopicBuilderState, item: UserMessageItem): void {
+function ingestLegacySubagentUserMessage(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  turn: TopicTurn,
+): void {
   const firstSource = getAgentSourcePresentation(item)?.group.sources[0];
   const sender = item.sender ?? firstSource?.sender;
-  const target = state.activeTopic ?? ensureFallbackTopic(state, item);
+  const authoritativeStamp = readItemTopicStamp(item);
+  let target: MutableTopicUnit | undefined;
+  if (authoritativeStamp) {
+    target = findMatchingTopic(state, authoritativeStamp);
+    if (!target) {
+      recordUnmatchedRef(state, authoritativeStamp);
+      return;
+    }
+    turn.hasAuthoritativeStamp = true;
+    turn.stampedTopics.add(target);
+  } else {
+    target = state.activeTopic ?? ensureFallbackTopic(state, item);
+  }
   const senderId = sender?.id ?? "subagent";
   const senderTitle = resolveSenderTitle(state, senderId, sender?.title);
   if (!target.leadAgentId && sender?.id) {
@@ -1375,8 +1698,15 @@ function ingestLegacySubagentUserMessage(state: TopicBuilderState, item: UserMes
 }
 
 interface TopicTurn {
+  turnId?: string;
   reportOnly: boolean;
   reportTopic?: MutableTopicUnit;
+  hasAuthoritativeStamp: boolean;
+  stampedTopics: Set<MutableTopicUnit>;
+  humanTriggerTopic?: MutableTopicUnit;
+  initialPromptUnits: Set<MutableTopicUnit>;
+  hasConclusion: boolean;
+  hasDelegation: boolean;
   unresolvedReports: Set<string>;
   dispatchAttempt: boolean;
   dispatched: boolean;
@@ -1400,14 +1730,24 @@ function startTopicTurn(
   first: number,
   end: number,
 ): TopicTurn {
+  let turnId: string | undefined;
   let startedByReport = false;
   let firstTrigger = true;
   let humanInput = false;
   let reportTopic: MutableTopicUnit | undefined;
   let ambiguous = false;
+  let hasAuthoritativeStamp = false;
+  const stampedTopics = new Set<MutableTopicUnit>();
 
   for (let index = first; index < end; index += 1) {
     const item = items[index]!;
+    if (!turnId && item.turnId) turnId = item.turnId;
+    const stamp = readItemTopicStamp(item);
+    if (stamp) {
+      hasAuthoritativeStamp = true;
+      const stamped = findMatchingTopic(state, stamp);
+      if (stamped) stampedTopics.add(stamped);
+    }
     const report = getAgentMessage(item);
     if (item.kind === "user_message" && isRealHumanPrompt(item)) humanInput = true;
     if (firstTrigger && isTurnTrigger(item)) {
@@ -1422,8 +1762,14 @@ function startTopicTurn(
 
   const reportOnly = startedByReport && !humanInput;
   return {
+    turnId,
     reportOnly,
     reportTopic: reportOnly && !ambiguous ? reportTopic : undefined,
+    hasAuthoritativeStamp,
+    stampedTopics,
+    initialPromptUnits: new Set(),
+    hasConclusion: false,
+    hasDelegation: false,
     unresolvedReports: new Set(),
     dispatchAttempt: false,
     dispatched: false,
@@ -1475,6 +1821,9 @@ function ingestMainReply(
     isUnread: false,
     item,
   };
+  if (reply.kind === "main_conclusion") {
+    turn.hasConclusion = true;
+  }
   const mirror = findMirroredReply(state, item, target);
   if (mirror) {
     if (entryBelongsToUnit(mirror, target)) {
@@ -1488,16 +1837,51 @@ function ingestMainReply(
   target.replies.push(reply);
 }
 
+function resolveSingleTurnStampedTopic(turn: TopicTurn): MutableTopicUnit | undefined {
+  if (turn.stampedTopics.size !== 1) return undefined;
+  return turn.stampedTopics.values().next().value;
+}
+
+function resolveStreamItemTarget(
+  state: TopicBuilderState,
+  item: StreamItem,
+  turn: TopicTurn,
+): MutableTopicUnit | undefined {
+  const authoritativeStamp = readItemTopicStamp(item);
+  if (authoritativeStamp) {
+    const target = findMatchingTopic(state, authoritativeStamp);
+    if (!target) {
+      recordUnmatchedRef(state, authoritativeStamp);
+      return undefined;
+    }
+    turn.hasAuthoritativeStamp = true;
+    turn.stampedTopics.add(target);
+    return target;
+  }
+  // COMPAT(timelineTopicAttribution): added in v0.19.0, remove fallback after 2027-06-01
+  // once the daemon floor stamps authoritative topicKey/taskId/rootMessageId on timeline items.
+  const turnStampedTopic = resolveSingleTurnStampedTopic(turn);
+  if (turn.reportOnly) {
+    return turnStampedTopic ?? turn.reportTopic;
+  }
+  if (turnStampedTopic ?? state.activeTopic) {
+    return turnStampedTopic ?? state.activeTopic;
+  }
+  return state.topics.some((unit) => !unit.redirectedTargetUnit)
+    ? undefined
+    : ensureFallbackTopic(state, item);
+}
+
 function ingestStreamItem(state: TopicBuilderState, item: StreamItem, turn: TopicTurn): void {
   if (item.kind === "user_message") {
     if (isRealHumanPrompt(item)) {
-      ingestHumanPrompt(state, item);
+      ingestHumanPrompt(state, item, turn);
     } else {
-      ingestLegacySubagentUserMessage(state, item);
+      ingestLegacySubagentUserMessage(state, item, turn);
     }
     return;
   }
-  if (ingestAgentMessageItem(state, item)) {
+  if (ingestAgentMessageItem(state, item, turn)) {
     const report = getAgentMessage(item);
     if (turn.reportOnly && report) {
       const source = JSON.stringify([
@@ -1510,10 +1894,7 @@ function ingestStreamItem(state: TopicBuilderState, item: StreamItem, turn: Topi
     return;
   }
 
-  const target = turn.reportOnly
-    ? turn.reportTopic
-    : (state.activeTopic ??
-      (state.topics.length > 0 ? undefined : ensureFallbackTopic(state, item)));
+  const target = resolveStreamItemTarget(state, item, turn);
   if (!target) return;
 
   markTopicCanceledIfStamped(target, item);
@@ -1521,7 +1902,10 @@ function ingestStreamItem(state: TopicBuilderState, item: StreamItem, turn: Topi
   if (item.kind === "tool_call") {
     if (isDispatchTool(item)) {
       turn.dispatchAttempt = true;
-      if (rememberDispatch(state, item, target)) turn.dispatched = true;
+      if (rememberDispatch(state, item, target)) {
+        turn.dispatched = true;
+        turn.hasDelegation = true;
+      }
     }
     target.processSteps.push({
       kind: "tool_call",
@@ -1687,8 +2071,9 @@ function attachExternalCollections(state: TopicBuilderState, input: ProjectTopic
 
   for (const perm of input.pendingPermissions ?? []) {
     const target =
-      state.topics.findLast((unit) => unitHasParticipant(unit, perm.agentId)) ??
-      state.topics.at(-1);
+      state.topics.findLast(
+        (unit) => !unit.redirectedTargetUnit && unitHasParticipant(unit, perm.agentId),
+      ) ?? state.topics.findLast((unit) => !unit.redirectedTargetUnit);
     if (target) target.linkedPermissions.push(perm);
   }
 }
@@ -1814,7 +2199,7 @@ function isTopicBlocked(
 }
 
 function isOutcomeReply(reply: TopicReplyItem): boolean {
-  if (reply.kind === "main_progress") return false;
+  if (reply.kind === "main_progress" || reply.kind === "attributed_user_message") return false;
   if (reply.kind === "main_conclusion" || reply.kind === "subagent_report") return true;
   if (reply.entry.role === "agent_reply") return true;
   return (
@@ -1825,7 +2210,9 @@ function isOutcomeReply(reply: TopicReplyItem): boolean {
 }
 
 function isCompletedOutcome(reply: TopicReplyItem | undefined): boolean {
-  if (!reply || reply.kind === "main_progress") return false;
+  if (!reply || reply.kind === "main_progress" || reply.kind === "attributed_user_message") {
+    return false;
+  }
   if (reply.kind === "main_conclusion") return true;
   if (reply.kind === "subagent_report") {
     return reply.status === "completed" || reply.status === "finished";
@@ -1841,18 +2228,80 @@ function isActiveDispatchOutcome(reply: TopicReplyItem | undefined): boolean {
   );
 }
 
+function resolveUnitActiveTurnOwnership(input: {
+  unit: MutableTopicUnit;
+  lastTurn: TopicTurn | undefined;
+  isLatestTopic: boolean;
+  hasStreamItems: boolean;
+}): { ownsActiveTurn: boolean; activeTurnSettled: boolean; isInitialTurn: boolean } {
+  const { unit, lastTurn, isLatestTopic, hasStreamItems } = input;
+  if (!hasStreamItems || !lastTurn) {
+    return {
+      ownsActiveTurn: isLatestTopic,
+      activeTurnSettled: unit.replies.some(
+        (reply) => reply.kind === "main_conclusion" || reply.kind === "subagent_report",
+      ),
+      isInitialTurn: true,
+    };
+  }
+  const activeTurnSettled = lastTurn.hasConclusion || lastTurn.hasDelegation;
+  const isInitialTurn = lastTurn.initialPromptUnits.has(unit);
+  if (lastTurn.hasAuthoritativeStamp) {
+    return {
+      ownsActiveTurn: lastTurn.stampedTopics.has(unit),
+      activeTurnSettled,
+      isInitialTurn,
+    };
+  }
+  // COMPAT(timelineTopicAttribution): added in v0.19.0, remove trigger/report turn-ownership
+  // inference after 2027-06-01 once daemon floor emits authoritative topic stamps.
+  if (lastTurn.reportOnly) {
+    return {
+      ownsActiveTurn: lastTurn.reportTopic === unit,
+      activeTurnSettled,
+      isInitialTurn: false,
+    };
+  }
+  if (lastTurn.humanTriggerTopic) {
+    return {
+      ownsActiveTurn: lastTurn.humanTriggerTopic === unit,
+      activeTurnSettled,
+      isInitialTurn,
+    };
+  }
+  return {
+    ownsActiveTurn: false,
+    activeTurnSettled,
+    isInitialTurn,
+  };
+}
+
 function isTopicDispatching(input: {
   unit: MutableTopicUnit;
+  delegations: readonly ObservedDelegation[];
   latestOutcome: TopicReplyItem | undefined;
+  lastTurn: TopicTurn | undefined;
+  hasStreamItems: boolean;
   isLatestTopic: boolean;
   isTurnActive: boolean;
 }): boolean {
-  if (input.isLatestTopic && input.isTurnActive) return true;
   const taskStatus = input.unit.task?.status;
   if (taskStatus === "in_progress" || taskStatus === "analyzing" || taskStatus === "verifying") {
     return true;
   }
-  return isActiveDispatchOutcome(input.latestOutcome);
+  if (isActiveDispatchOutcome(input.latestOutcome)) {
+    return true;
+  }
+  if (!input.isTurnActive) return false;
+  const ownership = resolveUnitActiveTurnOwnership({
+    unit: input.unit,
+    lastTurn: input.lastTurn,
+    isLatestTopic: input.isLatestTopic,
+    hasStreamItems: input.hasStreamItems,
+  });
+  if (!ownership.ownsActiveTurn || ownership.activeTurnSettled) return false;
+  if (ownership.isInitialTurn && input.delegations.length > 0) return false;
+  return true;
 }
 
 function hasUnrecoveredError(
@@ -1913,6 +2362,8 @@ function resolveTopicLifecycleStatus(input: {
   replies: readonly TopicReplyItem[];
   activeBlockingPrompt: TopicBlockingPrompt | null;
   hasUnread: boolean;
+  lastTurn: TopicTurn | undefined;
+  hasStreamItems: boolean;
   isLatestTopic: boolean;
   isTurnActive: boolean;
 }): TopicLifecycleStatus | null {
@@ -1929,7 +2380,10 @@ function resolveTopicLifecycleStatus(input: {
   if (
     isTopicDispatching({
       unit,
+      delegations,
       latestOutcome,
+      lastTurn: input.lastTurn,
+      hasStreamItems: input.hasStreamItems,
       isLatestTopic: input.isLatestTopic,
       isTurnActive: input.isTurnActive,
     })
@@ -2036,14 +2490,63 @@ function getDelegationLead(
   };
 }
 
+function formatRedirectTargetTitle(target: MutableTopicUnit): string {
+  const raw = (target.task?.title?.trim() || target.rootPrompt.text.trim()).replace(/\s+/g, " ");
+  if (!raw) return target.topicKey;
+  return raw.length > 60 ? `${raw.slice(0, 59)}…` : raw;
+}
+
 function finalizeTopicUnit(input: {
   unit: MutableTopicUnit;
   delegations: readonly ObservedDelegation[];
+  lastTurn: TopicTurn | undefined;
   isLatestTopic: boolean;
   projectionInput: ProjectTopicUnitsInput;
   watermark: TopicWatermarkSnapshot;
 }): TopicUnit {
-  const { unit, delegations, isLatestTopic, projectionInput, watermark } = input;
+  const { unit, delegations, lastTurn, isLatestTopic, projectionInput, watermark } = input;
+
+  watermark.maxSeq = maxSeqValue(watermark.maxSeq, unit.rootPrompt.seq);
+  watermark.maxTimestampMs = Math.max(watermark.maxTimestampMs, unit.rootPrompt.timestampMs);
+  if (unit.rootPrompt.epoch) {
+    watermark.epoch = unit.rootPrompt.epoch;
+  }
+
+  if (unit.redirectedTargetUnit) {
+    const target = unit.redirectedTargetUnit;
+    return {
+      topicKey: unit.topicKey,
+      rootItemId: unit.rootItemId,
+      rootMessageId: unit.rootMessageId,
+      rootPrompt: unit.rootPrompt,
+      task: null,
+      processSteps: [],
+      replies: [],
+      pendingInboxItems: [],
+      linkedTodos: [],
+      linkedDurableItems: [],
+      linkedPermissions: [],
+      fileConflicts: [],
+      activeBlockingPrompt: null,
+      unreadReplyCount: 0,
+      firstUnreadReplyIndex: null,
+      isMarkedUnread: false,
+      hasUnread: false,
+      latestSeq: unit.rootPrompt.seq,
+      latestTimestampMs: unit.rootPrompt.timestampMs,
+      latestEpoch: unit.rootPrompt.epoch,
+      lifecycleStatus: null,
+      retryCandidate: null,
+      redirectedTo: {
+        topicKey: target.topicKey,
+        ...(target.taskId ? { taskId: target.taskId } : {}),
+        ...(target.rootMessageId ? { rootMessageId: target.rootMessageId } : {}),
+        title: formatRedirectTargetTitle(target),
+        mode: unit.redirectedMode ?? "attach",
+      },
+    };
+  }
+
   const topicReadEntry = projectionInput.readSnapshot?.topics.find(
     (entry) => entry.topicKey === unit.topicKey,
   );
@@ -2054,12 +2557,6 @@ function finalizeTopicUnit(input: {
   let latestSeq: number | null = unit.rootPrompt.seq;
   let latestTimestampMs = unit.rootPrompt.timestampMs;
   let latestEpoch: string | null = unit.rootPrompt.epoch;
-
-  watermark.maxSeq = maxSeqValue(watermark.maxSeq, unit.rootPrompt.seq);
-  watermark.maxTimestampMs = Math.max(watermark.maxTimestampMs, unit.rootPrompt.timestampMs);
-  if (unit.rootPrompt.epoch) {
-    watermark.epoch = unit.rootPrompt.epoch;
-  }
 
   const orderedReplies = sortRepliesChronologically(unit.replies);
 
@@ -2078,7 +2575,9 @@ function finalizeTopicUnit(input: {
     latestTimestampMs = Math.max(latestTimestampMs, reply.timestampMs);
     watermark.maxTimestampMs = Math.max(watermark.maxTimestampMs, reply.timestampMs);
 
-    const isUserFollowup = reply.kind === "thread_entry" && reply.entry.role === "user_followup";
+    const isUserFollowup =
+      reply.kind === "attributed_user_message" ||
+      (reply.kind === "thread_entry" && reply.entry.role === "user_followup");
     const isUnread = isUserFollowup
       ? false
       : computeReplyUnread({
@@ -2111,6 +2610,8 @@ function finalizeTopicUnit(input: {
     replies,
     activeBlockingPrompt,
     hasUnread,
+    lastTurn,
+    hasStreamItems: projectionInput.items.length > 0,
     isLatestTopic,
     isTurnActive: Boolean(projectionInput.isTurnActive),
   });
@@ -2162,10 +2663,14 @@ function indexThreadEntries(
 ) {
   const userFollowupBySourceMessageId = new Map<string, TopicThreadEntry>();
   const mirroredReplyBySourceMessageId = new Map<string, TopicThreadEntry>();
+  const attributedFromTopicKeys = new Set<string>();
   const unmatchedUserFollowups: TopicThreadEntry[] = [];
   const unmatchedAgentReplies: TopicThreadEntry[] = [];
 
   for (const entry of entries) {
+    if (entry.attributedFromTopicKey && entry.attributedFromTopicKey !== entry.topicKey) {
+      attributedFromTopicKeys.add(entry.attributedFromTopicKey);
+    }
     if (entry.role === "user_followup") {
       if (entry.sourceMessageId) userFollowupBySourceMessageId.set(entry.sourceMessageId, entry);
       unmatchedUserFollowups.push(entry);
@@ -2181,6 +2686,7 @@ function indexThreadEntries(
   return {
     userFollowupBySourceMessageId,
     mirroredReplyBySourceMessageId,
+    attributedFromTopicKeys,
     unmatchedUserFollowups,
     unmatchedAgentReplies,
   };
@@ -2222,6 +2728,7 @@ function ingestTopicTurns(state: TopicBuilderState, items: readonly StreamItem[]
     for (let index = first; index < end; index += 1) {
       ingestStreamItem(state, items[index]!, turn);
     }
+    state.lastTurn = turn;
     first = end;
   }
 }
@@ -2234,12 +2741,15 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
   const loadedAgentMessageIds =
     threadEntries.length > 0 ? collectLoadedAgentMessageIds(input.items) : new Set<string>();
   const indexed = indexThreadEntries(threadEntries, assistantIds);
+  const attributedBySourceMessageId = indexAnchorAttributions(input.topicAnchors ?? []);
 
   const state: TopicBuilderState = {
     topics: [],
     byTaskId: new Map(),
     unitsByRootMessageId: new Map(),
     byTopicKey: new Map(),
+    attributedBySourceMessageId,
+    redirectedToUnit: new Map(),
     taskById,
     tasksByRootMessageId,
     ...indexed,
@@ -2253,6 +2763,7 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     unmatchedExplicitRefs: [],
     activeTopic: undefined,
     activeMainFollowup: undefined,
+    lastTurn: undefined,
     fallbackSenderTitle: input.fallbackSenderTitle ?? "Subagent",
     agentTitleById: input.agentTitleById,
     localServerId: input.localServerId,
@@ -2287,11 +2798,19 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     if (existing) existing.push(delegation);
     else delegationsByUnit.set(unit, [delegation]);
   }
+  let lastRealTopicIndex = -1;
+  for (let i = state.topics.length - 1; i >= 0; i -= 1) {
+    if (!state.topics[i]?.redirectedTargetUnit) {
+      lastRealTopicIndex = i;
+      break;
+    }
+  }
   const topics = state.topics.map((unit, index) => {
     const finalized = finalizeTopicUnit({
       unit,
       delegations: delegationsByUnit.get(unit) ?? [],
-      isLatestTopic: index === state.topics.length - 1,
+      lastTurn: state.lastTurn,
+      isLatestTopic: index === lastRealTopicIndex,
       projectionInput: input,
       watermark,
     });

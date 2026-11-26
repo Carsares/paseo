@@ -925,4 +925,68 @@ describe("selectProjectedTimelinePage", () => {
     expect(page.entries.some((entry) => entry.item.type === "tool_call")).toBe(true);
     expect(page.endSeq).toBe(501);
   });
+
+  test("preserves topicKey, taskId, and rootMessageId across projected entries and separates topic transitions", () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-02-13T00:00:00.001Z",
+        turnId: "turn-1",
+        topicKey: "msg:m1",
+        rootMessageId: "m1",
+        item: { type: "assistant_message", text: "before " },
+      },
+      {
+        seq: 2,
+        timestamp: "2026-02-13T00:00:00.002Z",
+        turnId: "turn-1",
+        topicKey: "msg:m1",
+        rootMessageId: "m1",
+        item: { type: "assistant_message", text: "attribution" },
+      },
+      {
+        seq: 3,
+        timestamp: "2026-02-13T00:00:00.003Z",
+        turnId: "turn-1",
+        topicKey: "task:t1",
+        taskId: "t1",
+        rootMessageId: "root-1",
+        item: { type: "assistant_message", text: "after attribution" },
+      },
+      {
+        ...toolRow(4, "running"),
+        turnId: "turn-1",
+        topicKey: "task:t1",
+        taskId: "t1",
+        rootMessageId: "root-1",
+      },
+      {
+        ...toolRow(5, "completed"),
+        turnId: "turn-1",
+        topicKey: "task:t1",
+        taskId: "t1",
+        rootMessageId: "root-1",
+      },
+    ];
+
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+    expect(projected).toHaveLength(3);
+    expect(projected[0]).toMatchObject({
+      item: { type: "assistant_message", text: "before attribution" },
+      topicKey: "msg:m1",
+      rootMessageId: "m1",
+    });
+    expect(projected[1]).toMatchObject({
+      item: { type: "assistant_message", text: "after attribution" },
+      topicKey: "task:t1",
+      taskId: "t1",
+      rootMessageId: "root-1",
+    });
+    expect(projected[2]).toMatchObject({
+      item: expect.objectContaining({ type: "tool_call", status: "completed" }),
+      topicKey: "task:t1",
+      taskId: "t1",
+      rootMessageId: "root-1",
+    });
+  });
 });

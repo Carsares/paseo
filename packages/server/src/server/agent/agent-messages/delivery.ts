@@ -162,6 +162,25 @@ interface DirectPrompt {
   sessionMode?: string;
   unarchive?: boolean;
   handoff?: QueueHandoff;
+  /** When true on a human direct prompt, block any sourced queued message from riding along. */
+  isolateFromSourcedRiders?: boolean;
+}
+/** Snapshot of a background agent-message batch that can be safely requeued if interrupted. */
+export interface InterruptedBackgroundBatch {
+  readonly recipientId: string;
+  readonly messages: readonly Pick<
+    Message,
+    | "recipientId"
+    | "messageId"
+    | "source"
+    | "childReported"
+    | "validateDispatch"
+    | "beforeProviderDispatch"
+    | "prompt"
+    | "sessionMode"
+    | "unarchive"
+    | "clearPendingPermissions"
+  >[];
 }
 /** The provider prompt a direct prompt became. Unchanged when nothing was queued. */
 interface JoinedPrompt {
@@ -181,6 +200,8 @@ interface ParentNotificationAddress {
 }
 interface Dependencies {
   shouldHoldInbox?(recipientId: string, source?: ChildSource): boolean;
+  /** When true for a recipient, human direct prompts never carry sourced messages as riders. */
+  isolateDirectPrompts?(recipientId: string): boolean;
   onInboxChange?(recipientId: string): void;
   classifyInbox?(recipientId: string, source: ChildSource): Promise<Message["subagentInbox"]>;
   /** Includes admitted starts and provider turns, including compaction. */
@@ -250,6 +271,14 @@ export interface AgentMessageDelivery {
   ): Promise<Result>;
   /** Remove matching messages that the queue still owns before dispatcher handoff. */
   withdrawPending(recipientId: string, matches: (source: AgentPromptSource) => boolean): number;
+  /** Whether the recipient currently has an in-flight turn started by agent-message delivery. */
+  hasActiveBackgroundTurn?(recipientId: string): boolean;
+  /** Capture the active background delivery batch so a caller can requeue it if interrupted. */
+  captureActiveBackgroundTurn?(recipientId: string): InterruptedBackgroundBatch | undefined;
+  /** Re-enqueue an interrupted background delivery batch as queued messages in order. */
+  requeueBackgroundBatch?(batch: InterruptedBackgroundBatch): number;
+  /** Temporarily pause starting new background dispatches for a recipient; returns a release fn. */
+  holdBackgroundDelivery?(recipientId: string): () => void;
   /** Messages and dispatches that will proceed without a new prompt. Held messages do not count. */
   hasPending(recipientId: string): boolean;
   /** Stop admission, flush pending messages, and await provider dispatch acknowledgments. */
@@ -299,7 +328,32 @@ function envelope(message: Admitted): AgentPromptInput {
   ).prompt;
 }
 
-/** Explicitly conflicting session modes require separate, ordered dispatches. */
+function normalizeTopicId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function sourceTopicKey(source: AgentPromptSource | undefined): string | undefined {
+  if (!source) return undefined;
+  if (source.kind === "agent-message") {
+    const taskId = normalizeTopicId(source.taskId);
+    if (taskId) return `task:${taskId}`;
+    const rootMessageId = normalizeTopicId(source.rootMessageId);
+    if (rootMessageId) return `msg:${rootMessageId}`;
+    return undefined;
+  }
+  if (source.kind === "peer-workspace-message") {
+    const correlationId = normalizeTopicId(source.correlationId);
+    return correlationId ? `peer:${correlationId}` : undefined;
+  }
+  return undefined;
+}
+
+function messageTopicKey(message: Admitted): string | undefined {
+  return sourceTopicKey(message.source);
+}
+
+/** Explicitly conflicting session modes or topic keys require separate, ordered dispatches. */
 function modeGroups(messages: Admitted[]): Admitted[][] {
   const groups: Admitted[][] = [];
   let group: Admitted[] = [];
@@ -308,6 +362,7 @@ function modeGroups(messages: Admitted[]): Admitted[][] {
     if (
       group.length &&
       ((mode && message.sessionMode && mode !== message.sessionMode) ||
+        messageTopicKey(group[0]!) !== messageTopicKey(message) ||
         Boolean(group[0]!.peerTurnAuthorization) !== Boolean(message.peerTurnAuthorization) ||
         group[0]!.taskAdmission ||
         message.taskAdmission ||
@@ -338,6 +393,12 @@ function modeGroups(messages: Admitted[]): Admitted[][] {
 export function createAgentMessageDelivery(dependencies: Dependencies): AgentMessageDelivery & {
   /** Explicit reports still buffered or awaiting provider admission for the recipient's task. */
   hasPendingTaskReport(recipientId: string, taskId: string, excludeMessageId?: string): boolean;
+  /** Explicit untasked reports still buffered or awaiting admission for the recipient's msg:<root>. */
+  hasPendingTopicReport(
+    recipientId: string,
+    rootMessageId: string,
+    excludeMessageId?: string,
+  ): boolean;
   pauseAdmission(): { drained: Promise<void>; release(): void };
 } {
   const schedule =
@@ -350,6 +411,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   const releasing = new Map<string, Promise<void>>();
   const parentInboxes = new Map<string, Admitted[]>();
   const parentInboxCaps = new Map<string, Map<string | undefined, () => void>>();
+  const activeBackgroundTurns = new Map<string, Admitted[]>();
+  const backgroundDeliveryHolds = new Map<string, number>();
   const stopWrites = new Set<Promise<void>>();
   const outcomeWrites = new Set<Promise<void>>();
   const stopWaiters = new Set<(recipientId: string) => void>();
@@ -357,6 +420,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   let closed = false;
   let queuesDrainedOnClose = false;
   let closing: Promise<void> | undefined;
+
+  const isBackgroundDeliveryHeld = (recipientId: string): boolean =>
+    (backgroundDeliveryHolds.get(recipientId) ?? 0) > 0;
 
   function inboxTaskId({ source }: Admitted): string | undefined {
     return source.kind === "agent-message" ? source.taskId || undefined : undefined;
@@ -571,6 +637,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       !inbox ||
       inbox.advancing ||
       inbox.phase !== "waiting" ||
+      isBackgroundDeliveryHeld(recipientId) ||
       !inbox.messages.some(isRunnable)
     )
       return;
@@ -806,6 +873,66 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (const message of messages) message.outcomeUnknown = true;
   }
 
+  function recordDispatchedBatch(
+    recipientId: string,
+    disposition: PromptDispatchDisposition,
+    messages: Admitted[],
+  ): void {
+    if (disposition === "turn_started") {
+      activeBackgroundTurns.set(recipientId, [...messages]);
+    }
+  }
+
+  function isDirectRiderBlocked(
+    message: Admitted,
+    direct: DirectPrompt,
+    isolateSourcedRiders: boolean,
+    directTopicKey: string | undefined,
+  ): boolean {
+    if (
+      message.taskAdmission ||
+      message.validateDispatch ||
+      message.subagentInbox ||
+      message.beforeProviderDispatch ||
+      message.sessionMode ||
+      message.childReported ||
+      message.source.kind === "agent-notification"
+    ) {
+      return true;
+    }
+    if (!direct.source) {
+      if (isolateSourcedRiders) return true;
+      return (
+        messageTopicKey(message) !== undefined ||
+        message.source.kind === "peer-workspace-message" ||
+        message.source.kind === "change-request-update" ||
+        (message.source.kind === "agent-message" && message.source.reportStatus !== undefined)
+      );
+    }
+    return messageTopicKey(message) !== directTopicKey;
+  }
+
+  function selectDirectRiders(candidates: Admitted[], direct: DirectPrompt): Admitted[] {
+    const isolateSourcedRiders =
+      !direct.source &&
+      (direct.isolateFromSourcedRiders === true ||
+        Boolean(dependencies.isolateDirectPrompts?.(direct.recipientId)));
+    const directTopicKey = sourceTopicKey(direct.source);
+    const boundary = candidates.findIndex((message) =>
+      isDirectRiderBlocked(message, direct, isolateSourcedRiders, directTopicKey),
+    );
+    return boundary < 0 ? candidates : candidates.slice(0, boundary);
+  }
+
+  function clearActiveBackgroundTurnIfStarted(
+    recipientId: string,
+    disposition: PromptDispatchDisposition,
+  ): void {
+    if (disposition === "turn_started") {
+      activeBackgroundTurns.delete(recipientId);
+    }
+  }
+
   /** Dispatch one batch. A batch that finds the recipient stopped, or busy when idle-only, stays queued. */
   async function deliver(
     recipientId: string,
@@ -838,6 +965,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         const disposition = await runWithTaskDispatchAdmission(messages[0]?.taskAdmission, () =>
           dependencies.dispatch(request),
         );
+        recordDispatchedBatch(recipientId, disposition, messages);
         for (const message of messages) claim(message, disposition, request);
         return;
       } catch (error) {
@@ -946,11 +1074,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         return;
       }
     }
-    if (inbox.phase !== "waiting") return;
+    if (inbox.phase !== "waiting" || isBackgroundDeliveryHeld(recipientId)) return;
     const running = (): boolean => inbox.phase === "waiting" && isRunning(recipientId);
     if (running()) await offerOutOfBand(recipientId, ahead, stopped, running);
     // Later mode groups stay queued for the turn ends that follow.
-    if (inbox.phase === "waiting") {
+    if (inbox.phase === "waiting" && !isBackgroundDeliveryHeld(recipientId)) {
       const first = modeGroups(ahead.filter(isRunnable))[0] ?? [];
       if (!isRunning(recipientId) || (first.length && first.every(maySteerDuringDrain))) {
         await deliver(recipientId, inbox, first, true, stopped);
@@ -987,6 +1115,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     inbox.cancelTimer();
     inbox.cancelCap();
     inbox.phase = "waiting";
+    if (isBackgroundDeliveryHeld(recipientId)) return;
     const running = isRunning(recipientId);
     if (running)
       inbox.cancelTimer = schedule(preparing() ? 100 : QUIET_MS, () => attempt(recipientId));
@@ -1212,6 +1341,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   }
 
   const unsubscribe = dependencies.subscribe?.((recipientId, releaseInboxForRecipient) => {
+    if (!isRunning(recipientId)) activeBackgroundTurns.delete(recipientId);
     refreshInbox(releaseInboxForRecipient ? recipientId : undefined);
     const inbox = inboxes.get(recipientId);
     if (!inbox) return;
@@ -1221,6 +1351,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (inbox.phase === "waiting" && !isRunning(recipientId)) attempt(recipientId);
   });
   const unsubscribeStop = dependencies.onStop?.((recipientId) => {
+    activeBackgroundTurns.delete(recipientId);
     const inbox = inboxes.get(recipientId);
     if (inbox) {
       inbox.stops++;
@@ -1334,11 +1465,92 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     },
     withdrawPending: (recipientId, matches) =>
       withdrawPending(recipientId, (message) => matches(message.originalSource)),
+    hasActiveBackgroundTurn: (recipientId) => activeBackgroundTurns.has(recipientId),
+    captureActiveBackgroundTurn: (recipientId) => {
+      const messages = activeBackgroundTurns.get(recipientId);
+      if (!messages?.length) return undefined;
+      return {
+        recipientId,
+        messages: messages.map((message) => ({
+          recipientId: message.recipientId,
+          messageId: message.receipt.messageId,
+          source: { ...message.source },
+          childReported: message.childReported,
+          validateDispatch: message.validateDispatch,
+          beforeProviderDispatch: message.beforeProviderDispatch,
+          prompt: message.prompt,
+          sessionMode: message.sessionMode,
+          unarchive: message.unarchive,
+          clearPendingPermissions: message.clearPendingPermissions,
+        })),
+      };
+    },
+    requeueBackgroundBatch(batch) {
+      if (closed || admissionPaused || !batch.messages.length) return 0;
+      activeBackgroundTurns.delete(batch.recipientId);
+      const existingIds = new Set<string>([
+        ...(inboxes.get(batch.recipientId)?.messages.map((message) => message.receipt.messageId) ??
+          []),
+        ...(parentInboxes.get(batch.recipientId)?.map((message) => message.receipt.messageId) ??
+          []),
+      ]);
+      let requeued = 0;
+      for (const message of batch.messages) {
+        if (message.messageId && existingIds.has(message.messageId)) continue;
+        this.enqueue({
+          recipientId: batch.recipientId,
+          messageId: message.messageId,
+          source: { ...message.source },
+          childReported: message.childReported,
+          validateDispatch: message.validateDispatch,
+          beforeProviderDispatch: message.beforeProviderDispatch,
+          prompt: message.prompt,
+          sessionMode: message.sessionMode,
+          unarchive: message.unarchive,
+          clearPendingPermissions: message.clearPendingPermissions,
+          activeTurnBehavior: "queue",
+        });
+        if (message.messageId) existingIds.add(message.messageId);
+        requeued++;
+      }
+      return requeued;
+    },
+    holdBackgroundDelivery: (recipientId) => {
+      backgroundDeliveryHolds.set(recipientId, (backgroundDeliveryHolds.get(recipientId) ?? 0) + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const remaining = (backgroundDeliveryHolds.get(recipientId) ?? 0) - 1;
+        if (remaining > 0) {
+          backgroundDeliveryHolds.set(recipientId, remaining);
+          return;
+        }
+        backgroundDeliveryHolds.delete(recipientId);
+        if (closed) return;
+        const inbox = inboxes.get(recipientId);
+        if (!inbox || inbox.phase !== "waiting" || !inbox.messages.some(isRunnable)) return;
+        if (!isRunning(recipientId)) attempt(recipientId);
+        else rest(recipientId);
+      };
+    },
     hasPendingTaskReport(recipientId, taskId, excludeMessageId) {
       const matches = ({ source, childReported, receipt }: Admitted) =>
         receipt.messageId !== excludeMessageId &&
         source.kind === "agent-message" &&
         source.taskId === taskId &&
+        (childReported === true || source.reportStatus !== undefined);
+      return (
+        parentInboxes.get(recipientId)?.some(matches) === true ||
+        inboxes.get(recipientId)?.messages.some(matches) === true
+      );
+    },
+    hasPendingTopicReport(recipientId, rootMessageId, excludeMessageId) {
+      const matches = ({ source, childReported, receipt }: Admitted) =>
+        receipt.messageId !== excludeMessageId &&
+        source.kind === "agent-message" &&
+        !source.taskId &&
+        source.rootMessageId === rootMessageId &&
         (childReported === true || source.reportStatus !== undefined);
       return (
         parentInboxes.get(recipientId)?.some(matches) === true ||
@@ -1440,17 +1652,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           // A newer Stop holds agent messages for a prompt submitted after it.
           const candidates = inbox?.stops === stopsAtSubmission ? ahead.filter(isQueued) : [];
           const canResumeHeld = candidates.some((message) => message.held);
-          const boundary = candidates.findIndex(
-            (message) =>
-              message.taskAdmission ||
-              message.validateDispatch ||
-              message.subagentInbox ||
-              message.beforeProviderDispatch ||
-              message.sessionMode ||
-              message.childReported ||
-              message.source.kind === "agent-notification",
-          );
-          const riders = boundary < 0 ? candidates : candidates.slice(0, boundary);
+          const riders = selectDirectRiders(candidates, direct);
           const stopped = inbox ? watchForHold(inbox) : () => false;
           const request = requestFor(direct.recipientId, riders, false, stopped);
           const joined = { ...join(riders, direct), waitForProviderPrompt: canResumeHeld };
@@ -1468,6 +1670,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
             reject(error);
             return;
           }
+          clearActiveBackgroundTurnIfStarted(direct.recipientId, result.disposition);
           for (const rider of riders) if (isQueued(rider)) rider.state = "claimed";
           resolve(result);
           if (!riders.length && !canResumeHeld) return;
@@ -1541,6 +1744,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         return retryFlush;
       }
       closed = true;
+      activeBackgroundTurns.clear();
+      backgroundDeliveryHolds.clear();
       unsubscribe?.();
       unsubscribeStop?.();
       const receipts: Promise<unknown>[] = [];

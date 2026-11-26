@@ -4818,4 +4818,50 @@ describe("turn metrics", () => {
 
     expect(repeated.tail).toBe(first.tail);
   });
+
+  it("propagates topicKey, taskId, and rootMessageId from hydrated timeline entries", () => {
+    const attribution = {
+      topicKey: "task:T-hydrate",
+      taskId: "T-hydrate",
+      rootMessageId: "m-root-hydrate",
+    };
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      payload: {
+        ...baseTimelineInput.payload,
+        reset: true,
+        startCursor: { seq: 1 },
+        endCursor: { seq: 3 },
+        entries: [
+          {
+            ...makeTimelineEntry(1, "Investigate worker crash", "user_message"),
+            turnId: "turn-h1",
+            ...attribution,
+          },
+          {
+            ...makeTimelineEntry(2, "Reading crash dump", "reasoning"),
+            turnId: "turn-h1",
+            ...attribution,
+          },
+          {
+            ...makeTimelineEntry(3, "Fixed null pointer.", "assistant_message"),
+            turnId: "turn-h1",
+            ...attribution,
+          },
+        ],
+      },
+    });
+
+    expect(result.tail.map((item) => item.kind)).toEqual([
+      "user_message",
+      "thought",
+      "assistant_message",
+    ]);
+    for (const item of result.tail) {
+      expect(item).toMatchObject({
+        turnId: "turn-h1",
+        ...attribution,
+      });
+    }
+  });
 });

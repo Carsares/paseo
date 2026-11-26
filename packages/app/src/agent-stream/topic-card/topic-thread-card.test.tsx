@@ -932,3 +932,107 @@ it("preserves original generation across unmount/remount on desktop and never do
     onSubmitTopicDecision.mock.calls[1]![0].clientMessageId,
   );
 });
+
+function makeRedirectedTopic(): TopicUnit {
+  return {
+    ...makeTopic(),
+    topicKey: "msg:m-follow-1",
+    taskId: undefined,
+    rootItemId: "u-follow-1",
+    rootMessageId: "m-follow-1",
+    replies: [],
+    processSteps: [],
+    hasUnread: false,
+    unreadReplyCount: 0,
+    lifecycleStatus: null,
+    redirectedTo: {
+      topicKey: "task:T-100",
+      taskId: "T-100",
+      rootMessageId: "m-100",
+      title: "Audit the WebSocket reconnect path",
+      mode: "attach",
+    },
+  };
+}
+
+function makeAttributedTopic(): TopicUnit {
+  const base = makeTopic();
+  return {
+    ...base,
+    replies: [
+      ...base.replies,
+      {
+        kind: "attributed_user_message",
+        id: "attributed:u-follow-1",
+        sourceMessageId: "m-follow-1",
+        mode: "merge",
+        attributedFromTopicKey: "msg:m-follow-1",
+        text: "Also verify reconnect backoff ceiling",
+        epoch: "ep-1",
+        seq: 4,
+        timestampMs: 1_700_000_004_000,
+        isUnread: false,
+        item: {
+          kind: "user_message",
+          id: "u-follow-1",
+          messageId: "m-follow-1",
+          text: "Also verify reconnect backoff ceiling",
+          timestamp: new Date(1_700_000_004_000),
+        },
+      },
+    ],
+  };
+}
+
+it("renders a compact redirect strip for attributed topics and jumps to target on click", () => {
+  const onJumpToTopic = vi.fn();
+  const redirectedTopic = makeRedirectedTopic();
+
+  render(
+    <TopicThreadCard
+      agentKey="srv-1:mc-1"
+      topic={redirectedTopic}
+      isPaneFocused={false}
+      onJumpToTopic={onJumpToTopic}
+      onAutoMarkRead={vi.fn()}
+      onMarkTopicMode={vi.fn()}
+      onFlushTopicInbox={vi.fn()}
+      onOpenAgentBeside={vi.fn()}
+      onSubmitDesktopReply={vi.fn(() => true)}
+      onActivateCompactReply={vi.fn()}
+      onConvertToTodo={vi.fn()}
+      onToggleTodoStatus={vi.fn()}
+      onEditTodo={vi.fn()}
+    />,
+  );
+
+  expect(screen.getByTestId("topic-redirect-card-msg:m-follow-1")).toBeTruthy();
+  expect(screen.queryByTestId("topic-thread-card-msg:m-follow-1")).toBeNull();
+  fireEvent.click(screen.getByTestId("topic-redirect-jump-msg:m-follow-1"));
+  expect(onJumpToTopic).toHaveBeenCalledWith(redirectedTopic.redirectedTo);
+});
+
+it("renders attributed user messages inside the target topic card", () => {
+  const topicWithAttributed = makeAttributedTopic();
+
+  render(
+    <TopicThreadCard
+      agentKey="srv-1:mc-1"
+      topic={topicWithAttributed}
+      isPaneFocused={false}
+      onAutoMarkRead={vi.fn()}
+      onMarkTopicMode={vi.fn()}
+      onFlushTopicInbox={vi.fn()}
+      onOpenAgentBeside={vi.fn()}
+      onSubmitDesktopReply={vi.fn(() => true)}
+      onActivateCompactReply={vi.fn()}
+      onConvertToTodo={vi.fn()}
+      onToggleTodoStatus={vi.fn()}
+      onEditTodo={vi.fn()}
+    />,
+  );
+
+  const attributedRow = screen.getByTestId("topic-reply-attributed-attributed:u-follow-1");
+  expect(attributedRow.textContent).toContain("Also verify reconnect backoff ceiling");
+  expect(attributedRow.textContent).toContain("topicWorkbench.topicStream.mergedMessageLabel");
+});

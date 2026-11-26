@@ -76,4 +76,53 @@ describe("quote attachment label", () => {
     const [quote] = appendQuoteAttachment([], "text", "Quote reply");
     expect(quote).toMatchObject({ kind: "quote", text: "text", label: "Quote reply" });
   });
+
+  it("preserves optional topic source metadata and omits blank fields for backward compatibility", () => {
+    expect(
+      createQuoteAttachment({
+        id: "t1",
+        text: "Investigate timeout",
+        label: "Network Lead",
+        topicKey: " task:T-12 ",
+        rootMessageId: " msg-root-1 ",
+        taskId: " T-12 ",
+        sourceMessageId: " rep-1 ",
+      }),
+    ).toEqual({
+      kind: "quote",
+      id: "t1",
+      text: "Investigate timeout",
+      label: "Network Lead",
+      topicKey: "task:T-12",
+      rootMessageId: "msg-root-1",
+      taskId: "T-12",
+      sourceMessageId: "rep-1",
+    });
+
+    const plain = createQuoteAttachment({
+      id: "t2",
+      text: "Plain quote",
+      topicKey: "   ",
+      taskId: "",
+    });
+    expect(plain).toEqual({ kind: "quote", id: "t2", text: "Plain quote" });
+    expect("topicKey" in plain).toBe(false);
+    expect("taskId" in plain).toBe(false);
+    expect("rootMessageId" in plain).toBe(false);
+    expect("sourceMessageId" in plain).toBe(false);
+
+    const [appended] = appendQuoteAttachment([], "From topic", "Lead", {
+      topicKey: "msg:m-42",
+      rootMessageId: "m-42",
+      sourceMessageId: "a-42",
+    });
+    expect(appended).toMatchObject({
+      kind: "quote",
+      text: "From topic",
+      label: "Lead",
+      topicKey: "msg:m-42",
+      rootMessageId: "m-42",
+      sourceMessageId: "a-42",
+    });
+  });
 });

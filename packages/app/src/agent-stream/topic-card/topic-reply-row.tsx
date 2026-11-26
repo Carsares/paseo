@@ -15,11 +15,12 @@ import {
   RotateCcw,
   Sparkles,
 } from "lucide-react-native";
-import { memo, useCallback, useRef, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { ComposerQuote } from "@/assistant-selection-copy/composer-quote";
+import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
@@ -105,6 +106,7 @@ function extractFirstTodoLine(rawText: string): string {
 function resolveReplySourceMessageId(reply: TopicReplyItem): string | undefined {
   if (reply.kind === "main_conclusion" || reply.kind === "main_progress") return reply.messageId;
   if (reply.kind === "thread_entry") return reply.entry.sourceMessageId;
+  if (reply.kind === "attributed_user_message") return reply.sourceMessageId;
   return reply.id;
 }
 
@@ -114,8 +116,43 @@ function resolveReplyAuthorAgentId(reply: TopicReplyItem): string | undefined {
   return undefined;
 }
 
+function resolveReplyQuoteMetadata(reply: TopicReplyItem): QuoteTopicSourceMetadata | undefined {
+  if (reply.kind === "subagent_report") {
+    let topicKey: string | undefined;
+    if (reply.taskId) {
+      topicKey = `task:${reply.taskId}`;
+    } else if (reply.rootMessageId) {
+      topicKey = `msg:${reply.rootMessageId}`;
+    }
+    const metadata: QuoteTopicSourceMetadata = {
+      ...(topicKey ? { topicKey } : {}),
+      ...(reply.taskId ? { taskId: reply.taskId } : {}),
+      ...(reply.rootMessageId ? { rootMessageId: reply.rootMessageId } : {}),
+      ...(reply.reportMessageId ? { sourceMessageId: reply.reportMessageId } : {}),
+    };
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+  }
+  if (reply.kind === "thread_entry") {
+    const { entry } = reply;
+    return {
+      topicKey: entry.topicKey,
+      ...(entry.taskId ? { taskId: entry.taskId } : {}),
+      ...(entry.rootMessageId ? { rootMessageId: entry.rootMessageId } : {}),
+      sourceMessageId: entry.sourceMessageId ?? entry.entryId,
+    };
+  }
+  if (reply.kind === "attributed_user_message") {
+    return {
+      ...(reply.attributedFromTopicKey ? { topicKey: reply.attributedFromTopicKey } : {}),
+      sourceMessageId: reply.sourceMessageId,
+    };
+  }
+  return reply.messageId ? { sourceMessageId: reply.messageId } : undefined;
+}
+
 export function TopicUserMessage({
   text,
+  label,
   textTestId,
   images,
   imageAttachments,
@@ -123,6 +160,7 @@ export function TopicUserMessage({
   children,
 }: {
   text: string;
+  label?: string;
   textTestId?: string;
   images?: readonly UserMessageImageAttachment[];
   imageAttachments?: readonly MessageImageAttachment[];
@@ -139,7 +177,9 @@ export function TopicUserMessage({
       ]}
       testID="topic-user-message"
     >
-      <Text style={styles.userLabel}>{t("topicWorkbench.topicStream.userMessageLabel")}</Text>
+      <Text style={styles.userLabel}>
+        {label ?? t("topicWorkbench.topicStream.userMessageLabel")}
+      </Text>
       {images?.length || imageAttachments?.length ? (
         <ReadOnlyMessageImages
           images={images}
@@ -184,6 +224,7 @@ function TopicReplyQuoteButton({
   sourceTitle,
   bodyRef,
   quoteLabel,
+  topicMetadata,
   onQuote,
 }: {
   id: string;
@@ -191,6 +232,7 @@ function TopicReplyQuoteButton({
   sourceTitle: string;
   bodyRef: React.RefObject<View | null>;
   quoteLabel?: string;
+  topicMetadata?: QuoteTopicSourceMetadata;
   onQuote?: TopicReplyRowProps["onQuote"];
 }) {
   const { t } = useTranslation();
@@ -214,8 +256,16 @@ function TopicReplyQuoteButton({
     const selection = captured.current ? captured.current.selection : readSelection();
     clearCapture();
     const quote = selection ?? extractReplyQuoteSummary(text, { sourceTitle });
-    if (quote) onQuote?.({ quote, label: sourceTitle });
-  }, [clearCapture, onQuote, readSelection, sourceTitle, text]);
+    if (!quote) return;
+    onQuote?.({
+      quote,
+      label: sourceTitle,
+      ...(topicMetadata?.topicKey ? { topicKey: topicMetadata.topicKey } : {}),
+      ...(topicMetadata?.rootMessageId ? { rootMessageId: topicMetadata.rootMessageId } : {}),
+      ...(topicMetadata?.taskId ? { taskId: topicMetadata.taskId } : {}),
+      ...(topicMetadata?.sourceMessageId ? { sourceMessageId: topicMetadata.sourceMessageId } : {}),
+    });
+  }, [clearCapture, onQuote, readSelection, sourceTitle, text, topicMetadata]);
 
   if (!onQuote || !text.trim()) return null;
 
@@ -281,6 +331,7 @@ const SubagentReportRow = memo(function SubagentReportRow({
   isRetrying,
   isStreaming,
   quoteLabel,
+  quoteTopicMetadata,
   onQuote,
   onHoverChange,
   onConvertToTodo,
@@ -293,6 +344,7 @@ const SubagentReportRow = memo(function SubagentReportRow({
   isRetrying: boolean;
   isStreaming?: boolean;
   quoteLabel?: string;
+  quoteTopicMetadata?: QuoteTopicSourceMetadata;
   onQuote?: TopicReplyRowProps["onQuote"];
   onHoverChange: (hovered: boolean) => void;
   onConvertToTodo: () => void;
@@ -353,6 +405,7 @@ const SubagentReportRow = memo(function SubagentReportRow({
               sourceTitle={reply.senderTitle}
               bodyRef={bodyRef}
               quoteLabel={quoteLabel}
+              topicMetadata={quoteTopicMetadata}
               onQuote={onQuote}
             />
             <ToolbarButton
@@ -578,6 +631,7 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   isRetrying,
   isStreaming,
   quoteLabel,
+  quoteTopicMetadata,
   onQuote,
   onHoverChange,
   onConvertToTodo,
@@ -591,6 +645,7 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   isRetrying: boolean;
   isStreaming?: boolean;
   quoteLabel?: string;
+  quoteTopicMetadata?: QuoteTopicSourceMetadata;
   onQuote?: TopicReplyRowProps["onQuote"];
   onHoverChange: (hovered: boolean) => void;
   onConvertToTodo: () => void;
@@ -636,6 +691,11 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
       <View testID={`topic-reply-thread-${entry.entryId}`}>
         <TopicUserMessage
           text={entry.text}
+          label={
+            entry.attributedFromTopicKey
+              ? t("topicWorkbench.topicStream.attributedMessageLabel")
+              : undefined
+          }
           images={reply.images}
           imageAttachments={entry.imageAttachments}
           imageReader={imageReader}
@@ -694,6 +754,7 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
                 sourceTitle={authorLabel}
                 bodyRef={bodyRef}
                 quoteLabel={quoteLabel}
+                topicMetadata={quoteTopicMetadata}
                 onQuote={onQuote}
               />
             ) : null}
@@ -729,6 +790,7 @@ function MainReplyRow({
   unreadCountForDivider,
   isStreaming,
   quoteLabel,
+  quoteTopicMetadata,
   onQuote,
   onHoverChange,
   showActions,
@@ -738,6 +800,7 @@ function MainReplyRow({
   "showNewDivider" | "unreadCountForDivider" | "isStreaming" | "quoteLabel" | "onQuote"
 > & {
   reply: Extract<TopicReplyItem, { kind: "main_conclusion" | "main_progress" }>;
+  quoteTopicMetadata?: QuoteTopicSourceMetadata;
   onHoverChange: (hovered: boolean) => void;
   showActions: boolean;
   onConvertToTodo: () => void;
@@ -793,6 +856,7 @@ function MainReplyRow({
                 sourceTitle={sourceTitle}
                 bodyRef={bodyRef}
                 quoteLabel={quoteLabel}
+                topicMetadata={quoteTopicMetadata}
                 onQuote={onQuote}
               />
               <ToolbarButton
@@ -832,6 +896,7 @@ export const TopicReplyRow = memo(function TopicReplyRow({
   onConvertToTodo,
   onRetryReply,
 }: TopicReplyRowProps) {
+  const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const [isHovered, setIsHovered] = useState(false);
 
@@ -858,6 +923,7 @@ export const TopicReplyRow = memo(function TopicReplyRow({
   const handleRetry = useCallback(() => {
     onRetryReply?.(reply);
   }, [onRetryReply, reply]);
+  const quoteTopicMetadata = useMemo(() => resolveReplyQuoteMetadata(reply), [reply]);
 
   if (reply.kind === "subagent_report") {
     const replyDisclosureKey =
@@ -874,6 +940,7 @@ export const TopicReplyRow = memo(function TopicReplyRow({
           isRetrying={isRetrying}
           isStreaming={isStreaming}
           quoteLabel={quoteLabel}
+          quoteTopicMetadata={quoteTopicMetadata}
           onQuote={onQuote}
           onHoverChange={setIsHovered}
           onConvertToTodo={handleConvertToTodo}
@@ -892,11 +959,30 @@ export const TopicReplyRow = memo(function TopicReplyRow({
         unreadCountForDivider={unreadCountForDivider}
         isStreaming={isStreaming}
         quoteLabel={quoteLabel}
+        quoteTopicMetadata={quoteTopicMetadata}
         onQuote={onQuote}
         onHoverChange={setIsHovered}
         showActions={showActions}
         onConvertToTodo={handleConvertToTodo}
       />
+    );
+  }
+
+  if (reply.kind === "attributed_user_message") {
+    const label = t(
+      reply.mode === "merge"
+        ? "topicWorkbench.topicStream.mergedMessageLabel"
+        : "topicWorkbench.topicStream.attributedMessageLabel",
+    );
+    return (
+      <View testID={`topic-reply-attributed-${reply.id}`}>
+        <TopicUserMessage
+          text={reply.text}
+          label={label}
+          images={reply.images}
+          imageReader={imageReader}
+        />
+      </View>
     );
   }
 
@@ -916,6 +1002,7 @@ export const TopicReplyRow = memo(function TopicReplyRow({
         isRetrying={isRetrying}
         isStreaming={isStreaming}
         quoteLabel={quoteLabel}
+        quoteTopicMetadata={quoteTopicMetadata}
         onQuote={onQuote}
         onHoverChange={setIsHovered}
         onConvertToTodo={handleConvertToTodo}

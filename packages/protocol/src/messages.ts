@@ -855,6 +855,9 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     type: z.literal("turn_started"),
     provider: AgentProviderSchema,
     turnId: z.string().optional(),
+    topicKey: z.string().min(1).optional(),
+    taskId: z.string().min(1).optional(),
+    rootMessageId: z.string().min(1).optional(),
   }),
   z.object({
     type: z.literal("turn_completed"),
@@ -882,6 +885,9 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     provider: AgentProviderSchema,
     item: AgentTimelineItemPayloadSchema,
     turnId: z.string().optional(),
+    topicKey: z.string().min(1).optional(),
+    taskId: z.string().min(1).optional(),
+    rootMessageId: z.string().min(1).optional(),
   }),
   z.object({
     type: z.literal("permission_requested"),
@@ -2748,6 +2754,7 @@ export const AgentFinishReportSchema = z.object({
   title: z.string(),
   event: z.enum(["finished", "errored", "permission-required", "closed"]),
   parentReportStatus: AgentReportStatusSchema.optional(),
+  escalateToParent: z.boolean().optional(),
   reportedAt: z.iso.datetime().optional(),
 });
 export type AgentFinishReport = z.infer<typeof AgentFinishReportSchema>;
@@ -3238,10 +3245,21 @@ export const TopicThreadEntrySchema = z.object({
   updatedAt: z.iso.datetime(),
   origin: TopicThreadEntryOriginSchema.optional(),
   reportStatus: AgentReportStatusSchema.optional(),
+  attributedFromTopicKey: z.string().min(1).optional(),
   durableItemRequestId: z.string().min(1).optional(),
   decision: WorkspaceDurableItemDecisionSchema.optional(),
 });
 export type TopicThreadEntry = z.infer<typeof TopicThreadEntrySchema>;
+
+export const TopicMessageAttributionModeSchema = z.enum(["attach", "merge"]);
+export type TopicMessageAttributionMode = z.infer<typeof TopicMessageAttributionModeSchema>;
+
+export const TopicMessageAttributionSchema = z.object({
+  sourceMessageId: z.string().min(1),
+  mode: TopicMessageAttributionModeSchema.optional(),
+  attributedAt: z.iso.datetime().optional(),
+});
+export type TopicMessageAttribution = z.infer<typeof TopicMessageAttributionSchema>;
 
 const TopicDelegationSummarySchema = z.object({
   reportIds: z.array(z.string()).optional(),
@@ -3269,6 +3287,7 @@ export const TopicAnchorSummarySchema = z.object({
   leadServerId: z.string().min(1).optional(),
   leadTitle: z.string().optional(),
   delegations: z.array(TopicDelegationSummarySchema).optional(),
+  attributedMessages: z.array(TopicMessageAttributionSchema).optional(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
 });
@@ -6914,6 +6933,9 @@ export const AgentTimelineEntryPayloadSchema = z.object({
   provider: AgentProviderSchema,
   item: AgentTimelineItemPayloadSchema,
   turnId: z.string().optional(),
+  topicKey: z.string().min(1).optional(),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
   timestamp: z.string(),
   seqStart: z.number().int().nonnegative(),
   seqEnd: z.number().int().nonnegative(),

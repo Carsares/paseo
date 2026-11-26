@@ -37,6 +37,77 @@ export interface QueuedTopicReply {
   clientMessageId: string;
 }
 
+export interface ResolveQuotedTopicRoutingTargetInput {
+  attachments: readonly ComposerAttachment[];
+  activeReplyTopic?: ActiveTopicReplyTarget | null;
+}
+
+function extractQuotePreview(attachment: Extract<ComposerAttachment, { kind: "quote" }>): string {
+  const preview = attachment.text.replace(/\s+/g, " ").trim() || attachment.label?.trim() || "";
+  return preview.slice(0, 120);
+}
+
+function parsePrefixedTopicId(topicKey: string, prefix: "task:" | "msg:"): string | undefined {
+  if (!topicKey.startsWith(prefix)) return undefined;
+  const parsed = topicKey.slice(prefix.length).trim();
+  return parsed || undefined;
+}
+
+/**
+ * Resolves a single-topic hard-routing target from quote attachments submitted via the main
+ * composer.
+ *
+ * - Explicit `activeReplyTopic` always keeps its existing card-reply path (returns `null`).
+ * - Exactly 1 distinct non-empty `topicKey` across quote attachments routes back into that topic.
+ * - 2+ distinct `topicKey`s indicate cross-topic coordination and never pick one blindly (`null`).
+ * - 0 topic-attributed quotes preserve standard main composer submission (`null`).
+ */
+export function resolveQuotedTopicRoutingTarget(
+  input: ResolveQuotedTopicRoutingTargetInput,
+): ActiveTopicReplyTarget | null {
+  if (input.activeReplyTopic) {
+    return null;
+  }
+
+  const attributedQuotes: Array<{
+    topicKey: string;
+    attachment: Extract<ComposerAttachment, { kind: "quote" }>;
+  }> = [];
+  for (const attachment of input.attachments) {
+    if (attachment.kind !== "quote") continue;
+    const topicKey = attachment.topicKey?.trim();
+    if (!topicKey) continue;
+    attributedQuotes.push({ topicKey, attachment });
+  }
+
+  const first = attributedQuotes[0];
+  if (!first) return null;
+
+  const resolvedTopicKey = first.topicKey;
+  if (attributedQuotes.some((entry) => entry.topicKey !== resolvedTopicKey)) {
+    return null;
+  }
+
+  let taskId: string | undefined;
+  let rootMessageId: string | undefined;
+  let promptPreview = "";
+  for (const { attachment } of attributedQuotes) {
+    taskId ||= attachment.taskId?.trim() || undefined;
+    rootMessageId ||= attachment.rootMessageId?.trim() || undefined;
+    promptPreview ||= extractQuotePreview(attachment);
+  }
+  taskId ||= parsePrefixedTopicId(resolvedTopicKey, "task:");
+  rootMessageId ||= parsePrefixedTopicId(resolvedTopicKey, "msg:");
+
+  return {
+    topicKey: resolvedTopicKey,
+    ...(taskId ? { taskId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
+    promptPreview,
+    routeMode: "auto",
+  };
+}
+
 export interface QueuedComposerMessage {
   id: string;
   text: string;

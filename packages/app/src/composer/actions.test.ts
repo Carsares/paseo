@@ -28,6 +28,7 @@ import {
   pickAndPersistImages,
   queueComposerMessage,
   removeComposerAttachmentAtIndex,
+  resolveQuotedTopicRoutingTarget,
   sendQueuedComposerMessageNow,
   toggleForgeAttachment,
   toggleForgeAttachmentFromPicker,
@@ -1283,4 +1284,123 @@ describe("file upload preparation", () => {
       expect(sends).toBe(0);
     },
   );
+});
+
+describe("resolveQuotedTopicRoutingTarget", () => {
+  it("routes a single-topic quote back to its original topic while preserving topic metadata", () => {
+    expect(
+      resolveQuotedTopicRoutingTarget({
+        attachments: [
+          {
+            kind: "quote",
+            id: "q1",
+            text: "Found missing jitter in reconnect backoff.",
+            label: "Network Lead",
+            topicKey: "task:T-100",
+            taskId: "T-100",
+            rootMessageId: "m-100",
+            sourceMessageId: "rep-1",
+          },
+          { kind: "image", metadata: imageMetadata },
+        ],
+      }),
+    ).toEqual({
+      topicKey: "task:T-100",
+      taskId: "T-100",
+      rootMessageId: "m-100",
+      promptPreview: "Found missing jitter in reconnect backoff.",
+      routeMode: "auto",
+    });
+  });
+
+  it("deduplicates multiple quotes targeting the same topic and merges metadata", () => {
+    expect(
+      resolveQuotedTopicRoutingTarget({
+        attachments: [
+          {
+            kind: "quote",
+            id: "q1",
+            text: "First clue",
+            topicKey: "task:T-100",
+          },
+          {
+            kind: "quote",
+            id: "q-plain",
+            text: "Plain selection without topic",
+          },
+          {
+            kind: "quote",
+            id: "q2",
+            text: "Second clue",
+            topicKey: " task:T-100 ",
+            rootMessageId: "m-100",
+          },
+        ],
+      }),
+    ).toEqual({
+      topicKey: "task:T-100",
+      taskId: "T-100",
+      rootMessageId: "m-100",
+      promptPreview: "First clue",
+      routeMode: "auto",
+    });
+  });
+
+  it("returns null when quotes reference two or more distinct topics (cross-topic coordination)", () => {
+    expect(
+      resolveQuotedTopicRoutingTarget({
+        attachments: [
+          {
+            kind: "quote",
+            id: "q1",
+            text: "Topic A detail",
+            topicKey: "task:T-1",
+            taskId: "T-1",
+            rootMessageId: "m-1",
+          },
+          {
+            kind: "quote",
+            id: "q2",
+            text: "Topic B detail",
+            topicKey: "task:T-2",
+            taskId: "T-2",
+            rootMessageId: "m-2",
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for plain quotes without valid topicKey metadata", () => {
+    expect(
+      resolveQuotedTopicRoutingTarget({
+        attachments: [
+          { kind: "quote", id: "q1", text: "Plain quote" },
+          { kind: "quote", id: "q2", text: "Blank topic", topicKey: "   " },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when an explicit activeReplyTopic is already active", () => {
+    expect(
+      resolveQuotedTopicRoutingTarget({
+        activeReplyTopic: {
+          topicKey: "task:T-active",
+          taskId: "T-active",
+          promptPreview: "Active card",
+          routeMode: "auto",
+        },
+        attachments: [
+          {
+            kind: "quote",
+            id: "q1",
+            text: "From another topic",
+            topicKey: "task:T-100",
+            taskId: "T-100",
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
 });

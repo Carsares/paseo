@@ -58,6 +58,7 @@ const sourceSchema = z.discriminatedUnion("kind", [
     serverId: z.string().min(1).optional(),
     title: z.string().min(1).optional(),
     reportStatus: z.enum(["completed", "blocked"]).optional(),
+    escalateToParent: z.boolean().optional(),
     taskId: z.string().min(1).optional(),
     rootMessageId: z.string().min(1).optional(),
   }),
@@ -806,11 +807,15 @@ export function formatAgentMessage(rawMessage: AgentMessage, recipientId?: strin
     source?.kind === "agent-message" && source.reportStatus
       ? ` report-status="${source.reportStatus}"`
       : "";
+  const escalate =
+    source?.kind === "agent-message" && source.escalateToParent === true
+      ? ' escalate-to-parent="true"'
+      : "";
   const topic =
     source?.kind === "agent-message"
       ? xmlAttr("task-id", source.taskId) + xmlAttr("root-message-id", source.rootMessageId)
       : "";
-  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}${status}${topic}>\n${escapeXml(text)}\n</paseo-system>`;
+  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}${status}${escalate}${topic}>\n${escapeXml(text)}\n</paseo-system>`;
 }
 
 function parsePeerWorkspaceEnvelope(
@@ -876,6 +881,7 @@ export function parseAgentMessage(text: string): AgentMessage | null {
     title: attributes.get("source-agent-title"),
     url: attributes.get("source-url"),
     ...(attributes.has("report-status") ? { reportStatus: attributes.get("report-status") } : {}),
+    ...(attributes.get("escalate-to-parent") === "true" ? { escalateToParent: true } : {}),
     ...(attributes.has("task-id") ? { taskId: attributes.get("task-id") } : {}),
     ...(attributes.has("root-message-id")
       ? { rootMessageId: attributes.get("root-message-id") }
@@ -1130,9 +1136,10 @@ export function projectedPeerMessagePrefix(
 }
 
 function reportMetadata(source: Extract<AgentPromptSource, { kind: "agent-message" }>) {
-  const { reportStatus, taskId, rootMessageId } = source;
+  const { reportStatus, escalateToParent, taskId, rootMessageId } = source;
   return {
     ...(reportStatus ? { reportStatus } : {}),
+    ...(escalateToParent === true ? { escalateToParent: true } : {}),
     ...(taskId ? { taskId } : {}),
     ...(rootMessageId ? { rootMessageId } : {}),
   };

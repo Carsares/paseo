@@ -282,8 +282,11 @@ test("state changes release only ready tasks and keep the legacy inbox independe
   scenario.delivery.flushInbox?.("main");
   expect(heldIds()).toBeUndefined();
   scenario.clock.advance(2_000);
-  await Promise.all([second.dispatched, followup.dispatched]);
-  expect(scenario.dispatch.mock.calls[2]?.[0].messageIds).toEqual(["second", "followup"]);
+  await expect(second.dispatched).resolves.toBe("turn_started");
+  expect(scenario.dispatch.mock.calls[2]?.[0].messageIds).toEqual(["second"]);
+  scenario.clock.advance(2_000);
+  await expect(followup.dispatched).resolves.toBe("turn_started");
+  expect(scenario.dispatch.mock.calls[3]?.[0].messageIds).toEqual(["followup"]);
   await scenario.delivery.close();
 });
 
@@ -321,7 +324,14 @@ test.each(["ordinary", "urgent"] as const)(
 
     scenario.delivery.flushInbox?.("main");
     scenario.clock.advance(2_000);
-    await Promise.all([second.dispatched, legacy.dispatched]);
+    await expect(second.dispatched).resolves.toBe("turn_started");
+    scenario.clock.advance(2_000);
+    await expect(legacy.dispatched).resolves.toBe("turn_started");
+    expect(scenario.dispatch.mock.calls.map(([batch]) => batch.messageIds)).toEqual([
+      ["first", "worker-a"],
+      ["second"],
+      ["legacy"],
+    ]);
     await scenario.delivery.close();
   },
 );
@@ -3630,5 +3640,226 @@ test("peer-marked prompt without handoff hitting outcome-unknown concurrently wi
   } finally {
     await delivery.close();
     resetInMemoryPeerDispatchStateForTest();
+  }
+});
+
+test("quiet window batches only messages with the same normalized topic key and splits different or unscoped topics", async () => {
+  const clock = createClock();
+  const batches: Array<readonly string[]> = [];
+  let running = false;
+  const listeners = new Set<(recipientId: string) => void>();
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => running,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    dispatch: async (request) => {
+      batches.push(request.messageIds);
+      running = true;
+      return "turn_started";
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  const endTurn = async () => {
+    running = false;
+    for (const listener of listeners) listener("main");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+
+  try {
+    const r1 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "task-a-1",
+      source: { kind: "agent-message", agentId: "child-1", taskId: "task-a" },
+      prompt: "Task A update 1",
+    });
+    const r2 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "task-a-2",
+      source: { kind: "agent-message", agentId: "child-2", taskId: "task-a" },
+      prompt: "Task A update 2",
+    });
+    const r3 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "task-b-1",
+      source: { kind: "agent-message", agentId: "child-3", taskId: "task-b" },
+      prompt: "Task B update",
+    });
+    const r4 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "msg-root-1",
+      source: { kind: "agent-message", agentId: "child-4", rootMessageId: "root-1" },
+      prompt: "Root 1 update",
+    });
+    const r5 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "unscoped-1",
+      source: { kind: "agent-message", agentId: "child-5" },
+      prompt: "Unscoped update",
+    });
+    const r6 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "peer-1",
+      source: {
+        kind: "peer-workspace-message",
+        agentId: "peer-a",
+        sourceWorkspaceId: "ws-a",
+        targetWorkspaceId: "ws-main",
+        correlationId: "corr-1",
+        intent: "query",
+        hop: 1,
+        maxHops: 2,
+        expectReply: false,
+      },
+      prompt: "Peer corr 1",
+    });
+    const r7 = delivery.enqueue({
+      recipientId: "main",
+      messageId: "peer-2",
+      source: {
+        kind: "peer-workspace-message",
+        agentId: "peer-b",
+        sourceWorkspaceId: "ws-b",
+        targetWorkspaceId: "ws-main",
+        correlationId: "corr-2",
+        intent: "query",
+        hop: 1,
+        maxHops: 2,
+        expectReply: false,
+      },
+      prompt: "Peer corr 2",
+    });
+
+    clock.advance(2_000);
+    await Promise.all([r1.dispatched, r2.dispatched]);
+    expect(batches).toEqual([["task-a-1", "task-a-2"]]);
+
+    await endTurn();
+    await expect(r3.dispatched).resolves.toBe("turn_started");
+    expect(batches).toEqual([["task-a-1", "task-a-2"], ["task-b-1"]]);
+
+    await endTurn();
+    await expect(r4.dispatched).resolves.toBe("turn_started");
+    await endTurn();
+    await expect(r5.dispatched).resolves.toBe("turn_started");
+    await endTurn();
+    await expect(r6.dispatched).resolves.toBe("turn_started");
+    await endTurn();
+    await expect(r7.dispatched).resolves.toBe("turn_started");
+
+    expect(batches).toEqual([
+      ["task-a-1", "task-a-2"],
+      ["task-b-1"],
+      ["msg-root-1"],
+      ["unscoped-1"],
+      ["peer-1"],
+      ["peer-2"],
+    ]);
+  } finally {
+    await delivery.close();
+  }
+});
+
+test("sendDirect never lets sourced system or subagent messages ride a human prompt when isolated or topic-scoped", async () => {
+  const clock = createClock();
+  let running = false;
+  const listeners = new Set<(recipientId: string) => void>();
+  const dispatched: Array<readonly string[]> = [];
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => running,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    dispatch: async (request) => {
+      dispatched.push(request.messageIds);
+      running = true;
+      return "turn_started";
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  const endTurn = async () => {
+    running = false;
+    for (const listener of listeners) listener("main");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+
+  try {
+    // 1. Main Control direct human prompt blocks even unscoped agent-message riders via isolateFromSourcedRiders.
+    const unscoped = delivery.enqueue({
+      recipientId: "main",
+      messageId: "subagent-msg",
+      source: { kind: "agent-message", agentId: "child-1" },
+      prompt: "Background note",
+    });
+    const receivedPrompts: AgentPromptInput[] = [];
+    const directResult = await delivery.sendDirect(
+      {
+        recipientId: "main",
+        prompt: "Brand new human question",
+        messageId: "human-1",
+        isolateFromSourcedRiders: true,
+      },
+      async (joined) => {
+        receivedPrompts.push(joined.prompt);
+        running = true;
+        return { disposition: "turn_started", started: Promise.resolve() };
+      },
+    );
+    expect(directResult.disposition).toBe("turn_started");
+    expect(receivedPrompts).toEqual(["Brand new human question"]);
+    expect(dispatched).toEqual([]);
+
+    // The blocked message remains queued and delivers in its own turn after the human turn ends.
+    clock.advance(2_000);
+    await endTurn();
+    await expect(unscoped.dispatched).resolves.toBe("turn_started");
+    expect(dispatched).toEqual([["subagent-msg"]]);
+    await endTurn();
+
+    // 2. Topic-scoped messages and change-request updates never ride any human prompt even without isolateFromSourcedRiders.
+    const topicReport = delivery.enqueue({
+      recipientId: "main",
+      messageId: "topic-report",
+      source: {
+        kind: "agent-message",
+        agentId: "child-2",
+        taskId: "task-42",
+        rootMessageId: "root-42",
+      },
+      prompt: "Task 42 done",
+    });
+    const prUpdate = delivery.enqueue({
+      recipientId: "main",
+      messageId: "pr-update",
+      source: { kind: "change-request-update", url: "https://github.com/org/repo/pull/9" },
+      prompt: "CI passed",
+    });
+    const receivedPrompts2: AgentPromptInput[] = [];
+    await delivery.sendDirect(
+      { recipientId: "main", prompt: "Second human question", messageId: "human-2" },
+      async (joined) => {
+        receivedPrompts2.push(joined.prompt);
+        running = true;
+        return { disposition: "turn_started", started: Promise.resolve() };
+      },
+    );
+    expect(receivedPrompts2).toEqual(["Second human question"]);
+
+    clock.advance(2_000);
+    await endTurn();
+    await expect(topicReport.dispatched).resolves.toBe("turn_started");
+    await endTurn();
+    await expect(prUpdate.dispatched).resolves.toBe("turn_started");
+    expect(dispatched).toEqual([["subagent-msg"], ["topic-report"], ["pr-update"]]);
+  } finally {
+    await delivery.close();
   }
 });

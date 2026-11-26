@@ -374,3 +374,88 @@ test("persists one silent report per source message across concurrent stores and
     reopened.appendReportEntry({ ...report, topicKey: "task:else", taskId: "else" }),
   ).rejects.toThrow("already used");
 });
+
+test("records, deduplicates, moves, and preserves attributedMessages across attach, merge, and promotion", async () => {
+  const scope = { workspaceId: followup.workspaceId, mainAgentId: followup.mainAgentId };
+  await store.upsertAnchor({
+    ...scope,
+    topicKey: "task:alpha",
+    taskId: "alpha",
+    rootMessageId: "root-alpha",
+    rootPromptText: "Build alpha",
+    title: "Alpha",
+  });
+
+  // Attach unscoped follow-up messages to an existing task anchor idempotently.
+  const firstAttach = await store.recordMessageAttributions({
+    ...scope,
+    sourceMessageIds: ["m-2", "m-2", "m-3"],
+    targetTopicKey: "task:alpha",
+  });
+  expect(firstAttach.mode).toBe("attach");
+  expect(firstAttach.attributedMessageIds).toEqual(["m-2", "m-3"]);
+  expect(firstAttach.anchor.attributedMessages).toEqual([
+    { sourceMessageId: "m-2", mode: "attach", attributedAt: expect.any(String) },
+    { sourceMessageId: "m-3", mode: "attach", attributedAt: expect.any(String) },
+  ]);
+
+  const repeatAttach = await store.recordMessageAttributions({
+    ...scope,
+    sourceMessageIds: ["m-2"],
+    targetTaskId: "alpha",
+  });
+  expect(repeatAttach.anchor.attributedMessages).toEqual(firstAttach.anchor.attributedMessages);
+
+  // Merge multiple unscoped messages into a new msg: anchor with title.
+  const merged = await store.recordMessageAttributions({
+    ...scope,
+    sourceMessageIds: ["m-10", "m-11", "m-12"],
+    mode: "merge",
+    title: "Merged topic",
+    rootPromptText: "First merged message",
+  });
+  expect(merged.mode).toBe("merge");
+  expect(merged.anchor).toMatchObject({
+    topicKey: "msg:m-10",
+    rootMessageId: "m-10",
+    title: "Merged topic",
+    rootPromptText: "First merged message",
+  });
+  expect(merged.attributedMessageIds).toEqual(["m-11", "m-12"]);
+  expect(merged.anchor.attributedMessages).toEqual([
+    { sourceMessageId: "m-11", mode: "merge", attributedAt: expect.any(String) },
+    { sourceMessageId: "m-12", mode: "merge", attributedAt: expect.any(String) },
+  ]);
+
+  // Promoting msg:m-10 -> task:beta preserves attributedMessages.
+  const promoted = await store.upsertAnchor({
+    ...scope,
+    topicKey: "task:beta",
+    taskId: "beta",
+    rootMessageId: "m-10",
+    rootPromptText: "First merged message",
+    title: "Beta",
+  });
+  expect(promoted.attributedMessages).toEqual(merged.anchor.attributedMessages);
+
+  // Moving m-3 from task:alpha to msg:m-10 follows the promoted task:beta anchor and removes it from alpha.
+  const moved = await store.recordMessageAttributions({
+    ...scope,
+    sourceMessageIds: ["m-3"],
+    targetRootMessageId: "m-10",
+  });
+  expect(moved.anchor.topicKey).toBe("task:beta");
+  expect(moved.updatedAnchors.map((anchor) => anchor.topicKey)).toEqual([
+    "task:alpha",
+    "task:beta",
+  ]);
+  const snapshot = await new TopicThreadStore(home).listWithAnchors(scope);
+  const alphaAnchor = snapshot.anchors.find((anchor) => anchor.topicKey === "task:alpha");
+  const betaAnchor = snapshot.anchors.find((anchor) => anchor.topicKey === "task:beta");
+  expect(alphaAnchor?.attributedMessages?.map((entry) => entry.sourceMessageId)).toEqual(["m-2"]);
+  expect(betaAnchor?.attributedMessages?.map((entry) => entry.sourceMessageId)).toEqual([
+    "m-11",
+    "m-12",
+    "m-3",
+  ]);
+});

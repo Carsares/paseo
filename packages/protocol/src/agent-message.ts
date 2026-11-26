@@ -12,6 +12,7 @@ export const AgentMessageSchema = z.object({
   }),
   text: z.string(),
   reportStatus: AgentReportStatusSchema.optional(),
+  escalateToParent: z.boolean().optional(),
   taskId: z.string().min(1).optional(),
   rootMessageId: z.string().min(1).optional(),
 });

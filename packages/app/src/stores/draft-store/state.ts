@@ -1,4 +1,4 @@
-import { normalizeQuoteText } from "@/attachments/quote";
+import { normalizeQuoteText, normalizeQuoteTopicMetadata } from "@/attachments/quote";
 import {
   NEW_WORKSPACE_PICKER_ATTACHMENT_OWNER,
   type AttachmentMetadata,
@@ -97,6 +97,10 @@ export const QuoteComposerAttachmentSchema = z.strictObject({
   id: z.string(),
   text: z.string(),
   label: z.string().optional(),
+  topicKey: z.string().optional(),
+  rootMessageId: z.string().optional(),
+  taskId: z.string().optional(),
+  sourceMessageId: z.string().optional(),
 });
 export const UserComposerAttachmentSchema: z.ZodType<UserComposerAttachment> = z.discriminatedUnion(
   "kind",
@@ -181,6 +185,7 @@ export function normalizeComposerAttachment(
       id: attachment.id,
       text: normalizeQuoteText(attachment.text),
       ...(attachment.label ? { label: attachment.label } : {}),
+      ...normalizeQuoteTopicMetadata(attachment),
     };
   }
   if (attachment.kind === "image") {

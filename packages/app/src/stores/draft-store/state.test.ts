@@ -111,6 +111,45 @@ describe("draft-store normalization", () => {
     });
   });
 
+  it("preserves optional topic source metadata on persisted quote attachments", () => {
+    expect(
+      toDraftInputIfReady({
+        input: {
+          text: "Follow up",
+          attachments: [
+            {
+              kind: "quote",
+              id: "q-topic",
+              text: "Quoted from topic",
+              label: "Lead",
+              topicKey: " task:T-7 ",
+              taskId: " T-7 ",
+              rootMessageId: " m-7 ",
+              sourceMessageId: " r-7 ",
+            },
+          ],
+        },
+        lifecycle: "active",
+        updatedAt: 1,
+        version: 1,
+      }),
+    ).toEqual({
+      text: "Follow up",
+      attachments: [
+        {
+          kind: "quote",
+          id: "q-topic",
+          text: "Quoted from topic",
+          label: "Lead",
+          topicKey: "task:T-7",
+          taskId: "T-7",
+          rootMessageId: "m-7",
+          sourceMessageId: "r-7",
+        },
+      ],
+    });
+  });
+
   it("rejects malformed persisted quote attachments", () => {
     expect(
       UserComposerAttachmentSchema.safeParse({ kind: "quote", id: "q1", text: null }).success,

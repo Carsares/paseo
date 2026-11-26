@@ -373,7 +373,12 @@ describe("TopicStreamList & read-watermark integration", () => {
         </QueryClientProvider>,
       );
       fireEvent.click(await screen.findByTestId("topic-reply-quote-a-1"));
-      const attachment = { kind: "quote", text: expect.stringContaining("Investigating now") };
+      const attachment = {
+        kind: "quote",
+        text: expect.stringContaining("Investigating now"),
+        topicKey: "msg:m-1",
+        rootMessageId: "m-1",
+      };
       try {
         const topicState = useTopicStreamViewStore.getState();
         expect(topicState.inlineReplyDrafts[siblingDraftKey]).toBeUndefined();
@@ -2154,5 +2159,101 @@ describe("TopicStreamList & read-watermark integration", () => {
     expect(useTeamDirectoryViewStore.getState().activeTab).toBe("todos");
     expect(toggleDirectory).toHaveBeenCalledTimes(1);
     expect(decideWorkspaceTopic).not.toHaveBeenCalled();
+  });
+
+  it("renders a lightweight redirect strip for attributed bottom-bar prompts and scrolls to the target topic card on click", () => {
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: true,
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const agentKey = buildTopicAgentKey(SERVER_ID, MAIN_AGENT_ID);
+    qc.setQueryData(workspaceTopicAnchorsQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), [
+      {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-orig",
+        taskId: "T-orig",
+        rootMessageId: "m-orig",
+        rootPromptText: "Original database migration",
+        title: "DB migration",
+        attributedMessages: [
+          {
+            sourceMessageId: "m-extra",
+            mode: "attach",
+            attributedAt: "2026-06-01T00:00:05.000Z",
+          },
+        ],
+        createdAt: "2026-06-01T00:00:01.000Z",
+        updatedAt: "2026-06-01T00:00:05.000Z",
+      },
+    ]);
+    qc.setQueryData(workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), []);
+
+    const streamItems: StreamItem[] = [
+      {
+        kind: "user_message",
+        id: "u-orig",
+        messageId: "m-orig",
+        text: "Original database migration",
+        timestamp: new Date(1_000),
+        timelineCursor: { epoch: "ep-1", seq: 1 },
+      },
+      {
+        kind: "user_message",
+        id: "u-extra",
+        messageId: "m-extra",
+        text: "Also add rollback index",
+        timestamp: new Date(5_000),
+        timelineCursor: { epoch: "ep-1", seq: 2 },
+      },
+      {
+        kind: "assistant_message",
+        id: "a-extra",
+        messageId: "a-extra",
+        topicKey: "task:T-orig",
+        taskId: "T-orig",
+        rootMessageId: "m-orig",
+        text: "Added rollback index to the migration.",
+        timestamp: new Date(6_000),
+        timelineCursor: { epoch: "ep-1", seq: 3 },
+      },
+    ];
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={streamItems}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    const origCard = screen.getByTestId("topic-thread-card-task:T-orig");
+    expect(origCard.textContent).toContain("Also add rollback index");
+    expect(origCard.textContent).toContain("Added rollback index to the migration.");
+
+    expect(screen.getByTestId("topic-redirect-card-msg:m-extra")).toBeTruthy();
+    expect(screen.queryByTestId("topic-thread-card-msg:m-extra")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("topic-redirect-jump-msg:m-extra"));
+    expect(useTopicStreamViewStore.getState().pendingScrollTopicByAgentKey[agentKey]).toMatchObject(
+      {
+        topicKey: "task:T-orig",
+        taskId: "T-orig",
+        rootMessageId: "m-orig",
+        highlight: true,
+      },
+    );
   });
 });

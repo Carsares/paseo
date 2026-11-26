@@ -15,12 +15,14 @@ interface MainControlWakeupCheck {
   topicMainMatches: boolean;
   explicit: boolean;
   status: string | undefined;
+  escalateToParent?: boolean;
   childAgentId: string;
   childServerId: string;
   localServerId: string;
   childLabels?: Record<string, string>;
   task: Readonly<WorkspaceTask> | null | undefined;
   tasks: readonly Readonly<WorkspaceTask>[];
+  rootMessageId?: string;
   shouldHoldInbox: boolean;
   hasBufferedTaskReports: boolean;
   summary: string;
@@ -29,23 +31,40 @@ interface MainControlWakeupCheck {
 }
 
 export function shouldBypassMainControlWakeup(check: MainControlWakeupCheck): boolean {
-  if (!isExplicitTopicMainReport(check)) return false;
-  if (check.status !== "completed" || check.sourceKind === "peer-workspace-message") return false;
+  if (!isEligibleBypassCandidate(check)) return false;
   const { task } = check;
-  if (!task || !isActiveWorkspaceTask(task) || task.leadAgentId !== check.childAgentId)
-    return false;
-  if ((task.leadServerId ?? check.localServerId) !== check.childServerId) return false;
-  if (
-    task.status === "awaiting_decision" ||
-    task.status === "verifying" ||
-    task.blockingQuestion?.trim()
-  )
-    return false;
+  if (!task) {
+    return (
+      check.status === "completed" &&
+      Boolean(check.rootMessageId?.trim()) &&
+      !hasUnscopedReportFileConflict(check)
+    );
+  }
+  return canBypassTaskReport(task, check);
+}
+
+function isEligibleBypassCandidate(check: MainControlWakeupCheck): boolean {
+  if (!isExplicitTopicMainReport(check)) return false;
+  if (check.sourceKind === "peer-workspace-message") return false;
+  if (check.status !== "completed" && check.status !== "blocked") return false;
   if (check.shouldHoldInbox || check.hasBufferedTaskReports) return false;
-  if (hasResidentInboxBypass(check.childLabels) || /@主控|@main\b/iu.test(check.summary))
-    return false;
-  if (task.closure?.verification?.state === "failed") return false;
-  return !hasReportFileConflict(task, check);
+  return (
+    check.escalateToParent !== true &&
+    !hasResidentInboxBypass(check.childLabels) &&
+    !/@主控|@main\b/iu.test(check.summary)
+  );
+}
+
+function canBypassTaskReport(
+  task: Readonly<WorkspaceTask>,
+  check: MainControlWakeupCheck,
+): boolean {
+  if (!isActiveWorkspaceTask(task) || task.leadAgentId !== check.childAgentId) return false;
+  if ((task.leadServerId ?? check.localServerId) !== check.childServerId) return false;
+  if (hasReportFileConflict(task, check)) return false;
+  if (check.status === "blocked") return true;
+  if (task.status === "awaiting_decision" || task.blockingQuestion?.trim()) return false;
+  return task.closure?.verification?.state !== "failed";
 }
 
 function isExplicitTopicMainReport({
@@ -70,6 +89,14 @@ function hasReportFileConflict(task: Readonly<WorkspaceTask>, check: MainControl
       peer.taskId !== task.taskId &&
       isActiveWorkspaceTask(peer) &&
       peer.touchedFiles?.some((path) => paths.has(path)),
+  );
+}
+
+function hasUnscopedReportFileConflict(check: MainControlWakeupCheck) {
+  const paths = new Set(mergeTouchedFiles([], check.touchedFiles ?? []));
+  if (paths.size === 0) return false;
+  return check.tasks.some(
+    (peer) => isActiveWorkspaceTask(peer) && peer.touchedFiles?.some((path) => paths.has(path)),
   );
 }
 

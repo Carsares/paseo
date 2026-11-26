@@ -4,6 +4,7 @@ import type {
   AgentProvider,
   AgentTimelineItem,
   JsonValue,
+  TimelineTopicAttribution,
   ToolCallDetail,
   UserMessageForkContext,
 } from "@getpaseo/protocol/agent-types";
@@ -103,6 +104,9 @@ export interface UserMessageItem {
   clientMessageId?: string;
   messageId?: string;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timelineCursor?: TimelinePosition;
   text: string;
   timestamp: Date;
@@ -117,6 +121,9 @@ export interface UserMessageInput {
   clientMessageId?: string;
   messageId?: string;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timelineCursor?: TimelinePosition;
   text: string;
   timestamp: Date;
@@ -124,6 +131,17 @@ export interface UserMessageInput {
   attachments?: AgentAttachment[];
   /** Set when this message's turn ended via `turn_canceled`. */
   turnCanceled?: true;
+}
+
+function pickTopicAttribution(
+  source: TimelineTopicAttribution | undefined,
+): TimelineTopicAttribution {
+  if (!source) return {};
+  return {
+    ...(source.topicKey ? { topicKey: source.topicKey } : {}),
+    ...(source.taskId ? { taskId: source.taskId } : {}),
+    ...(source.rootMessageId ? { rootMessageId: source.rootMessageId } : {}),
+  };
 }
 
 export function createUserMessage(input: UserMessageInput): UserMessageItem {
@@ -137,6 +155,7 @@ export function createUserMessage(input: UserMessageInput): UserMessageItem {
     ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
     ...(input.messageId ? { messageId: input.messageId } : {}),
     ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...pickTopicAttribution(input),
     ...(input.timelineCursor ? { timelineCursor: input.timelineCursor } : {}),
     text: input.text,
     timestamp: input.timestamp,
@@ -314,6 +333,22 @@ function mergeUserMessageAttachments(
   return changed ? enriched : presented;
 }
 
+function isSameUserMessage(existing: UserMessageItem, merged: UserMessageItem): boolean {
+  return (
+    existing.id === merged.id &&
+    existing.clientMessageId === merged.clientMessageId &&
+    existing.messageId === merged.messageId &&
+    existing.topicKey === merged.topicKey &&
+    existing.taskId === merged.taskId &&
+    existing.rootMessageId === merged.rootMessageId &&
+    existing.timelineCursor === merged.timelineCursor &&
+    existing.text === merged.text &&
+    existing.timestamp === merged.timestamp &&
+    existing.images === merged.images &&
+    existing.attachments === merged.attachments
+  );
+}
+
 function produceUserMessage(
   items: StreamItem[],
   incoming: UserMessageItem,
@@ -347,18 +382,12 @@ function produceUserMessage(
     attachments: mergeUserMessageAttachments(presentation.attachments, other.attachments),
     clientMessageId: incoming.clientMessageId ?? existing.clientMessageId,
     messageId: incoming.messageId ?? existing.messageId,
+    topicKey: incoming.topicKey ?? existing.topicKey,
+    taskId: incoming.taskId ?? existing.taskId,
+    rootMessageId: incoming.rootMessageId ?? existing.rootMessageId,
     timelineCursor: incoming.timelineCursor ?? existing.timelineCursor,
   });
-  if (
-    existing.id === merged.id &&
-    existing.clientMessageId === merged.clientMessageId &&
-    existing.messageId === merged.messageId &&
-    existing.timelineCursor === merged.timelineCursor &&
-    existing.text === merged.text &&
-    existing.timestamp === merged.timestamp &&
-    existing.images === merged.images &&
-    existing.attachments === merged.attachments
-  ) {
+  if (isSameUserMessage(existing, merged)) {
     return { items, index, message: existing, matched: true };
   }
   const next = [...items];
@@ -551,6 +580,7 @@ function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): S
       retained.payload.data,
       retained.timestamp,
       retained.timelineCursor,
+      pickTopicAttribution(retained),
     );
     return next;
   }
@@ -795,6 +825,9 @@ export interface AssistantMessageItem {
   id: string;
   messageId?: string;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timelineCursor?: TimelinePosition;
   text: string;
   timestamp: Date;
@@ -817,6 +850,9 @@ export interface ThoughtItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   text: string;
   timestamp: Date;
   status: ThoughtStatus;
@@ -856,6 +892,9 @@ export interface ToolCallItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   payload: ToolCallPayload;
   /** Set when this call carries its turn's footer. */
@@ -886,6 +925,9 @@ export interface NotificationItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   level: NotificationLevel;
   message: string;
@@ -896,6 +938,9 @@ export interface CompactionItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   status: "loading" | "completed";
   trigger?: "auto" | "manual";
@@ -911,6 +956,9 @@ export interface PluginTimelineStreamItem {
   sourceKind?: StreamItem["kind"];
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   pluginId: string;
   pluginItemId: string;
@@ -928,6 +976,9 @@ export interface TurnSummaryItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   /**
    * The prompt the turn folds under, or its first loaded tool call when the prompt is above the
@@ -955,6 +1006,9 @@ export interface TodoListItem {
   id: string;
   timelineCursor?: TimelinePosition;
   turnId?: string;
+  topicKey?: string;
+  taskId?: string;
+  rootMessageId?: string;
   timestamp: Date;
   provider: AgentProvider;
   items: TodoEntry[];
@@ -1017,6 +1071,7 @@ function appendUserMessage(
   timelineCursor?: TimelinePosition,
   turnId?: string,
   forkContext?: UserMessageForkContext,
+  topicAttribution?: TimelineTopicAttribution,
 ): StreamItem[] {
   const { chunk, hasContent } = normalizeChunk(text);
   const attachments = forkContextToChatHistoryAttachments(forkContext);
@@ -1031,6 +1086,7 @@ function appendUserMessage(
     messageId,
     timelineCursor,
     turnId,
+    ...pickTopicAttribution(topicAttribution),
     text: hasContent ? chunk : "",
     timestamp,
     attachments,
@@ -1108,6 +1164,7 @@ function appendThought(
   timestamp: Date,
   timelineCursor?: TimelinePosition,
   turnId?: string,
+  topicAttribution?: TimelineTopicAttribution,
 ): StreamItem[] {
   const { chunk, hasContent } = normalizeChunk(text);
   if (!chunk) {
@@ -1115,9 +1172,12 @@ function appendThought(
   }
 
   const last = state[state.length - 1];
-  if (last && last.kind === "thought" && last.turnId === turnId) {
+  const sameTopicKey =
+    !last?.topicKey || !topicAttribution?.topicKey || last.topicKey === topicAttribution.topicKey;
+  if (last && last.kind === "thought" && last.turnId === turnId && sameTopicKey) {
     const updated: ThoughtItem = {
       ...last,
+      ...pickTopicAttribution(topicAttribution),
       ...(timelineCursor ? { timelineCursor } : {}),
       text: `${last.text}${chunk}`,
       timestamp,
@@ -1134,6 +1194,7 @@ function appendThought(
   const item: ThoughtItem = {
     kind: "thought",
     id: createUniqueTimelineId(state, "thought", idSeed, timestamp),
+    ...pickTopicAttribution(topicAttribution),
     ...(timelineCursor ? { timelineCursor } : {}),
     text: chunk,
     timestamp,
@@ -1287,6 +1348,7 @@ export function mergeAgentToolCallItem(
   data: AgentToolCallData,
   timestamp: Date,
   timelineCursor?: TimelinePosition,
+  topicAttribution?: TimelineTopicAttribution,
 ): AgentToolCallItem {
   const mergedStatus = mergeAgentToolCallStatus(existing.payload.data.status, data.status);
   const mergedError =
@@ -1298,6 +1360,7 @@ export function mergeAgentToolCallItem(
 
   return {
     ...existing,
+    ...pickTopicAttribution(topicAttribution),
     ...(timelineCursor ? { timelineCursor } : {}),
     timestamp,
     payload: {
@@ -1320,10 +1383,11 @@ interface AppendAgentToolCallInput {
   timestamp: Date;
   turnId?: string;
   timelineCursor?: TimelinePosition;
+  topicAttribution?: TimelineTopicAttribution;
 }
 
 function appendAgentToolCall(input: AppendAgentToolCallInput): StreamItem[] {
-  const { state, data, timestamp, turnId, timelineCursor } = input;
+  const { state, data, timestamp, turnId, timelineCursor, topicAttribution } = input;
   const identity = agentToolCallIdentity({ callId: data.callId, turnId });
   const existingIndex = findExistingTimelineIdentityIndex(state, identity);
 
@@ -1332,7 +1396,13 @@ function appendAgentToolCall(input: AppendAgentToolCallInput): StreamItem[] {
     if (!existing || !isAgentToolCallItem(existing)) {
       return state;
     }
-    const merged = mergeAgentToolCallItem(existing, data, timestamp, timelineCursor);
+    const merged = mergeAgentToolCallItem(
+      existing,
+      data,
+      timestamp,
+      timelineCursor,
+      topicAttribution,
+    );
 
     if (
       merged.payload.data.provider === existing.payload.data.provider &&
@@ -1342,6 +1412,9 @@ function appendAgentToolCall(input: AppendAgentToolCallInput): StreamItem[] {
       merged.payload.data.error === existing.payload.data.error &&
       merged.payload.data.detail === existing.payload.data.detail &&
       merged.payload.data.metadata === existing.payload.data.metadata &&
+      merged.topicKey === existing.topicKey &&
+      merged.taskId === existing.taskId &&
+      merged.rootMessageId === existing.rootMessageId &&
       merged.timelineCursor === existing.timelineCursor
     ) {
       return state;
@@ -1357,6 +1430,7 @@ function appendAgentToolCall(input: AppendAgentToolCallInput): StreamItem[] {
     id: `agent_tool_${identity}`,
     ...(timelineCursor ? { timelineCursor } : {}),
     ...(turnId ? { turnId } : {}),
+    ...pickTopicAttribution(topicAttribution),
     timestamp,
     payload: {
       source: "agent",
@@ -1581,6 +1655,7 @@ function reduceTimelineToolCall(
     timestamp,
     timelineCursor,
     turnId: event.turnId,
+    topicAttribution: pickTopicAttribution(event),
   });
 }
 
@@ -1631,6 +1706,7 @@ function reduceTimelineEvent(
   timelineCursor?: TimelinePosition,
 ): StreamItem[] {
   const item = event.item;
+  const topicAttribution = pickTopicAttribution(event);
   switch (item.type) {
     case "user_message":
       return appendUserMessage(
@@ -1643,6 +1719,7 @@ function reduceTimelineEvent(
         timelineCursor,
         event.turnId,
         item.forkContext,
+        topicAttribution,
       );
     case "assistant_message":
       return appendAssistantMessage(
@@ -1655,7 +1732,14 @@ function reduceTimelineEvent(
         timelineCursor,
       );
     case "reasoning":
-      return appendThought(state, item.text, timestamp, timelineCursor, event.turnId);
+      return appendThought(
+        state,
+        item.text,
+        timestamp,
+        timelineCursor,
+        event.turnId,
+        topicAttribution,
+      );
     case "tool_call":
       return reduceTimelineToolCall(state, event, item, timestamp, timelineCursor);
     case "todo": {
@@ -1784,14 +1868,34 @@ function applyTimelineTurnId(
     return reconcileCanonicalUserTurnMembership(items, clientMessageId, event.turnId);
   }
 
-  if (!event.turnId || items === previous) return items;
-  // Assign membership only to rows written by this event, before finalizing
-  // unrelated reasoning rows. Late lifecycle updates can replace an earlier row.
-  return items.map((item, index) =>
-    item === previous[index] || item.turnId === event.turnId
-      ? item
-      : ({ ...item, turnId: event.turnId } as StreamItem),
-  );
+  const topicAttribution = pickTopicAttribution(event);
+  const hasTopicAttribution =
+    topicAttribution.topicKey !== undefined ||
+    topicAttribution.taskId !== undefined ||
+    topicAttribution.rootMessageId !== undefined;
+  if ((!event.turnId && !hasTopicAttribution) || items === previous) return items;
+  // Assign membership and authoritative topic attribution only to rows written
+  // by this event, before finalizing unrelated reasoning rows. Late lifecycle
+  // updates can replace an earlier row.
+  return items.map((item, index) => {
+    if (item === previous[index]) return item;
+    const needsTurnId = event.turnId !== undefined && item.turnId !== event.turnId;
+    const needsTopicKey =
+      topicAttribution.topicKey !== undefined && item.topicKey !== topicAttribution.topicKey;
+    const needsTaskId =
+      topicAttribution.taskId !== undefined && item.taskId !== topicAttribution.taskId;
+    const needsRootMessageId =
+      topicAttribution.rootMessageId !== undefined &&
+      item.rootMessageId !== topicAttribution.rootMessageId;
+    if (!needsTurnId && !needsTopicKey && !needsTaskId && !needsRootMessageId) {
+      return item;
+    }
+    return {
+      ...item,
+      ...(event.turnId ? { turnId: event.turnId } : {}),
+      ...topicAttribution,
+    } as StreamItem;
+  });
 }
 
 function reconcileCanonicalUserTurnMembership(
@@ -2020,10 +2124,11 @@ function createCanonicalUserMessage(input: {
   existing: StreamItem[];
   item: Extract<AgentTimelineItem, { type: "user_message" }>;
   turnId: string | undefined;
+  topicAttribution?: TimelineTopicAttribution;
   timestamp: Date;
   timelineCursor?: TimelinePosition;
 }): { canonical: UserMessageItem; hasRenderableContent: boolean } {
-  const { existing, item, turnId, timestamp, timelineCursor } = input;
+  const { existing, item, turnId, topicAttribution, timestamp, timelineCursor } = input;
   const normalized = normalizeChunk(item.text);
   const attachments = forkContextToChatHistoryAttachments(item.forkContext);
   const canonical = createUserMessage({
@@ -2038,6 +2143,7 @@ function createCanonicalUserMessage(input: {
     messageId: item.messageId,
     clientMessageId: item.clientMessageId,
     turnId,
+    ...pickTopicAttribution(topicAttribution),
     timelineCursor,
     text: normalized.hasContent ? normalized.chunk : "",
     timestamp,
@@ -2066,6 +2172,7 @@ function applyCanonicalUserMessageEvent(params: {
     existing: [...tail, ...head],
     item: event.item,
     turnId: event.turnId,
+    topicAttribution: pickTopicAttribution(event),
     timestamp,
     timelineCursor,
   });

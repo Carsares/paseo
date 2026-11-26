@@ -47,7 +47,7 @@ import {
   type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
 import { decodeParentReportIdentity } from "./agent/finish-subscriptions/report-identity.js";
-import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
+import { TASK_ID_LABEL, TOPIC_ROOT_MESSAGE_ID_LABEL } from "./agent/hierarchy-policy.js";
 import { resolveReportTitle } from "./agent/report-title.js";
 import {
   getParentAddressFromLabels,
@@ -74,7 +74,11 @@ import { CreationService } from "./creation/index.js";
 import { openDurableItemStore } from "./durable-items/requests.js";
 import type { DurableItemStore } from "./durable-items/store.js";
 import { TopicReadStateStore } from "./topic-read-state/store.js";
-import { TopicThreadStore, type TopicTaskBinding } from "./topic-threads/store.js";
+import {
+  TopicThreadStore,
+  type TopicMessageAttributionInput,
+  type TopicTaskBinding,
+} from "./topic-threads/store.js";
 import {
   requireMatchingAnchor,
   TOPIC_ANCHOR_LIMIT,
@@ -647,6 +651,7 @@ function parentReportFingerprint(report: AgentFinishReport): string {
         report.title,
         report.prompt,
         report.event,
+        ...(report.escalateToParent !== undefined ? [report.escalateToParent] : []),
       ]),
     )
     .digest("hex");
@@ -1699,6 +1704,24 @@ export class VoiceAssistantWebSocketServer {
       }),
     );
     return stored;
+  }
+
+  async assignTopicAttribution(input: TopicMessageAttributionInput) {
+    const tasks = await this.taskLedger.list(input.workspaceId);
+    const result = await this.topicThreadStore.recordMessageAttributions(input, undefined, tasks);
+    for (const anchor of result.updatedAnchors) {
+      this.broadcast(
+        wrapSessionMessage({
+          type: "workspace.topic.anchor.updated",
+          payload: {
+            workspaceId: anchor.workspaceId,
+            mainAgentId: anchor.mainAgentId,
+            anchor,
+          },
+        }),
+      );
+    }
+    return result;
   }
 
   listTopicEntries(scope: Parameters<TopicThreadStore["list"]>[0]) {
@@ -3892,17 +3915,29 @@ export class VoiceAssistantWebSocketServer {
 
   private shouldHoldSubagentInbox(
     parentId: string,
-    source?: { kind: string; agentId: string; serverId?: string; taskId?: string },
+    source?: {
+      kind: string;
+      agentId: string;
+      serverId?: string;
+      taskId?: string;
+      rootMessageId?: string;
+    },
   ): boolean {
     const { agentManager, serverId } = this;
     const live = agentManager.getAgent(parentId);
     if (live && !isMainControlAgentLabels(live.labels)) return false;
     const taskId = source?.kind === "agent-message" ? source.taskId || undefined : undefined;
+    const rootMessageId =
+      source?.kind === "agent-message" && !taskId ? source.rootMessageId || undefined : undefined;
     const sourceServerId = source?.serverId ?? serverId;
     return (
       agentManager.listAgents().some((child) => {
         if (source?.agentId === child.id && sourceServerId === serverId) return false;
         if ((child.labels?.[TASK_ID_LABEL] || undefined) !== taskId) return false;
+        if (rootMessageId) {
+          const childRoot = child.labels?.[TOPIC_ROOT_MESSAGE_ID_LABEL] || undefined;
+          if (childRoot && childRoot !== rootMessageId) return false;
+        }
         if (isResidentAgentLabels(child.labels) && hasResidentInboxBypass(child.labels))
           return false;
         const parent = getParentAddressFromLabels(child.labels, serverId);
@@ -4040,6 +4075,24 @@ export class VoiceAssistantWebSocketServer {
     return { childLabels: child?.labels ?? stored?.labels, touchedFiles };
   }
 
+  private async readArchivedLocalTaskParticipants(
+    task: Readonly<WorkspaceTask>,
+    mainAgentId: string,
+    childAgentId: string,
+    childServerId: string,
+  ): Promise<ReadonlySet<string>> {
+    const archived = new Set<string>();
+    for (const participant of task.participants) {
+      if (participant.boundBy !== mainAgentId) continue;
+      const participantServerId = participant.serverId ?? this.serverId;
+      if (participant.agentId === childAgentId && participantServerId === childServerId) continue;
+      if (participantServerId !== this.serverId) continue;
+      const stored = await this.agentStorage.get(participant.agentId);
+      if (stored?.archivedAt) archived.add(participant.agentId);
+    }
+    return archived;
+  }
+
   private async syncTaskFinishReport(input: {
     record: FinishSubscription;
     report: AgentFinishReport;
@@ -4059,12 +4112,18 @@ export class VoiceAssistantWebSocketServer {
     const topicKey = `task:${taskId}`;
     const scope = { workspaceId, mainAgentId };
     const summary = report.prompt.replace(/^Report to parent \((?:completed|blocked)\):\n\n/, "");
-    const { childLabels, touchedFiles } = await this.readReportChild(
-      record,
-      childServerId,
-      workspace.cwd,
-    );
-    const alreadyLanded = (await this.topicThreadStore.list(scope, topicKey)).some(
+    const [{ childLabels, touchedFiles }, archivedLocalParticipants, existingEntries] =
+      await Promise.all([
+        this.readReportChild(record, childServerId, workspace.cwd),
+        this.readArchivedLocalTaskParticipants(
+          task,
+          mainAgentId,
+          record.childAgentId,
+          childServerId,
+        ),
+        this.topicThreadStore.list(scope, topicKey),
+      ]);
+    const alreadyLanded = existingEntries.some(
       (entry) => entry.sourceMessageId === messageId && entry.origin === "subagent_report",
     );
     const source = {
@@ -4076,18 +4135,27 @@ export class VoiceAssistantWebSocketServer {
     const canBypass = (current: Readonly<WorkspaceTask>, tasks: readonly WorkspaceTask[]) =>
       report.event === "finished" &&
       (current.silentReportIds?.length ?? 0) < TASK_PENDING_SILENT_REPORT_LIMIT &&
-      !current.participants.some(
-        (participant) =>
-          participant.boundBy === mainAgentId &&
-          (participant.agentId !== record.childAgentId ||
-            (participant.serverId ?? this.serverId) !== childServerId),
-      ) &&
+      !current.participants.some((participant) => {
+        if (participant.boundBy !== mainAgentId) return false;
+        const participantServerId = participant.serverId ?? this.serverId;
+        if (participant.agentId === record.childAgentId && participantServerId === childServerId) {
+          return false;
+        }
+        if (
+          participantServerId === this.serverId &&
+          archivedLocalParticipants.has(participant.agentId)
+        ) {
+          return false;
+        }
+        return true;
+      }) &&
       shouldBypassMainControlWakeup({
         workspaceId,
         parentAgent: { workspaceId, labels: parentAgent.labels },
         topicMainMatches: true,
         explicit: true,
         status,
+        escalateToParent: report.escalateToParent,
         childAgentId: record.childAgentId,
         childServerId,
         localServerId: this.serverId,
@@ -4150,7 +4218,7 @@ export class VoiceAssistantWebSocketServer {
         authorAgentId: record.childAgentId,
         authorTitle: title,
         sourceMessageId: messageId,
-        reportStatus: "completed",
+        reportStatus: status,
         text: summary,
       });
       this.broadcast(
@@ -4160,10 +4228,148 @@ export class VoiceAssistantWebSocketServer {
         }),
       );
     }
-    if (bypassMainControl) {
+    if (bypassMainControl && status === "completed") {
       await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
     }
     return bypassMainControl;
+  }
+
+  private async readRootPromptTextFromMain(
+    mainAgentId: string,
+    rootMessageId: string,
+  ): Promise<string> {
+    const rows = await this.agentManager.getTimelineRows(mainAgentId).catch(() => []);
+    const found = rows.find(
+      ({ item }) =>
+        item.type === "user_message" &&
+        (item.messageId === rootMessageId || item.clientMessageId === rootMessageId),
+    )?.item;
+    return found?.type === "user_message" ? found.text : "";
+  }
+
+  private async syncLightweightTopicFinishReport(input: {
+    record: FinishSubscription;
+    report: AgentFinishReport;
+    childServerId: string;
+    messageId: string;
+    rootMessageId: string;
+    title?: string;
+  }): Promise<boolean> {
+    const { record, report, childServerId, messageId, rootMessageId, title } = input;
+    if (
+      report.event !== "finished" ||
+      report.parentReportStatus !== "completed" ||
+      this.featureOverrides.workspaceButlerV1 === false
+    ) {
+      return false;
+    }
+    const mainAgentId = record.callerAgentId;
+    const storedParent = await this.agentStorage.get(mainAgentId);
+    const parentAgent = this.agentManager.getAgent(mainAgentId) ?? storedParent;
+    const workspaceId = parentAgent?.workspaceId;
+    if (!workspaceId || storedParent?.archivedAt || !isMainControlAgentLabels(parentAgent.labels)) {
+      return false;
+    }
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    if (!workspace?.topic || workspace.archivedAt) return false;
+
+    const topicKey = `msg:${rootMessageId}`;
+    const scope = { workspaceId, mainAgentId };
+    const summary = report.prompt.replace(/^Report to parent \((?:completed|blocked)\):\n\n/, "");
+    const [{ childLabels, touchedFiles }, tasks, snapshot] = await Promise.all([
+      this.readReportChild(record, childServerId, workspace.cwd),
+      this.taskLedger.list(workspaceId),
+      this.topicThreadStore.listWithAnchors(scope, topicKey),
+    ]);
+    const alreadyLanded = snapshot.entries.some(
+      (entry) => entry.sourceMessageId === messageId && entry.origin === "subagent_report",
+    );
+    if (alreadyLanded) {
+      await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
+      return true;
+    }
+    if (tasks.some((task) => task.rootMessageId === rootMessageId && isActiveWorkspaceTask(task))) {
+      return false;
+    }
+    const source = {
+      kind: "agent-message",
+      agentId: record.childAgentId,
+      serverId: childServerId,
+      rootMessageId,
+    };
+    const bypassAllowed = shouldBypassMainControlWakeup({
+      workspaceId,
+      parentAgent: { workspaceId, labels: parentAgent.labels },
+      topicMainMatches: true,
+      explicit: true,
+      status: "completed",
+      escalateToParent: report.escalateToParent,
+      childAgentId: record.childAgentId,
+      childServerId,
+      localServerId: this.serverId,
+      childLabels,
+      task: null,
+      tasks,
+      rootMessageId,
+      shouldHoldInbox: this.shouldHoldSubagentInbox(mainAgentId, source),
+      hasBufferedTaskReports: this.agentMessages.hasPendingTopicReport(
+        mainAgentId,
+        rootMessageId,
+        messageId,
+      ),
+      summary,
+      touchedFiles,
+      sourceKind: source.kind,
+    });
+    if (!bypassAllowed) return false;
+
+    let hasPendingDurableDecision = false;
+    await this.durableItems.withPendingWorkspaceItems(
+      { workspaceId, serverId: this.serverId },
+      async (items) => {
+        hasPendingDurableDecision = items.some(
+          (item) =>
+            (item.kind === "acceptance" || item.kind === "decision") && item.topicKey === topicKey,
+        );
+      },
+    );
+    if (hasPendingDurableDecision) return false;
+
+    const existingAnchor = snapshot.anchors.find((anchor) => anchor.topicKey === topicKey);
+    if (!existingAnchor) {
+      const rootPromptText = await this.readRootPromptTextFromMain(mainAgentId, rootMessageId);
+      await this.persistTopicAnchor(
+        {
+          ...scope,
+          topicKey,
+          rootMessageId,
+          rootPromptText,
+          leadAgentId: record.childAgentId,
+          leadServerId: childServerId,
+          ...(title ? { leadTitle: title } : {}),
+        },
+        tasks,
+      );
+    }
+
+    const { entry } = await this.topicThreadStore.appendReportEntry({
+      ...scope,
+      topicKey,
+      rootMessageId,
+      authorAgentId: record.childAgentId,
+      authorTitle: title,
+      sourceMessageId: messageId,
+      reportStatus: "completed",
+      text: summary,
+    });
+    this.broadcast(
+      wrapSessionMessage({
+        type: "workspace.topic.thread.updated",
+        payload: { ...scope, entry },
+      }),
+    );
+    await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
+    return true;
   }
 
   private isRemoteFinishedSuperseded(
@@ -4202,29 +4408,46 @@ export class VoiceAssistantWebSocketServer {
   private async finalizeSilentTaskReport(
     mainAgentId: string,
     taskId: string | undefined,
+    rootMessageId: string | undefined,
     messageId: string,
     report: AgentFinishReport,
     silentDelivery: boolean,
   ): Promise<void> {
-    if (!taskId || report.parentReportStatus !== "completed") return;
+    if (report.parentReportStatus !== "completed") return;
+    if (!taskId && !rootMessageId) return;
     const workspaceId =
       this.agentManager.getAgent(mainAgentId)?.workspaceId ??
       (await this.agentStorage.get(mainAgentId))?.workspaceId;
     if (!workspaceId) return;
-    // The ledger marker survives an interruption after the report receipt commits.
-    const pending =
-      silentDelivery ||
-      (await this.taskLedger.list(workspaceId)).some(
-        (task) => task.taskId === taskId && task.silentReportIds?.includes(messageId),
+    if (taskId) {
+      // The ledger marker survives an interruption after the report receipt commits.
+      const pending =
+        silentDelivery ||
+        (await this.taskLedger.list(workspaceId)).some(
+          (task) => task.taskId === taskId && task.silentReportIds?.includes(messageId),
+        );
+      if (!pending) return;
+      await this.sendSilentTaskNotificationOnce(
+        mainAgentId,
+        `task:${taskId}`,
+        messageId,
+        report.prompt,
       );
-    if (!pending) return;
-    await this.sendSilentTaskNotificationOnce(mainAgentId, taskId, messageId, report.prompt);
-    await this.taskLedger.acknowledgeSilentReport(workspaceId, taskId, messageId);
+      await this.taskLedger.acknowledgeSilentReport(workspaceId, taskId, messageId);
+      return;
+    }
+    if (!silentDelivery || !rootMessageId) return;
+    await this.sendSilentTaskNotificationOnce(
+      mainAgentId,
+      `msg:${rootMessageId}`,
+      messageId,
+      report.prompt,
+    );
   }
 
   private async sendSilentTaskNotificationOnce(
     mainAgentId: string,
-    taskId: string,
+    topicKey: string,
     messageId: string,
     prompt: string,
   ): Promise<void> {
@@ -4234,7 +4457,7 @@ export class VoiceAssistantWebSocketServer {
       request: { messageId },
       // Keep the successful send in memory if committing its receipt fails.
       retryIfUnsent: () => false,
-      send: () => this.notifySilentTeamConclusion(mainAgentId, taskId, prompt),
+      send: () => this.notifySilentTeamConclusion(mainAgentId, topicKey, prompt),
     });
   }
 
@@ -4270,6 +4493,95 @@ export class VoiceAssistantWebSocketServer {
       reportIdentity.id,
       report.parentReportStatus,
     );
+  }
+
+  private resolveSilentReportTopicKey(
+    report: AgentFinishReport,
+    taskId: string | undefined,
+    rootMessageId: string | undefined,
+  ): string | undefined {
+    if (!report.parentReportStatus) return undefined;
+    if (taskId) return `task:${taskId}`;
+    if (rootMessageId && report.parentReportStatus === "completed") return `msg:${rootMessageId}`;
+    return undefined;
+  }
+
+  private async tryHandleSilentFinishReport(input: {
+    record: FinishSubscription;
+    report: AgentFinishReport;
+    childServerId: string;
+    messageId: string;
+    taskId: string | undefined;
+    rootMessageId: string | undefined;
+    title: string | undefined;
+    reportedAt: string | undefined;
+  }): Promise<boolean> {
+    const { record, report, childServerId, messageId, taskId, rootMessageId, title, reportedAt } =
+      input;
+    if (report.parentReportStatus === undefined) return false;
+    let handledSilently = false;
+    if (taskId) {
+      handledSilently = await this.syncTaskFinishReport({
+        record,
+        report,
+        childServerId,
+        messageId,
+        taskId,
+        rootMessageId,
+        title,
+      });
+    } else if (rootMessageId && report.parentReportStatus === "completed") {
+      handledSilently = await this.syncLightweightTopicFinishReport({
+        record,
+        report,
+        childServerId,
+        messageId,
+        rootMessageId,
+        title,
+      });
+    }
+    if (handledSilently && report.parentReportStatus === "blocked" && reportedAt) {
+      await this.agentManager.notifyPersistedBlockedSubagentReport(
+        record.callerAgentId,
+        JSON.stringify([
+          childServerId,
+          record.childAgentId,
+          decodeParentReportIdentity(report.id).id,
+        ]),
+        reportedAt,
+      );
+    }
+    return handledSilently;
+  }
+
+  private buildFinishReportSource(input: {
+    record: FinishSubscription;
+    report: AgentFinishReport;
+    childServerId: string;
+    title: string | undefined;
+    taskId: string | undefined;
+    rootMessageId: string | undefined;
+  }) {
+    const { record, report, childServerId, title, taskId, rootMessageId } = input;
+    if (report.parentReportStatus !== undefined) {
+      return {
+        kind: "agent-message" as const,
+        agentId: record.childAgentId,
+        serverId: childServerId,
+        ...(title ? { title } : {}),
+        reportStatus: report.parentReportStatus,
+        ...(report.escalateToParent === true ? { escalateToParent: true } : {}),
+        ...(taskId ? { taskId } : {}),
+        ...(rootMessageId ? { rootMessageId } : {}),
+      };
+    }
+    return {
+      kind: "agent-notification" as const,
+      agentId: record.childAgentId,
+      serverId: record.serverId,
+      ...(title ? { title } : {}),
+      event: report.event,
+    };
   }
 
   async dispatchFinishReport(
@@ -4312,49 +4624,43 @@ export class VoiceAssistantWebSocketServer {
     const reportIdentity = explicit ? decodeParentReportIdentity(report.id) : undefined;
     const taskId = record.taskId ?? reportIdentity?.taskId;
     const rootMessageId = record.rootMessageId ?? reportIdentity?.rootMessageId;
-    const source = explicit
-      ? ({
-          kind: "agent-message",
-          agentId: record.childAgentId,
-          serverId: childServerId,
-          ...(title ? { title } : {}),
-          reportStatus: report.parentReportStatus,
-          ...(taskId ? { taskId } : {}),
-          ...(rootMessageId ? { rootMessageId } : {}),
-        } as const)
-      : ({
-          kind: "agent-notification",
-          agentId: record.childAgentId,
-          serverId: record.serverId,
-          ...(title ? { title } : {}),
-          event: report.event,
-        } as const);
+    const source = this.buildFinishReportSource({
+      record,
+      report,
+      childServerId,
+      title,
+      taskId,
+      rootMessageId,
+    });
     let silentDelivery = false;
     await receipts.send({
       agentId: record.callerAgentId,
       messageId,
       confirmPendingSilentDelivery: async () => {
-        if (!taskId || !explicit || report.parentReportStatus !== "completed") return false;
+        const topicKey = this.resolveSilentReportTopicKey(report, taskId, rootMessageId);
+        if (!topicKey) return false;
         const mainAgentId = record.callerAgentId;
         const stored = await this.agentStorage.get(mainAgentId);
         const workspaceId =
           stored?.workspaceId ?? this.agentManager.getAgent(mainAgentId)?.workspaceId;
         if (!workspaceId) return false;
-        const entries = await this.topicThreadStore.list(
-          { workspaceId, mainAgentId },
-          `task:${taskId}`,
-        );
+        const entries = await this.topicThreadStore.list({ workspaceId, mainAgentId }, topicKey);
         silentDelivery = entries.some(
           (entry) =>
             entry.sourceMessageId === messageId &&
             entry.origin === "subagent_report" &&
-            entry.reportStatus === "completed" &&
+            entry.reportStatus === report.parentReportStatus &&
             entry.authorAgentId === record.childAgentId,
         );
-        if (silentDelivery) {
+        if (silentDelivery && report.parentReportStatus === "completed") {
           await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
           // Legacy pending receipts may lack a ledger marker. Notify before committing them.
-          await this.sendSilentTaskNotificationOnce(mainAgentId, taskId, messageId, report.prompt);
+          await this.sendSilentTaskNotificationOnce(
+            mainAgentId,
+            topicKey,
+            messageId,
+            report.prompt,
+          );
         }
         return silentDelivery;
       },
@@ -4387,9 +4693,7 @@ export class VoiceAssistantWebSocketServer {
           await this.applyRemoteReportSupersession(record, report.id);
         await this.recordDelegationReport(record, report, childServerId, taskId, rootMessageId);
         if (
-          taskId &&
-          explicit &&
-          (await this.syncTaskFinishReport({
+          await this.tryHandleSilentFinishReport({
             record,
             report,
             childServerId,
@@ -4397,7 +4701,8 @@ export class VoiceAssistantWebSocketServer {
             taskId,
             rootMessageId,
             title,
-          }))
+            reportedAt,
+          })
         ) {
           // There is no provider handoff to mark pending. All silent effects are already durable.
           silentDelivery = true;
@@ -4448,6 +4753,7 @@ export class VoiceAssistantWebSocketServer {
     await this.finalizeSilentTaskReport(
       record.callerAgentId,
       taskId,
+      rootMessageId,
       messageId,
       report,
       silentDelivery,
@@ -5003,7 +5309,7 @@ export class VoiceAssistantWebSocketServer {
 
   private async notifySilentTeamConclusion(
     agentId: string,
-    taskId: string,
+    topicKey: string,
     prompt: string,
   ): Promise<void> {
     const stored = await this.agentStorage.get(agentId);
@@ -5015,7 +5321,7 @@ export class VoiceAssistantWebSocketServer {
       attentionTimestamp: stored.attentionTimestamp ? new Date(stored.attentionTimestamp) : null,
       teamConclusion: {
         workspaceId: stored.workspaceId,
-        topicKey: `task:${taskId}`,
+        topicKey,
         summary: prompt.replace(/^Report to parent \(completed\):\n\n/, ""),
       },
     });

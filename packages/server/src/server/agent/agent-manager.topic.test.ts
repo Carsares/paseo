@@ -2108,3 +2108,103 @@ test("daemon startup resumes an accepted delegation and reports only to its orig
     await before.close();
   }
 }, 30_000);
+
+test("stamps single-topic turns on AgentManager and avoids stamping multi-topic batches", async () => {
+  const { manager, createSilentMain } = await topicScenario();
+  const main = await createSilentMain();
+  const streamEvents: AgentStreamEvent[] = [];
+  const unsubscribe = manager.subscribe(
+    (event) => {
+      if (event.type === "agent_stream") streamEvents.push(event.event);
+    },
+    { agentId: main.id, replayState: false },
+  );
+  onTestFinished(() => unsubscribe());
+
+  // 1. Single-topic topicFollowup turn gets task:<id> + rootMessageId on turn_started & timeline rows.
+  for await (const _ of manager.streamAgent(
+    main.id,
+    "Continue task alpha",
+    topicFollowupRunOptions({
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: main.id,
+      taskId: "alpha",
+      topicKey: "task:alpha",
+      rootMessageId: "root-alpha",
+      humanInitiated: true,
+    }),
+  )) {
+    // consume stream
+  }
+  expect(streamEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_started",
+      topicKey: "task:alpha",
+      taskId: "alpha",
+      rootMessageId: "root-alpha",
+    }),
+  );
+  const alphaRows = manager
+    .fetchTimeline(main.id, { limit: 0 })
+    .rows.filter((row) => row.topicKey === "task:alpha");
+  expect(alphaRows.length).toBeGreaterThan(0);
+  expect(alphaRows.some((row) => row.item.type === "assistant_message")).toBe(true);
+  for (const row of alphaRows) {
+    expect(row).toMatchObject({
+      topicKey: "task:alpha",
+      taskId: "alpha",
+      rootMessageId: "root-alpha",
+    });
+  }
+
+  // 2. Single-topic inbound agent-message envelope stamps task:beta.
+  streamEvents.length = 0;
+  const singleEnvelope = formatAgentMessage({
+    id: "env-1",
+    source: {
+      kind: "agent-message",
+      agentId: "lead-beta",
+      taskId: "beta",
+      rootMessageId: "root-beta",
+    },
+    text: "Beta report",
+  });
+  for await (const _ of manager.streamAgent(main.id, singleEnvelope)) {
+    // consume stream
+  }
+  expect(streamEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_started",
+      topicKey: "task:beta",
+      taskId: "beta",
+      rootMessageId: "root-beta",
+    }),
+  );
+
+  // 3. Multi-topic batch must NOT stamp a wrong topicKey.
+  streamEvents.length = 0;
+  const mixedBatch = [
+    formatAgentMessage({
+      id: "env-a",
+      source: { kind: "agent-message", agentId: "lead-a", taskId: "alpha" },
+      text: "Alpha update",
+    }),
+    formatAgentMessage({
+      id: "env-b",
+      source: { kind: "agent-message", agentId: "lead-b", taskId: "beta" },
+      text: "Beta update",
+    }),
+  ].join("\n\n");
+  for await (const _ of manager.streamAgent(main.id, mixedBatch)) {
+    // consume stream
+  }
+  const mixedStarts = streamEvents.filter((e) => e.type === "turn_started");
+  expect(mixedStarts).toHaveLength(1);
+  expect(mixedStarts[0]?.topicKey).toBeUndefined();
+  expect(mixedStarts[0]?.taskId).toBeUndefined();
+  const mixedTimelines = streamEvents.filter((e) => e.type === "timeline");
+  expect(mixedTimelines.length).toBeGreaterThan(0);
+  for (const ev of mixedTimelines) {
+    expect(ev.topicKey).toBeUndefined();
+  }
+});

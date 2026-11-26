@@ -2,15 +2,19 @@ import type { AgentMetric } from "@getpaseo/protocol/agent-types";
 import React, { memo, useCallback, useMemo, type ReactNode } from "react";
 import { View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { QuoteTopicProvider } from "@/assistant-selection-copy/composer-quote";
+import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { SPACING, type Theme } from "@/styles/theme";
 import type { TurnTiming } from "@/timeline/turn-time";
 import { getStreamItemMessageId, type StreamItem } from "@/types/stream";
+import { getAgentMessage } from "./agent-interactions";
 import {
   collectAssistantResponseContentForStreamRenderStrategy,
   collectAssistantResponseMessageIdsForStreamRenderStrategy,
   type StreamStrategy,
 } from "./strategy";
 import { resolveAssistantTurnForkBoundary, type AssistantTurnForkBoundary } from "./turn-boundary";
+import { continuesResponse } from "./turn-membership";
 import {
   AssistantTurnFooter,
   LiveElapsed,
@@ -166,6 +170,83 @@ function RunningTurnFooter({
   );
 }
 
+interface TurnTopicHints {
+  taskIds: Set<string>;
+  rootMessageIds: Set<string>;
+  humanRootMessageId?: string;
+}
+
+function collectTurnTopicHints(params: {
+  strategy: TurnContentStrategy;
+  items: StreamItem[];
+  startIndex: number;
+}): TurnTopicHints {
+  const { strategy, items, startIndex } = params;
+  const taskIds = new Set<string>();
+  const rootMessageIds = new Set<string>();
+  let humanRootMessageId: string | undefined;
+  let laterItem: StreamItem | null = null;
+
+  for (
+    let index = startIndex;
+    index >= 0 && index < items.length;
+    index = strategy.getNeighborIndex(index, "above")
+  ) {
+    const currentItem = items[index];
+    if (!currentItem || (laterItem && !continuesResponse(currentItem, laterItem))) {
+      break;
+    }
+    const agentMessage = getAgentMessage(currentItem);
+    if (agentMessage) {
+      const taskId = agentMessage.taskId?.trim();
+      const rootMessageId = agentMessage.rootMessageId?.trim();
+      if (taskId) taskIds.add(taskId);
+      if (rootMessageId) rootMessageIds.add(rootMessageId);
+    } else if (currentItem.kind === "user_message" && !currentItem.sender) {
+      humanRootMessageId ||= (currentItem.messageId ?? currentItem.clientMessageId)?.trim();
+    }
+    laterItem = currentItem;
+  }
+
+  return { taskIds, rootMessageIds, humanRootMessageId };
+}
+
+function resolveTurnQuoteTopicMetadata(params: {
+  strategy: TurnContentStrategy;
+  items: StreamItem[];
+  startIndex: number;
+}): QuoteTopicSourceMetadata | null {
+  const hostItem = params.items[params.startIndex];
+  if (!hostItem) return null;
+
+  const { taskIds, rootMessageIds, humanRootMessageId } = collectTurnTopicHints(params);
+  // Batched multi-topic turn: never attribute blindly to one topic.
+  if (taskIds.size > 1 || (taskIds.size === 0 && rootMessageIds.size > 1)) {
+    return null;
+  }
+
+  const taskId = taskIds.size === 1 ? [...taskIds][0] : undefined;
+  const singleAgentRoot = rootMessageIds.size === 1 ? [...rootMessageIds][0] : undefined;
+  const rootMessageId =
+    singleAgentRoot ?? (rootMessageIds.size === 0 ? humanRootMessageId : undefined);
+  let topicKey: string | undefined;
+  if (taskId) {
+    topicKey = `task:${taskId}`;
+  } else if (rootMessageId) {
+    topicKey = `msg:${rootMessageId}`;
+  }
+  if (!topicKey) return null;
+
+  const sourceMessageId =
+    hostItem.kind === "assistant_message" ? (hostItem.messageId ?? hostItem.id) : undefined;
+  return {
+    topicKey,
+    ...(rootMessageId ? { rootMessageId } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+  };
+}
+
 function CompletedTurnFooter({
   strategy,
   items,
@@ -209,6 +290,10 @@ function CompletedTurnFooter({
     if (messageIds.length > 0) return messageIds;
     return fallbackMessageId ? [fallbackMessageId] : [];
   }, [fallbackMessageId, messageIds]);
+  const turnQuoteTopic = useMemo(
+    () => resolveTurnQuoteTopicMetadata({ strategy, items, startIndex }),
+    [items, startIndex, strategy],
+  );
   const boundary = resolveAssistantTurnForkBoundary({
     items,
     startIndex,
@@ -225,14 +310,16 @@ function CompletedTurnFooter({
   );
   return (
     <View style={stylesheet.turnFooterSlot}>
-      <AssistantTurnFooter
-        getContent={items[startIndex]?.kind === "assistant_message" ? getContent : undefined}
-        messageIds={resolvedMessageIds}
-        completedAt={timing?.completedAt}
-        durationMs={timing?.durationMs}
-        onFork={boundary && onForkAssistantTurn ? handleFork : undefined}
-        metrics={turnMetrics}
-      />
+      <QuoteTopicProvider topic={turnQuoteTopic}>
+        <AssistantTurnFooter
+          getContent={items[startIndex]?.kind === "assistant_message" ? getContent : undefined}
+          messageIds={resolvedMessageIds}
+          completedAt={timing?.completedAt}
+          durationMs={timing?.durationMs}
+          onFork={boundary && onForkAssistantTurn ? handleFork : undefined}
+          metrics={turnMetrics}
+        />
+      </QuoteTopicProvider>
     </View>
   );
 }

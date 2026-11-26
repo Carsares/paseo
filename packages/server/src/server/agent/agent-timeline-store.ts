@@ -224,7 +224,14 @@ export class InMemoryAgentTimelineStore {
   append(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      timestamp?: string;
+      providerMessageId?: string;
+      turnId?: string;
+      topicKey?: string;
+      taskId?: string;
+      rootMessageId?: string;
+    },
   ): AgentTimelineRow {
     const state = this.requireState(agentId);
     const row: AgentTimelineRow = {
@@ -233,6 +240,9 @@ export class InMemoryAgentTimelineStore {
       item: distinguishToolFromPrefix(state, item, options?.turnId),
       ...(options?.turnId ? { turnId: options.turnId } : {}),
       ...(options?.providerMessageId ? { providerMessageId: options.providerMessageId } : {}),
+      ...(options?.topicKey ? { topicKey: options.topicKey } : {}),
+      ...(options?.taskId ? { taskId: options.taskId } : {}),
+      ...(options?.rootMessageId ? { rootMessageId: options.rootMessageId } : {}),
     };
     state.nextSeq += 1;
     if (state.minSeq === 0) state.minSeq = row.seq;
