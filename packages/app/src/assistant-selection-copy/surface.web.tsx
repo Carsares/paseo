@@ -1,6 +1,7 @@
 import { useCallback, useRef, type ClipboardEvent, type CSSProperties } from "react";
 import { View } from "react-native";
 import { usePluginSelectionButtons } from "@/plugins/buttons/view";
+import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { createAssistantSelectionClipboardContent } from "./content.web";
 import { useComposerQuote } from "./composer-quote";
 import { AssistantSelectionQuote } from "./quote.web";
@@ -17,7 +18,10 @@ export function AssistantSelectionCopySurface({
   canSubmitSelection,
   subagentSpawnMode,
   onSpawnSubagentFromSelection,
-}: AssistantSelectionCopySurfaceProps) {
+  resolveQuoteTopicByRowId,
+}: AssistantSelectionCopySurfaceProps & {
+  resolveQuoteTopicByRowId?: (rowId: string) => QuoteTopicSourceMetadata | undefined;
+}) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const composerQuote = useComposerQuote();
   const selectionButtons = usePluginSelectionButtons(
@@ -54,6 +58,7 @@ export function AssistantSelectionCopySurface({
           selectionButtons={selectionButtons}
           canSubmitSelection={canSubmitSelection}
           onQuote={composerQuote?.addQuote}
+          resolveQuoteTopicByRowId={resolveQuoteTopicByRowId}
           subagentSpawnMode={subagentSpawnMode}
           onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
         />

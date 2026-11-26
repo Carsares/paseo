@@ -1,8 +1,12 @@
 import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   TASK_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
@@ -17,11 +21,13 @@ import type {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "../agent/agent-manager.js";
-import type { AgentSession } from "../agent/agent-sdk-types.js";
+import type { AgentPromptInput, AgentSession } from "../agent/agent-sdk-types.js";
 import { AgentStorage } from "../agent/agent-storage.js";
+import { TOPIC_ROOT_MESSAGE_ID_LABEL } from "../agent/hierarchy-policy.js";
 import { WorkspaceTaskLedgerStore } from "../agent/task-ledger/index.js";
 import { FileUploadStore } from "../file-upload/index.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { createTopicPromptDispatcher, createTopicReplyRouter } from "./reply-router.js";
 import { TopicThreadStore } from "./store.js";
 import type { TopicUploadAccess } from "./uploaded-attachments.js";
@@ -55,6 +61,253 @@ beforeEach(async () => {
 afterEach(async () => {
   await router?.close();
   await rm(home, { recursive: true, force: true });
+});
+
+test("preserves merged prompts and images through timeline clear, retry, and reassignment", async () => {
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    agentClients: createTestAgentClients(),
+  });
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    clientId: "preserve-merged-history",
+    appVersion: "0.18.0",
+  });
+  try {
+    await client.connect();
+    const config = { provider: "codex" as const, cwd: daemon.staticDir };
+    const created = await client.createWorkspace({
+      source: { kind: "directory", path: daemon.staticDir },
+      title: "Preserve merged prompts",
+      topic: { summary: "Preserve merged prompts" },
+      mainAgent: { config },
+    });
+    if (!created.workspace || !created.mainAgent) throw new Error(created.error ?? "Missing topic");
+    const scope = { workspaceId: created.workspace.id, mainAgentId: created.mainAgent.id };
+    const manager = daemon.daemon.agentManager;
+    const liveStore = new TopicThreadStore(daemon.paseoHome);
+    const images = [{ data: pngData, mimeType: "image/png" }];
+    for (const [messageId, text] of [
+      ["first", "First prompt"],
+      ["second", "Amend the first prompt"],
+    ] as const) {
+      await client.sendAgentMessage(scope.mainAgentId, text, { messageId, images });
+      await vi.waitFor(() => expect(manager.hasInFlightRun(scope.mainAgentId)).toBe(false));
+    }
+    const before = await client.fetchAgentTimeline(scope.mainAgentId, { direction: "tail" });
+    const prompts = before.entries.flatMap(({ item }) =>
+      item.type === "user_message" ? [item] : [],
+    );
+    expect(prompts).toHaveLength(2);
+    await liveStore.recordMessageAttributions({
+      ...scope,
+      sourceMessageIds: ["first", "second"],
+      mode: "merge",
+    });
+    const beforeClear = await client.listWorkspaceTopicEntries(scope);
+    await client.resetAgentSession(scope.mainAgentId, { clearVisibleTimeline: true });
+    await client.resetAgentSession(scope.mainAgentId, { clearVisibleTimeline: true });
+    const reopened = await client.listWorkspaceTopicEntries(scope);
+    expect(reopened.anchors.map(({ topicKey }) => topicKey).sort()).toEqual(
+      beforeClear.anchors.map(({ topicKey }) => topicKey).sort(),
+    );
+    const rootAnchor = reopened.anchors.find(({ topicKey }) => topicKey === "msg:first");
+    expect(rootAnchor).toMatchObject({
+      rootPromptText: "First prompt",
+      imageAttachments: [expect.objectContaining({ mimeType: "image/png" })],
+      attributedMessages: [{ sourceMessageId: "second", mode: "merge" }],
+    });
+    expect(rootAnchor?.imageAttachments).toEqual(prompts[0]?.imageAttachments);
+    expect(reopened.entries).toMatchObject([
+      {
+        topicKey: "msg:first",
+        status: "completed",
+        role: "user_followup",
+        sourceMessageId: "second",
+        attributedFromTopicKey: "msg:second",
+        text: "Amend the first prompt",
+        imageAttachments: [expect.objectContaining({ mimeType: "image/png" })],
+      },
+    ]);
+    expect(reopened.entries[0]?.imageAttachments).toEqual(prompts[1]?.imageAttachments);
+    const image = reopened.entries[0]?.imageAttachments?.[0];
+    if (!image) throw new Error("Missing preserved image reference");
+    await expect(
+      client.readFile(daemon.staticDir, `paseo-attachment:${image.id}`),
+    ).resolves.toMatchObject({
+      kind: "image",
+      bytes: new Uint8Array(Buffer.from(pngData, "base64")),
+    });
+    const moved = await liveStore.recordMessageAttributions({
+      ...scope,
+      sourceMessageIds: ["second"],
+      targetRootMessageId: "other",
+      mode: "merge",
+    });
+    expect(moved.updatedAnchors).toMatchObject([
+      { topicKey: "msg:first", attributedMessages: [] },
+      { topicKey: "msg:other", attributedMessages: [{ sourceMessageId: "second", mode: "merge" }] },
+    ]);
+    const afterMove = await client.listWorkspaceTopicEntries(scope);
+    expect(afterMove.entries).toHaveLength(1);
+    expect(afterMove.entries[0]).toMatchObject({
+      entryId: reopened.entries[0]?.entryId,
+      topicKey: "msg:other",
+      imageAttachments: [image],
+    });
+  } finally {
+    await client.close();
+    await daemon.close();
+  }
+});
+
+test("delegates under the explicitly assigned topic and sends multi-participant completion to Main Control", async () => {
+  const releaseMain = Promise.withResolvers<void>();
+  const releaseChild = Promise.withResolvers<void>();
+  const mainText = "Move this question to the existing topic";
+  const childText = "Work as the first participant";
+  const completion = "The first participant has finished";
+  function promptText(prompt: AgentPromptInput) {
+    return typeof prompt === "string"
+      ? prompt
+      : prompt.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
+  }
+  const onStartTurn = vi.fn();
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: true,
+    agentClients: createTestAgentClients({
+      onStartTurn,
+      async beforeTurnComplete(prompt) {
+        if (promptText(prompt).includes(mainText)) await releaseMain.promise;
+        if (promptText(prompt).includes(childText)) await releaseChild.promise;
+      },
+    }),
+  });
+  const manager = daemon.daemon.agentManager;
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    clientId: "delegate-attributed-topic",
+    appVersion: "0.18.0",
+  });
+  const tools: Client[] = [];
+  async function connectTools(agentId: string) {
+    const toolClient = new Client({ name: "topic-history-test", version: "1" });
+    tools.push(toolClient);
+    await toolClient.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${agentId}`),
+        {
+          requestInit: { headers: { Authorization: `Bearer ${manager.getMcpAuthToken(agentId)}` } },
+        },
+      ),
+    );
+    return toolClient;
+  }
+  try {
+    await client.connect();
+    const config = { provider: "codex" as const, cwd: daemon.staticDir };
+    const created = await client.createWorkspace({
+      source: { kind: "directory", path: daemon.staticDir },
+      title: "Explicit attribution and completion",
+      topic: { summary: "Check explicit attribution and completion" },
+      mainAgent: { config },
+    });
+    if (!created.workspace || !created.mainAgent) throw new Error(created.error ?? "Missing topic");
+    const workspaceId = created.workspace.id;
+    const mainAgentId = created.mainAgent.id;
+    const rootMessageId = "explicit-root";
+    const topicKey = `msg:${rootMessageId}`;
+    const child = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TASK_ID_LABEL]: "old-task",
+        [TOPIC_ROOT_MESSAGE_ID_LABEL]: "old-root",
+      },
+    });
+    const second = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+      },
+    });
+    const mainTools = await connectTools(mainAgentId);
+    await client.sendAgentMessage(mainAgentId, mainText, { messageId: "unscoped" });
+    await vi.waitFor(() =>
+      expect(manager.getAgent(mainAgentId)?.activeForegroundTurnId).toEqual(expect.any(String)),
+    );
+    const assigned = await mainTools.callTool({
+      name: "assign_topic_attribution",
+      arguments: { sourceMessageIds: ["unscoped"], targetRootMessageId: rootMessageId },
+    });
+    expect(assigned.structuredContent).toMatchObject({ topicKey, rootMessageId });
+    for (const agentId of [child.id, second.id]) {
+      const sent = await mainTools.callTool({
+        name: "send_agent_prompt",
+        arguments: {
+          agentId,
+          prompt: agentId === child.id ? childText : "Work as the second participant",
+          notifyOnFinish: false,
+        },
+      });
+      expect(sent.structuredContent).toMatchObject({ topicDelegation: { agentId, rootMessageId } });
+      expect(sent.structuredContent).not.toMatchObject({ topicDelegation: { taskId: "old-task" } });
+    }
+    await vi.waitFor(async () => {
+      const result = await client.listWorkspaceTopicEntries({ workspaceId, mainAgentId, topicKey });
+      expect(result.anchors[0]?.delegations).toHaveLength(2);
+    });
+    releaseMain.resolve();
+    await vi.waitFor(
+      async () => {
+        expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+        const current = await client.listWorkspaceTopicEntries({
+          workspaceId,
+          mainAgentId,
+          topicKey,
+        });
+        expect(current.anchors[0]?.delegations).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ agentId: child.id, status: "running" }),
+            expect.objectContaining({ agentId: second.id, status: "ended" }),
+          ]),
+        );
+        expect(manager.getAgent(child.id)?.activeForegroundTurnId).toEqual(expect.any(String));
+      },
+      { timeout: 7000 },
+    );
+    await client.refreshAgent(mainAgentId);
+    const childTools = await connectTools(child.id);
+    const reported = await childTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary: completion },
+    });
+    expect(reported.isError).not.toBe(true);
+    await vi.waitFor(
+      () =>
+        expect(
+          onStartTurn.mock.calls.some(([prompt]) => promptText(prompt).includes(completion)),
+        ).toBe(true),
+      { timeout: 6000 },
+    );
+    const result = await client.listWorkspaceTopicEntries({ workspaceId, mainAgentId, topicKey });
+    expect(result.entries).toEqual([]);
+    const timeline = await client.fetchAgentTimeline(mainAgentId, { direction: "tail" });
+    expect(timeline.entries).toContainEqual(
+      expect.objectContaining({
+        topicKey,
+        item: expect.objectContaining({ agentMessage: expect.objectContaining({ rootMessageId }) }),
+      }),
+    );
+  } finally {
+    releaseMain.resolve();
+    releaseChild.resolve();
+    await Promise.all(tools.map((tool) => tool.close()));
+    await client.close();
+    await daemon.close();
+  }
 });
 
 async function uploadFile(fileName: string, mimeType: string, bytes: Buffer, owner?: string) {
@@ -172,6 +425,8 @@ test.each([
             workspaceId: "workspace",
             mainAgentId: "main",
             taskId: "task",
+            topicKey: request.topicKey,
+            rootMessageId: request.rootMessageId,
             humanInitiated: marked,
           },
         }),
@@ -215,6 +470,8 @@ test.each(["decision_reply", "butler_dispatch"] as const)(
             workspaceId: "workspace",
             mainAgentId: "main",
             taskId: "task",
+            topicKey: request.topicKey,
+            rootMessageId: request.rootMessageId,
             humanInitiated: false,
           },
         }),
@@ -416,6 +673,8 @@ test.each([
           workspaceId: "workspace",
           mainAgentId: "main",
           taskId: "task",
+          topicKey: request.topicKey,
+          rootMessageId: request.rootMessageId,
           humanInitiated: false,
         },
       }),

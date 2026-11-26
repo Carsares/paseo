@@ -1508,6 +1508,7 @@ function matchTopicReport(
   item: StreamItem,
   agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
   recordUnmatched = true,
+  allowUnstampedFallback = false,
 ) {
   const reportMessageId = localReportId(
     projectedAgentMessageId(item),
@@ -1548,14 +1549,14 @@ function matchTopicReport(
     }
     return { matched, reportMessageId, scoped: true, exactDispatch: false };
   }
-  // A report without dispatch provenance must not move the active card to another topic.
-  if (senderDelegations.length > 0) return;
-  return {
-    matched: findMatchingTopic(state, {}),
-    reportMessageId,
-    scoped: false,
-    exactDispatch: false,
-  };
+  if (allowUnstampedFallback) {
+    return {
+      matched: findMatchingTopic(state, {}),
+      reportMessageId,
+      scoped: false,
+      exactDispatch: false,
+    };
+  }
 }
 
 function dispatchKey(delegation: TopicDelegation): string {
@@ -1613,11 +1614,17 @@ function ingestAgentMessageItem(
   const agentMessage = getAgentMessage(item);
   if (!agentMessage) return false;
   if (findExactMirroredReply(state, item)) return true;
-  const match = matchTopicReport(state, item, agentMessage);
+  const match = matchTopicReport(
+    state,
+    item,
+    agentMessage,
+    true,
+    turn.allowUnstampedReportFallback,
+  );
   if (!match) return true;
   const { matched, reportMessageId, scoped } = match;
-
   const target = matched ?? ensureFallbackTopic(state, item);
+  if (!scoped && turn.reportOnly) turn.reportTopic = target;
   if (readItemTopicStamp(item)) {
     turn.hasAuthoritativeStamp = true;
     turn.stampedTopics.add(target);
@@ -1701,6 +1708,7 @@ interface TopicTurn {
   turnId?: string;
   reportOnly: boolean;
   reportTopic?: MutableTopicUnit;
+  allowUnstampedReportFallback: boolean;
   hasAuthoritativeStamp: boolean;
   stampedTopics: Set<MutableTopicUnit>;
   humanTriggerTopic?: MutableTopicUnit;
@@ -1719,7 +1727,6 @@ function uniqueReportTopic(
 ): MutableTopicUnit | undefined {
   const match = matchTopicReport(state, item, report, false);
   if (!match?.matched) return;
-  if (!match.scoped) return state.topics.length === 1 ? match.matched : undefined;
   if (match.exactDispatch || report.taskId || !report.rootMessageId) return match.matched;
   if (state.unitsByRootMessageId.get(report.rootMessageId)?.length === 1) return match.matched;
 }
@@ -1735,6 +1742,7 @@ function startTopicTurn(
   let firstTrigger = true;
   let humanInput = false;
   let reportTopic: MutableTopicUnit | undefined;
+  let reportCount = 0;
   let ambiguous = false;
   let hasAuthoritativeStamp = false;
   const stampedTopics = new Set<MutableTopicUnit>();
@@ -1755,6 +1763,7 @@ function startTopicTurn(
       firstTrigger = false;
     }
     if (!report) continue;
+    reportCount += 1;
     const match = uniqueReportTopic(state, item, report);
     if (!match || (reportTopic && reportTopic !== match)) ambiguous = true;
     else reportTopic = match;
@@ -1765,6 +1774,8 @@ function startTopicTurn(
     turnId,
     reportOnly,
     reportTopic: reportOnly && !ambiguous ? reportTopic : undefined,
+    // A single report can use the old order-based placement. An ambiguous batch cannot.
+    allowUnstampedReportFallback: reportCount === 1 && !hasAuthoritativeStamp,
     hasAuthoritativeStamp,
     stampedTopics,
     initialPromptUnits: new Set(),
@@ -1862,7 +1873,9 @@ function resolveStreamItemTarget(
   // once the daemon floor stamps authoritative topicKey/taskId/rootMessageId on timeline items.
   const turnStampedTopic = resolveSingleTurnStampedTopic(turn);
   if (turn.reportOnly) {
-    return turnStampedTopic ?? turn.reportTopic;
+    if (turn.stampedTopics.size > 1) return undefined;
+    if (turnStampedTopic && turnStampedTopic !== turn.reportTopic) return undefined;
+    return turn.reportTopic;
   }
   if (turnStampedTopic ?? state.activeTopic) {
     return turnStampedTopic ?? state.activeTopic;

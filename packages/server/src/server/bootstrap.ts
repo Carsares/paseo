@@ -1105,6 +1105,7 @@ export async function createPaseoDaemon(
     registry: agentStorage,
     taskLedger,
     topicDelegations,
+    topicHistoryDirectory: path.join(config.paseoHome, "timeline-topic-attribution"),
     workspaceRegistry,
     preserveTopicHistory: (scope, rows) => {
       if (!wsServer) throw new Error("Topic history storage is unavailable.");

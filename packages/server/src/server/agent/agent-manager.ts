@@ -39,8 +39,8 @@ import { applyRecordPatch } from "../record-patch.js";
 import type { FinishRegistration } from "./finish-subscriptions/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { basename, resolve } from "node:path";
-import { stat } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import { appendFile, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import {
   AGENT_LIFECYCLE_STATUSES,
@@ -345,6 +345,7 @@ function submittedPromptText(prompt: AgentPromptInput): string {
 const directHumanPrompt = Symbol("directHumanPrompt");
 const topicFollowup = Symbol("topicFollowup");
 const restartDelegation = Symbol("restartDelegation");
+const backgroundReportReplacement = Symbol("backgroundReportReplacement");
 
 interface TopicTaskScope {
   workspaceId: string;
@@ -361,6 +362,32 @@ export interface AuthoritativeTopicAttribution {
 }
 
 const MAX_RETAINED_TURN_TOPIC_ATTRIBUTIONS = 64;
+
+const replayTopicStampSchema = z.object({
+  keys: z.array(z.string()),
+  turnId: z.string(),
+  topicKey: z.string(),
+  taskId: z.string().optional(),
+  rootMessageId: z.string().optional(),
+});
+type ReplayTopicStamp = Omit<z.infer<typeof replayTopicStampSchema>, "keys">;
+
+function replayTopicKeys(item: AgentTimelineItem, providerMessageId?: string): string[] {
+  switch (item.type) {
+    case "user_message":
+      return [...new Set([item.clientMessageId, providerMessageId, item.messageId])]
+        .filter((id): id is string => Boolean(id))
+        .map((id) => JSON.stringify([item.type, id]));
+    case "assistant_message":
+      return item.messageId || providerMessageId
+        ? [JSON.stringify([item.type, providerMessageId ?? item.messageId])]
+        : [];
+    case "tool_call":
+      return [JSON.stringify([item.type, item.callId])];
+    default:
+      return [];
+  }
+}
 
 function normalizeTopicAttribution(
   input: TimelineTopicAttribution | null | undefined,
@@ -420,7 +447,23 @@ type ForegroundRunMetadata = AgentRunOptions & {
   [directHumanPrompt]?: true;
   [topicFollowup]?: TopicTaskScope;
   [restartDelegation]?: TopicDelegationTurn;
+  [backgroundReportReplacement]?: {
+    turnId: string | undefined;
+    onInterrupted: () => void;
+  };
 };
+
+export function backgroundReportReplacementRunOptions(
+  options: AgentRunOptions | undefined,
+  turnId: string | undefined,
+  onInterrupted: () => void,
+): AgentRunOptions {
+  const marked: ForegroundRunMetadata = {
+    ...options,
+    [backgroundReportReplacement]: { turnId, onInterrupted },
+  };
+  return marked;
+}
 
 export function restartRecoveryRunOptions(original?: TopicDelegationTurn): AgentRunOptions {
   const options: ForegroundRunMetadata = {
@@ -933,6 +976,7 @@ export interface AgentManagerOptions {
   registry?: AgentStorage;
   taskLedger?: WorkspaceTaskLedgerStore;
   topicDelegations?: TopicDelegationStore;
+  topicHistoryDirectory?: string;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   preserveTopicHistory?: (
     scope: { workspaceId: string; mainAgentId: string },
@@ -1864,6 +1908,12 @@ export class AgentManager {
   ) => Promise<FinishRegistration | undefined>;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly durableTimelineWriteTails = new Map<string, Promise<void>>();
+  private readonly topicHistoryDirectory?: string;
+  private readonly topicHistoryWrites = new Map<string, Promise<void>>();
+  private readonly liveReplayTopicStamps = new WeakMap<
+    ActiveManagedAgent,
+    { turnId: string; entries: Map<string, string> }
+  >();
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
@@ -1983,6 +2033,7 @@ export class AgentManager {
     this.registry = options.registry;
     this.taskLedger = options.taskLedger;
     this.topicDelegations = options.topicDelegations;
+    this.topicHistoryDirectory = options.topicHistoryDirectory;
     this.workspaceRegistry = options.workspaceRegistry;
     this.preserveTopicHistory = options.preserveTopicHistory;
     if (options.rewindDirectories) this.configureRewindCheckpoints(options.rewindDirectories);
@@ -8722,6 +8773,104 @@ export class AgentManager {
     );
   }
 
+  private topicHistoryPath(agentId: string): string {
+    return join(this.topicHistoryDirectory!, `${encodeURIComponent(agentId)}.jsonl`);
+  }
+
+  private rememberReplayTopicStamp(agentId: string, row: AgentTimelineRow): void {
+    if (!this.topicHistoryDirectory || !row.topicKey || !row.turnId) return;
+    const agent = this.agents.get(agentId);
+    if (!agent?.session || !agent.persistence?.sessionId) return;
+    const keys = this.sessionReplayTopicKeys(agent, row.item, row.providerMessageId);
+    if (!keys.length) return;
+
+    const { turnId, topicKey, taskId, rootMessageId } = row;
+    const stamp = { turnId, topicKey, taskId, rootMessageId };
+    const value = JSON.stringify(stamp);
+    let current = this.liveReplayTopicStamps.get(agent);
+    if (current?.turnId !== turnId) {
+      current = { turnId, entries: new Map() };
+      this.liveReplayTopicStamps.set(agent, current);
+    }
+    const remembered = current.entries;
+    const changed = keys.filter((key) => remembered.get(key) !== value);
+    if (!changed.length) return;
+    for (const key of changed) remembered.set(key, value);
+
+    const directory = this.topicHistoryDirectory;
+    const tail = this.topicHistoryWrites.get(agentId) ?? Promise.resolve();
+    const write = tail
+      .then(async () => {
+        await mkdir(directory, { recursive: true });
+        // Start a fresh line even if a process stopped partway through its prior append.
+        return appendFile(
+          this.topicHistoryPath(agentId),
+          `\n${JSON.stringify({ ...stamp, keys: changed })}\n`,
+        );
+      })
+      .catch((err) => {
+        for (const key of changed) if (remembered.get(key) === value) remembered.delete(key);
+        this.logger.warn({ err, agentId, turnId }, "Failed to save timeline topic attribution");
+      });
+    this.topicHistoryWrites.set(agentId, write);
+    this.trackBackgroundTask(write);
+    void write.finally(() => {
+      if (this.topicHistoryWrites.get(agentId) === write) this.topicHistoryWrites.delete(agentId);
+    });
+  }
+
+  private sessionReplayTopicKeys(
+    agent: ActiveManagedAgent,
+    item: AgentTimelineItem,
+    providerMessageId?: string,
+  ): string[] {
+    const sessionId = agent.persistence?.sessionId;
+    if (!sessionId) return [];
+    return replayTopicKeys(item, providerMessageId).map((key) =>
+      JSON.stringify([agent.provider, sessionId, key]),
+    );
+  }
+
+  private async restoreReplayTopicStamps(
+    agent: ActiveManagedAgent,
+    entries: ProviderHistoryEntry[],
+  ): Promise<void> {
+    if (!this.topicHistoryDirectory || !agent.persistence?.sessionId) return;
+    await this.topicHistoryWrites.get(agent.id);
+    let contents: string;
+    try {
+      contents = await readFile(this.topicHistoryPath(agent.id), "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT")
+        this.logger.warn({ err, agentId: agent.id }, "Failed to read timeline topic attribution");
+      return;
+    }
+    const stamps = new Map<string, ReplayTopicStamp>();
+    for (const line of contents.split("\n")) {
+      if (!line) continue;
+      try {
+        const parsed = replayTopicStampSchema.safeParse(JSON.parse(line));
+        if (!parsed.success) continue;
+        const { keys, ...stamp } = parsed.data;
+        for (const key of keys) stamps.set(key, stamp);
+      } catch {
+        // An incomplete append cannot erase earlier complete entries.
+      }
+    }
+    for (const entry of entries) {
+      if (entry.type !== "row") continue;
+      const { event } = entry;
+      const keys = this.sessionReplayTopicKeys(agent, event.item, event.historyAssistantMessageId);
+      const stamp = keys.map((key) => stamps.get(key)).find((candidate) => candidate !== undefined);
+      if (!stamp || (event.turnId && event.turnId !== stamp.turnId)) continue;
+      entry.event = {
+        ...event,
+        turnId: event.turnId ?? stamp.turnId,
+        ...(!event.topicKey ? stamp : {}),
+      };
+    }
+  }
+
   private async recordPendingDelegation(
     agent: ActiveManagedAgent,
     pendingRun: PendingForegroundRun,
@@ -10522,6 +10671,10 @@ export class AgentManager {
     assertInterrupt?: () => void,
   ) {
     assertInterrupt?.();
+    const replacement = (options as ForegroundRunMetadata | undefined)?.[
+      backgroundReportReplacement
+    ];
+    const interruptedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
     const previousLifecycle = agent.lifecycle;
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
@@ -10530,6 +10683,9 @@ export class AgentManager {
     try {
       const result = await this.cancelAgentRunNow(agent.id, "replace", assertInterrupt);
       if (result.status === "refused") throw new AgentRunCancellationError(agent.id, "replace");
+      if (result.status === "settled" && replacement && replacement.turnId === interruptedTurnId) {
+        replacement.onInterrupted();
+      }
       return this.reserveAgentRun(agent.id, prompt, options, promptStart);
     } catch (error) {
       agent.pendingReplacement = false;
@@ -11759,6 +11915,10 @@ export class AgentManager {
     this.discardRetainedAgentState(agentId);
     await this.timelinePrefixes.delete(agentId);
     await this.deleteCommittedTimeline(agentId);
+    if (this.topicHistoryDirectory) {
+      await this.topicHistoryWrites.get(agentId);
+      await rm(this.topicHistoryPath(agentId), { force: true });
+    }
   }
 
   notifyAgentRemoved(agent: Pick<StoredAgentRecord, "id" | "workspaceId" | "internal">): void {
@@ -12775,6 +12935,7 @@ export class AgentManager {
       }
     }
 
+    await this.restoreReplayTopicStamps(agent, historyEntries);
     verifyHistory?.(historyEntries.flatMap((entry) => (entry.type === "row" ? [entry.event] : [])));
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.cancelContextHandoff(agent.id);
@@ -12852,17 +13013,22 @@ export class AgentManager {
       return null;
     }
     const { event } = entry;
+    const options = {
+      timestamp: event.timestamp,
+      turnId: event.turnId,
+      topicKey: event.topicKey,
+      taskId: event.taskId,
+      rootMessageId: event.rootMessageId,
+    };
     if (verifyHistory) {
-      const row = this.timelineStore.append(agent.id, limitAgentTimelineItemContent(event.item), {
-        timestamp: event.timestamp,
-      });
+      const row = this.timelineStore.append(
+        agent.id,
+        limitAgentTimelineItemContent(event.item),
+        options,
+      );
       return { event: { ...event, item: row.item }, row };
     }
-    const row = this.recordTimeline(
-      agent.id,
-      event.item,
-      event.timestamp ? { timestamp: event.timestamp } : undefined,
-    );
+    const row = this.recordTimeline(agent.id, event.item, options);
     return { event, row };
   }
 
@@ -12898,6 +13064,7 @@ export class AgentManager {
 
     // The replay is the timeline, so drop the rows a previous hydration committed.
     // Keeping them would leave getTimelineRows reading one copy per hydration.
+    await this.restoreReplayTopicStamps(agent, historyEntries);
     await this.deleteCommittedTimeline(agent.id);
     const prefix = await this.seedTimelinePrefix(agent.id);
 
@@ -13806,6 +13973,7 @@ export class AgentManager {
     },
   ): AgentStreamEvent {
     const row = this.recordTimeline(agentId, item, { ...options, turnId });
+    this.rememberReplayTopicStamp(agentId, row);
     const event: AgentStreamEvent = {
       type: "timeline",
       item: row.item,
@@ -13910,7 +14078,10 @@ export class AgentManager {
         clientMessageId,
         messageId,
       );
-      if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
+      if (enriched) {
+        this.enqueueDurableTimelineUpdate(agent.id, enriched);
+        this.rememberReplayTopicStamp(agent.id, enriched);
+      }
     }
     return existing;
   }

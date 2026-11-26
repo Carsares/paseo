@@ -42,6 +42,9 @@ export interface ResolveQuotedTopicRoutingTargetInput {
   activeReplyTopic?: ActiveTopicReplyTarget | null;
 }
 
+/** Draft-only value for a single quote spanning multiple topics. It never names a reply target. */
+export const CROSS_TOPIC_QUOTE_KEY = "selection:multiple-topics";
+
 function extractQuotePreview(attachment: Extract<ComposerAttachment, { kind: "quote" }>): string {
   const preview = attachment.text.replace(/\s+/g, " ").trim() || attachment.label?.trim() || "";
   return preview.slice(0, 120);
@@ -84,7 +87,11 @@ export function resolveQuotedTopicRoutingTarget(
   if (!first) return null;
 
   const resolvedTopicKey = first.topicKey;
-  if (attributedQuotes.some((entry) => entry.topicKey !== resolvedTopicKey)) {
+  if (
+    attributedQuotes.some(
+      (entry) => entry.topicKey === CROSS_TOPIC_QUOTE_KEY || entry.topicKey !== resolvedTopicKey,
+    )
+  ) {
     return null;
   }
 

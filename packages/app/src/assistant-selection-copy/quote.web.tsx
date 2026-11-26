@@ -46,6 +46,7 @@ import {
   createAssistantSelectionMarkdown,
 } from "./content.web";
 import type { ComposerQuote } from "./composer-quote";
+import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import type { SelectionSubagentSpawnContext, SelectionSubagentSpawnMode } from "./surface";
 
 type QuoteState = { phase: "idle" } | ({ phase: "offered" } & SelectionPassage);
@@ -54,11 +55,12 @@ interface SelectionPassage {
   endpoints: readonly [Node, Node];
   text: string;
   quote: string;
+  quoteTopic?: QuoteTopicSourceMetadata;
   messageRowId: string | null;
 }
 
 type PendingMenuAction =
-  | { kind: "quote"; quote: string }
+  | { kind: "quote"; quote: ComposerQuote }
   | { kind: "spawn"; quote: string; messageRowId: string | null }
   | { kind: "plugin"; run: () => void };
 
@@ -81,6 +83,7 @@ interface AssistantSelectionQuoteProps {
   selectionButtons?: readonly RegisteredPluginButton[];
   canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onQuote?: (quote: ComposerQuote) => void;
+  resolveQuoteTopicByRowId?: (rowId: string) => QuoteTopicSourceMetadata | undefined;
   subagentSpawnMode?: SelectionSubagentSpawnMode;
   onSpawnSubagentFromSelection?: (
     selectedMarkdown: string,
@@ -108,6 +111,7 @@ function SelectionActions({
   selectionButtons = NO_SELECTION_BUTTONS,
   canSubmitSelection,
   onQuote,
+  resolveQuoteTopicByRowId,
   subagentSpawnMode = "child",
   onSpawnSubagentFromSelection,
 }: AssistantSelectionQuoteProps) {
@@ -166,7 +170,7 @@ function SelectionActions({
     if (!action) return;
     // Let the menu restore focus during unmount before the action can move it again.
     if (action.kind === "quote") {
-      onQuote?.({ quote: action.quote });
+      onQuote?.(action.quote);
     } else if (action.kind === "spawn") {
       spawnSubagent(action.quote, action.messageRowId);
     } else {
@@ -181,7 +185,11 @@ function SelectionActions({
     const readSelection = () => {
       frame = 0;
       if (menuOpenRef.current || floatingMenu.current) return;
-      const passage = readSelectionPassage(streamRef.current, window.getSelection());
+      const passage = readSelectionPassage(
+        streamRef.current,
+        window.getSelection(),
+        resolveQuoteTopicByRowId,
+      );
       update(passage ? { phase: "offered", ...passage } : IDLE);
     };
     const scheduleRead = () => {
@@ -215,7 +223,7 @@ function SelectionActions({
       document.removeEventListener("pointerup", handlePointerUp, true);
       document.removeEventListener("pointercancel", handlePointerUp, true);
     };
-  }, [streamRef, update]);
+  }, [resolveQuoteTopicByRowId, streamRef, update]);
 
   const hasSelectionActions = Boolean(
     onQuote || onSpawnSubagentFromSelection || selectionButtons.length,
@@ -227,7 +235,7 @@ function SelectionActions({
       if (event.defaultPrevented || floatingMenu.current) return;
       if (isEditableContextTarget(event.target)) return;
       const selection = window.getSelection();
-      const passage = readSelectionPassage(stream, selection);
+      const passage = readSelectionPassage(stream, selection, resolveQuoteTopicByRowId);
       if (!passage) return;
       if (event.target instanceof Node && !passage.range.intersectsNode(event.target)) return;
       const clipboard = createAssistantSelectionClipboardContent(selection);
@@ -242,7 +250,14 @@ function SelectionActions({
     };
     stream.addEventListener("contextmenu", handleContextMenu);
     return () => stream.removeEventListener("contextmenu", handleContextMenu);
-  }, [hasSelectionActions, setAnchorRect, setMenuOpen, streamRef, update]);
+  }, [
+    hasSelectionActions,
+    resolveQuoteTopicByRowId,
+    setAnchorRect,
+    setMenuOpen,
+    streamRef,
+    update,
+  ]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -298,7 +313,10 @@ function SelectionActions({
   }, [dismiss, menuSelection, onSpawnSubagentFromSelection, setMenuOpen]);
   const quoteFromMenu = useCallback(() => {
     if (!onQuote || !menuSelection) return;
-    pendingMenuAction.current = { kind: "quote", quote: menuSelection.quote };
+    pendingMenuAction.current = {
+      kind: "quote",
+      quote: { quote: menuSelection.quote, ...menuSelection.quoteTopic },
+    };
     setMenuOpen(false);
     dismiss();
     window.getSelection()?.removeAllRanges();
@@ -320,7 +338,7 @@ function SelectionActions({
     if (!onQuote || current.phase !== "offered") return;
     window.getSelection()?.removeAllRanges();
     dismiss();
-    onQuote({ quote: current.quote });
+    onQuote({ quote: current.quote, ...current.quoteTopic });
   }, [dismiss, onQuote]);
 
   if (menuOpen && menuSelection) {
@@ -401,6 +419,7 @@ function pluginSelection(
 function readSelectionPassage(
   stream: HTMLElement | null,
   selection: Selection | null,
+  resolveQuoteTopicByRowId: AssistantSelectionQuoteProps["resolveQuoteTopicByRowId"],
 ): SelectionPassage | null {
   if (!stream || !selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
   const range = selection.getRangeAt(0);
@@ -408,13 +427,21 @@ function readSelectionPassage(
   const quote = createAssistantSelectionMarkdown(selection);
   // A live Range can retarget to a connected parent when virtualization removes its text.
   const endpoints = [range.startContainer, range.endContainer] as const;
-  const messageRowId =
-    eventTargetElement(range.startContainer)
-      ?.closest<HTMLElement>("[data-message-id]")
-      ?.getAttribute("data-message-id")
-      ?.trim() || null;
+  const row = eventTargetElement(range.startContainer)?.closest<HTMLElement>("[data-message-id]");
+  const messageRowId = row?.dataset.messageId?.trim() || null;
+  const historyRowId = row?.dataset.historyRowId;
+  // The Markdown reader accepts one logical message, including its split rows. Resolve the
+  // selected row, never the latest assistant reply or the enclosing turn's topic.
+  const quoteTopic = historyRowId ? resolveQuoteTopicByRowId?.(historyRowId) : undefined;
   return quote
-    ? { range: range.cloneRange(), endpoints, text: selection.toString(), quote, messageRowId }
+    ? {
+        range: range.cloneRange(),
+        endpoints,
+        text: selection.toString(),
+        quote,
+        quoteTopic,
+        messageRowId,
+      }
     : null;
 }
 

@@ -6,7 +6,8 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { within } from "@testing-library/dom";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { WorkspaceDurableItem } from "@getpaseo/protocol/messages";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
@@ -15,6 +16,7 @@ import { ToastProvider } from "@/contexts/toast-context";
 import { DiffDocumentWorkspaceCacheProvider } from "@/git/diff-document/workspace-cache";
 import { i18n } from "@/i18n/i18next";
 import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
+import { MobilePanelsProvider } from "@/mobile-panels/provider";
 import { AgentConversationPanel } from "@/panels/agent-panel";
 import {
   PaneFocusProvider,
@@ -151,16 +153,13 @@ function serve(items: WorkspaceDurableItem[]) {
   }));
   const decide = vi.fn<DaemonClient["decideWorkspaceDurableItem"]>();
   const readFile = vi.fn<DaemonClient["readFile"]>();
-  const client = {
+  const client = Object.assign(new DaemonClient({ url: "ws://unused.test", clientId: "host" }), {
     readFile,
     listWorkspaceDurableItems: list,
     decideWorkspaceDurableItem: decide,
-  } satisfies Pick<
-    DaemonClient,
-    "listWorkspaceDurableItems" | "decideWorkspaceDurableItem" | "readFile"
-  >;
+  });
   const store = useSessionStore.getState();
-  store.initializeSession("host", client as unknown as DaemonClient, 1);
+  store.initializeSession("host", client, 1);
   store.updateSessionServerInfo("host", {
     serverId: "host",
     hostname: null,
@@ -183,12 +182,17 @@ function serve(items: WorkspaceDurableItem[]) {
   return { list, decide, snapshot, readFile };
 }
 
-function render(agentId = "agent", active = true) {
+function render(agentId = "agent", active = true, pendingOnly = false) {
   act(() =>
     root.render(
       <QueryClientProvider client={queryClient}>
         <RetainedPanelActivity active={active}>
-          <AgentDurableItems serverId="host" workspaceId="workspace" agentId={agentId} />
+          <AgentDurableItems
+            serverId="host"
+            workspaceId="workspace"
+            agentId={agentId}
+            pendingOnly={pendingOnly}
+          />
         </RetainedPanelActivity>
       </QueryClientProvider>,
     ),
@@ -196,7 +200,7 @@ function render(agentId = "agent", active = true) {
   return within(container);
 }
 
-function seedConversationAgents() {
+function seedConversationAgents(mainAgentId?: string) {
   const store = useSessionStore.getState();
   const date = new Date(pending.createdAt);
   const shared: Omit<Agent, "id"> = {
@@ -231,15 +235,41 @@ function seedConversationAgents() {
     parentAgentId: null,
     labels: {},
   };
-  store.setAgents("host", new Map(["agent", "sibling-agent"].map((id) => [id, { ...shared, id }])));
+  store.setAgents(
+    "host",
+    new Map<string, Agent>(
+      ["agent", "sibling-agent"].map((id) => [
+        id,
+        {
+          ...shared,
+          id,
+          status: id === mainAgentId ? "idle" : shared.status,
+          archivedAt: id === mainAgentId ? null : shared.archivedAt,
+          labels:
+            id === mainAgentId ? { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } : shared.labels,
+        },
+      ]),
+    ),
+  );
+  if (mainAgentId) {
+    store.applyAgentTimelineResponseState("host", mainAgentId, {
+      items: [],
+      head: [],
+      range: null,
+      older: "none",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+  }
 }
 
-function conversationPane(agentId: string): PaneContextValue {
+function conversationPane(agentId: string, host: PaneContextValue["host"]): PaneContextValue {
   const noop = () => {};
   return {
     serverId: "host",
     workspaceId: "workspace",
-    host: "main",
+    host,
     tabId: agentId,
     target: { kind: "agent", agentId },
     closeCurrentTab: noop,
@@ -290,13 +320,15 @@ function renderConversation(
     active = true,
     focused = true,
     sheetHost,
+    paneHost = "main",
   }: {
     active?: boolean;
     focused?: boolean;
     sheetHost?: SheetPaneHost;
+    paneHost?: PaneContextValue["host"];
   } = {},
 ) {
-  const value = conversationPane(agentId);
+  const value = conversationPane(agentId, paneHost);
   const conversation = (
     <RetainedPanelActivity active={active}>
       <PaneProvider value={value}>
@@ -323,7 +355,9 @@ function renderConversation(
   act(() =>
     root.render(
       <QueryClientProvider client={queryClient}>
-        <PortalProvider>{content}</PortalProvider>
+        <PortalProvider>
+          <MobilePanelsProvider>{content}</MobilePanelsProvider>
+        </PortalProvider>
       </QueryClientProvider>,
     ),
   );
@@ -342,8 +376,17 @@ it("shows only pending requests from this agent and workspace", async () => {
     },
     { ...pending, workspaceId: "other", title: "Another workspace's request" },
   ]);
-  seedConversationAgents();
-  const view = renderConversation("agent");
+  seedConversationAgents("agent");
+  const sheetHost: SheetPaneHost = {
+    workspaceKey: "host:workspace",
+    serverId: "host",
+    workspaceId: "workspace",
+    isWorkspaceFocused: true,
+    buildContent: () => {
+      throw new Error("No additional sheet is opened by this test");
+    },
+  };
+  const view = renderConversation("agent", { paneHost: "sheet", sheetHost });
   await view.findByText("Workspace authorization");
   expect(view.queryByText("Earlier authorization")).toBeNull();
   expect(view.getAllByTestId("durable-item-card")).toHaveLength(1);
@@ -352,12 +395,21 @@ it("shows only pending requests from this agent and workspace", async () => {
   expect(view.queryByText("Another workspace's request")).toBeNull();
   expect(view.queryByText("Another agent's request")).toBeNull();
 
-  renderConversation("sibling-agent");
+  renderConversation("sibling-agent", { paneHost: "sheet", sheetHost });
   await expect.element(await view.findByText("Another agent's request")).toBeVisible();
   expect(view.queryByText("Workspace authorization")).toBeNull();
   expect(list.mock.calls.map(([scope]) => scope)).toEqual([
     { workspaceId: "workspace", limit: 100, cursor: undefined },
   ]);
+});
+
+it("keeps resolved requests visible in an ordinary conversation", async () => {
+  serve([pending, decided({ ...pending, requestId: "old", title: "Earlier authorization" })]);
+  seedConversationAgents();
+  const view = renderConversation("agent");
+  await view.findByText("Earlier authorization");
+  expect(view.getAllByTestId("durable-item-card")).toHaveLength(2);
+  expect(view.getAllByRole("button", { name: "Approve" })).toHaveLength(1);
 });
 
 it("refreshes the production conversation on focus and on activation after hiding", async () => {
@@ -426,7 +478,7 @@ it("collapses the request list when the last pending request is resolved remotel
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const items: WorkspaceDurableItem[] = [pending];
   const { list, decide } = serve(items);
-  const view = render();
+  const view = render("agent", true, true);
   await expect.element(await view.findByRole("button", { name: "Approve" })).toBeEnabled();
 
   items[0] = decided(pending);
@@ -435,7 +487,7 @@ it("collapses the request list when the last pending request is resolved remotel
   expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
   expect(decide).not.toHaveBeenCalled();
 
-  render("agent", false);
+  render("agent", false, true);
   const callsBeforeHiding = list.mock.calls.length;
   await act(async () => vi.advanceTimersByTimeAsync(30_000));
   expect(list).toHaveBeenCalledTimes(callsBeforeHiding);
@@ -443,7 +495,7 @@ it("collapses the request list when the last pending request is resolved remotel
 
 it("collapses the request list after a confirmed decision before refreshing the list", async () => {
   const { list, decide } = serve([pending]);
-  const view = render();
+  const view = render("agent", true, true);
   const approve = await view.findByRole("button", { name: "Approve" });
   await expect.element(approve).toBeEnabled();
   const result = decided(pending);
@@ -468,17 +520,18 @@ it("collapses the request list after a confirmed decision before refreshing the 
 
 it("blocks a cached action until a returning host confirms its latest state", async () => {
   const { list, decide, snapshot } = serve([pending]);
-  const view = render();
+  const renderPending = () => render("agent", true, true);
+  const view = renderPending();
   await expect.element(await view.findByRole("button", { name: "Approve" })).toBeEnabled();
 
   snapshot.connectionStatus = "offline";
-  render();
+  renderPending();
   await expect.element(view.getByRole("button", { name: "Approve" })).toBeDisabled();
 
   let finishRefresh!: (response: Awaited<ReturnType<typeof list>>) => void;
   list.mockImplementationOnce(() => new Promise((resolve) => (finishRefresh = resolve)));
   snapshot.connectionStatus = "online";
-  render();
+  renderPending();
   await expect.element(view.getByText("Checking this request…")).toBeVisible();
   await expect.element(view.getByRole("button", { name: "Approve" })).toBeDisabled();
   expect(decide).not.toHaveBeenCalled();

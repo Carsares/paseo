@@ -1,3 +1,5 @@
+/// <reference types="vitest/importMeta" />
+
 import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
 import { mapCustomMessageToToolCall } from "../custom-message.js";
 import { randomUUID } from "node:crypto";
@@ -138,6 +140,7 @@ const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
 const PASEO_PI_REWIND_ENTRY_TYPE = "paseo_rewind";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
+const PASEO_PI_ASSISTANT_ID_MARKER = "PASEO_ASSISTANT_ID ";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
 const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PI_RPC_TIMEOUT_MS = 60_000;
@@ -712,6 +715,7 @@ function createPiPaseoExtensionFile({
 	    pi.registerMcpServer(name, config);
 	  }
 	  const submittedUserMessages = [];
+	  let assistantId;
 	  ${piExtensionRuntimeBridge}
 
 	  function emitSubmittedUserEntries(ctx) {
@@ -752,12 +756,32 @@ function createPiPaseoExtensionFile({
 	    if (event.message?.role === "user") {
 	      submittedUserMessages.push(event.message);
 	    }
+	    if (event.message?.role === "assistant") {
+	      // Pi persists this object after the extension hook. Keep the ID already streamed
+	      // even if a provider response ID arrived after the first text delta.
+	      if (assistantId && assistantId !== event.message.responseId) {
+	        event.message.paseoAssistantMessageId = assistantId;
+	      }
+	      assistantId = undefined;
+	    }
 	  });
 
 	  pi.on("message_start", async (event, ctx) => {
 	    if (event.message?.role === "assistant") {
+	      assistantId = event.message.responseId;
 	      emitSubmittedUserEntries(ctx);
 	    }
+	  });
+
+	  pi.on("message_update", async (event, ctx) => {
+	    if (assistantId || event.assistantMessageEvent.type !== "text_delta") {
+	      return;
+	    }
+	    // Use the last appended entry rather than the active leaf, which a rewind can reuse.
+	    // Every persisted reply advances this tail, even if two replies have identical text.
+	    assistantId = event.message?.responseId ||
+	      ("paseo:pi:assistant:" + (ctx.sessionManager.getEntries().at(-1)?.id ?? ""));
+	    ctx.ui.notify("${PASEO_PI_ASSISTANT_ID_MARKER}" + assistantId, "info");
 	  });
 
 	  pi.on("turn_end", async (_event, ctx) => {
@@ -1209,6 +1233,7 @@ export class PiRpcAgentSession implements AgentSession {
   private activeTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private activeAssistantMessageId: string | null = null;
+  private unstampedAssistantCount = 0;
   private activeTurnStarted = false;
   private activeTurnStartedEmitted = false;
   private pendingSettledMessages: PiAgentMessage[] | null = null;
@@ -2164,6 +2189,10 @@ export class PiRpcAgentSession implements AgentSession {
   ): void {
     const message = optionalString(event.message);
     if (event.method === "notify" && message) {
+      if (message.startsWith(PASEO_PI_ASSISTANT_ID_MARKER)) {
+        this.activeAssistantMessageId ??= message.slice(PASEO_PI_ASSISTANT_ID_MARKER.length);
+        return;
+      }
       const extensionMapping = this.extensionHost.mapRuntimeNotification(message);
       if (extensionMapping) {
         this.emitExtensionOutput(extensionMapping, this.currentTurnIdForEvent());
@@ -2529,8 +2558,10 @@ export class PiRpcAgentSession implements AgentSession {
     }
     this.firstToken.replyUpdated(event.assistantMessageEvent, Date.now());
     if (event.assistantMessageEvent.type === "text_delta") {
-      // Pi-compatible runtimes may emit updates without a preceding message_start.
-      this.activeAssistantMessageId ??= event.message?.responseId || randomUUID();
+      // Runtimes without the Paseo extension can still group live deltas. This
+      // transient ID is never used to match persisted history.
+      this.activeAssistantMessageId ??=
+        event.message?.responseId || `pi-live-assistant-${++this.unstampedAssistantCount}`;
       this.emit({
         type: "timeline",
         provider: this.provider,
@@ -3118,4 +3149,158 @@ export class PiRpcAgentClient implements AgentClient {
       defaultBinary: PI_BINARY_COMMAND,
     });
   }
+}
+
+if (import.meta.vitest) {
+  const { expect, test } = import.meta.vitest;
+
+  test("restores each Pi reply's topic on restart when response IDs are missing", async () => {
+    const { pathToFileURL } = await import("node:url");
+    const { default: pino } = await import("pino");
+    const { AgentManager, topicFollowupRunOptions } = await import("../../agent-manager.js");
+    const { AgentStorage } = await import("../../agent-storage.js");
+    const { FakePi } = await import("./test-utils/fake-pi.js");
+    const { readPiTranscript } = await import("./transcript.js");
+
+    const root = mkdtempSync(join(tmpdir(), "paseo-pi-topic-restart-"));
+    const transcript = join(root, "pi.jsonl");
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(root, "agents"), logger);
+    const start = (runtime: PiRuntime) =>
+      new AgentManager({
+        clients: {
+          pi: Object.assign(new PiRpcAgentClient({ logger, runtime }), {
+            isAvailable: async () => true,
+          }),
+        },
+        registry: storage,
+        logger,
+        topicHistoryDirectory: join(root, "topic-history"),
+      });
+    class TranscriptPi extends FakePi {
+      override async startSession(input: PiStartSessionInput) {
+        const session = await super.startSession(input);
+        if (input.extensionPaths?.length) {
+          session.state.sessionFile = transcript;
+          const runtimeSession: PiRuntimeSession = session;
+          runtimeSession.getHistory = async () =>
+            existsSync(transcript)
+              ? readPiTranscript(readFileSync(transcript, "utf8"))
+              : { messages: [], userEntries: [] };
+        }
+        return session;
+      }
+    }
+    const pi = new TranscriptPi();
+    const first = start(pi);
+    const second = start(new TranscriptPi());
+    try {
+      const agent = await first.createAgent({ provider: "pi", cwd: root }, undefined, {
+        workspaceId: "workspace",
+      });
+      const runtime = pi.latestSession();
+      const script = pi.recordedLaunches.at(-1)?.extensionPaths?.[0];
+      if (!script) throw new Error("Expected a launched Pi extension");
+      const { default: register } = await import(pathToFileURL(script).href);
+      const entries: Array<{ type: string; id: string; parentId: string | null; message: object }> =
+        [
+          {
+            type: "message",
+            id: "user",
+            parentId: null,
+            message: { role: "user", content: "prompt" },
+          },
+        ];
+      const context = {
+        sessionManager: { getEntries: () => entries },
+        ui: {
+          notify: (message: string) =>
+            runtime.emit({ type: "extension_ui_request", id: "notify", method: "notify", message }),
+        },
+      };
+      type Hook = (
+        event: { message: object; assistantMessageEvent?: { type: string } },
+        ctx: typeof context,
+      ) => Promise<void>;
+      const hooks = new Map<string, Hook>();
+      register({
+        on: (type: string, hook: Hook) => hooks.set(type, hook),
+        events: { on() {} },
+        registerCommand() {},
+      });
+
+      const expected = [];
+      for (const task of ["one", "two"]) {
+        const turn = first.streamAgent(agent.id, "prompt", {
+          ...topicFollowupRunOptions({
+            workspaceId: "workspace",
+            mainAgentId: agent.id,
+            topicKey: `task:${task}`,
+            rootMessageId: task,
+          }),
+          clientMessageId: task,
+        });
+        const { value } = await turn.next();
+        expect(value).toMatchObject({ type: "turn_started", turnId: expect.any(String) });
+        if (value?.type !== "turn_started") throw new Error("Expected an accepted Pi turn");
+        const partial = { role: "assistant" as const, content: [], timestamp: 1000 };
+        const final = {
+          ...partial,
+          content: [{ type: "text" as const, text: "same reply" }],
+        };
+        // Cover stripped RPC updates and a compatible runtime without message_start.
+        if (task === "one") {
+          await hooks.get("message_start")!({ message: partial }, context);
+          runtime.emit({ type: "message_start", message: partial });
+        }
+        for (const delta of ["same ", "reply"]) {
+          const update = { type: "text_delta" as const, delta };
+          await hooks.get("message_update")!(
+            { message: partial, assistantMessageEvent: update },
+            context,
+          );
+          runtime.emit({ type: "message_update", assistantMessageEvent: update });
+        }
+        await hooks.get("message_end")!({ message: final }, context);
+        runtime.emit({ type: "message_end", message: final });
+        entries.push({ type: "message", id: task, parentId: entries.at(-1)!.id, message: final });
+        runtime.finishTurn(final);
+        for await (const _ of turn) {
+          // Drain the accepted turn so its timeline writes can finish.
+        }
+        expected.push({
+          topicKey: `task:${task}`,
+          rootMessageId: task,
+          turnId: value.turnId,
+          item: { text: "same reply" },
+        });
+      }
+      const replies = (manager: InstanceType<typeof AgentManager>) =>
+        manager
+          .fetchTimeline(agent.id, { limit: 0 })
+          .rows.filter(({ item }) => item.type === "assistant_message");
+      const live = replies(first);
+      expect(live).toMatchObject(expected);
+
+      const header = { type: "session", version: 3, id: "pi-session-1", cwd: root };
+      writeFileSync(
+        transcript,
+        [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n"),
+      );
+      const persistence = first.getAgent(agent.id)?.persistence;
+      if (!persistence) throw new Error("Expected a persisted Pi session");
+      await first.closeAgent(agent.id);
+      await first.flushForShutdown();
+      await second.resumeAgentFromPersistence(persistence, { cwd: root }, agent.id);
+      await second.hydrateTimelineFromProvider(agent.id);
+      expect(replies(second)).toMatchObject(expected);
+    } finally {
+      for (const manager of [first, second]) {
+        await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+        await manager.flushForShutdown();
+      }
+      await storage.flush();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 }

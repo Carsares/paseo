@@ -5,7 +5,9 @@ import type { AgentMetric } from "@getpaseo/protocol/agent-types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { ComposerQuoteProvider } from "@/assistant-selection-copy/composer-quote";
+import { createQuoteAttachment } from "@/attachments/quote";
 import type { QuoteTopicSourceMetadata } from "@/attachments/types";
+import { resolveQuotedTopicRoutingTarget } from "@/composer/actions";
 import { FloatingPanelPortalHost } from "@/components/ui/floating-panel-portal";
 import { i18n } from "@/i18n/i18next";
 import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
@@ -255,6 +257,133 @@ it("ignores a selection that lies in another message", () => {
   } finally {
     window.getSelection()?.removeAllRanges();
   }
+});
+
+describe("footer quote routing from selected rows", () => {
+  const question: StreamItem = {
+    kind: "user_message",
+    id: "question-row",
+    messageId: "new-root",
+    turnId: "shared-turn",
+    text: "What comes next?",
+    timestamp: FRIDAY_NIGHT,
+  };
+  const older: StreamItem = {
+    kind: "assistant_message",
+    id: "older-row",
+    messageId: "older-answer",
+    turnId: "shared-turn",
+    topicKey: "msg:older",
+    rootMessageId: "older",
+    taskId: "older-task",
+    text: "Older topic update.",
+    timestamp: FRIDAY_NIGHT,
+  };
+  const newer: StreamItem = {
+    kind: "assistant_message",
+    id: "newer-row",
+    messageId: "newer-answer",
+    turnId: "shared-turn",
+    topicKey: "msg:new-root",
+    rootMessageId: "new-root",
+    text: "Current topic update.",
+    timestamp: FRIDAY_NIGHT,
+  };
+  const unstamped: StreamItem = {
+    kind: "assistant_message",
+    id: "plain-row",
+    turnId: "shared-turn",
+    text: "Plain update.",
+    timestamp: FRIDAY_NIGHT,
+  };
+
+  function renderQuoteRows(items: StreamItem[]) {
+    const attachments: ReturnType<typeof createQuoteAttachment>[] = [];
+    renderCompletedFooter(TIMING, {
+      items: [question, ...items],
+      startIndex: items.length,
+      addQuoteAttachment: (text, label, metadata) =>
+        attachments.push(createQuoteAttachment({ text, label, ...metadata })),
+      streamChildren: items.map((item) => (
+        <div key={item.id} data-history-row-id={item.id} data-message-id={item.id}>
+          {item.kind === "assistant_message" ? item.text : null}
+        </div>
+      )),
+    });
+    return attachments;
+  }
+
+  function selectRows(first: StreamItem, last: StreamItem, endOffset: number) {
+    const firstText = host.querySelector(`[data-history-row-id="${first.id}"]`)!.firstChild!;
+    const lastText = host.querySelector(`[data-history-row-id="${last.id}"]`)!.firstChild!;
+    const range = document.createRange();
+    range.setStart(firstText, 0);
+    range.setEnd(lastText, endOffset);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return selection.toString().trim();
+  }
+
+  it("routes to the selected older reply even when the selection ends before text in a newer row", () => {
+    const attachments = renderQuoteRows([older, newer]);
+    try {
+      selectRows(older, newer, 0);
+      act(() => {
+        const button = quoteButton()!;
+        button.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+        window.getSelection()?.removeAllRanges();
+        button.click();
+      });
+
+      expect(attachments).toEqual([
+        expect.objectContaining({
+          text: older.text,
+          topicKey: "msg:older",
+          rootMessageId: "older",
+          taskId: "older-task",
+          sourceMessageId: "older-answer",
+        }),
+      ]);
+      expect(resolveQuotedTopicRoutingTarget({ attachments })).toMatchObject({
+        topicKey: "msg:older",
+        rootMessageId: "older",
+        taskId: "older-task",
+      });
+    } finally {
+      window.getSelection()?.removeAllRanges();
+    }
+  });
+
+  it("keeps a selection across topics together and routes through main even with another attributed quote", () => {
+    const attachments = renderQuoteRows([older, newer]);
+    try {
+      const text = selectRows(older, newer, newer.text.length);
+      act(() => quoteButton()?.click());
+      expect(attachments).toEqual([expect.objectContaining({ text, label: "Quote selection" })]);
+      expect(resolveQuotedTopicRoutingTarget({ attachments })).toBeNull();
+      const singleTopicQuote = createQuoteAttachment({ text: "Follow-up", topicKey: "msg:older" });
+      expect(
+        resolveQuotedTopicRoutingTarget({ attachments: [singleTopicQuote, ...attachments] }),
+      ).toBeNull();
+    } finally {
+      window.getSelection()?.removeAllRanges();
+    }
+  });
+
+  it("keeps an unstamped selected reply as plain text even when the turn has a root prompt", () => {
+    const attachments = renderQuoteRows([unstamped]);
+    try {
+      selectRows(unstamped, unstamped, unstamped.text.length);
+      act(() => quoteButton()?.click());
+      expect(attachments).toEqual([
+        { id: expect.any(String), kind: "quote", text: unstamped.text, label: "Quote selection" },
+      ]);
+      expect(resolveQuotedTopicRoutingTarget({ attachments })).toBeNull();
+    } finally {
+      window.getSelection()?.removeAllRanges();
+    }
+  });
 });
 
 it("caps a quoted selection at 500 characters", () => {

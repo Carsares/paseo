@@ -82,7 +82,11 @@ import type {
   AgentSessionConfig,
   AgentTimelineItem,
 } from "../agent-sdk-types.js";
-import type { AgentManager, ManagedAgent } from "../agent-manager.js";
+import type {
+  AgentManager,
+  AuthoritativeTopicAttribution,
+  ManagedAgent,
+} from "../agent-manager.js";
 import {
   ActiveTurnBehaviorSchema,
   AgentActiveTurnBehaviorSchema,
@@ -199,6 +203,7 @@ import {
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 import {
   WorkspaceTaskLedgerStore,
+  type WorkspaceTask,
   projectTaskParticipantReuse,
   WorkspaceTaskToolInputSchema,
 } from "../task-ledger/index.js";
@@ -2108,6 +2113,8 @@ async function withPeerStateMutex<T>(
 }
 
 const peerRuntimeByManager = new WeakMap<object, PeerWorkspaceRuntime>();
+// A deliberate reassignment can override a non-resident recipient's inherited task.
+const assignedTurnTopics = new WeakSet<AuthoritativeTopicAttribution>();
 
 function getPeerWorkspaceRuntime(
   key: object,
@@ -4806,6 +4813,7 @@ function createToolCatalog(
       },
       async (args: z.output<typeof assignTopicAttributionInputSchema>) => {
         const { workspaceId, mainAgentId } = await requireButlerCaller(args.workspaceId);
+        const { turnId } = readButlerDecisionTurn(mainAgentId);
         if (getActivePeerTurnContext(mainAgentId)) {
           throw new PaseoToolInputError(
             "Cross-workspace peer messages are read-only and cannot change topic attribution.",
@@ -4834,11 +4842,18 @@ function createToolCatalog(
           );
         }
         const { anchor } = persisted;
-        agentManager.setActiveTurnTopicAttribution(mainAgentId, {
-          topicKey: anchor.topicKey,
-          taskId: anchor.taskId,
-          rootMessageId: anchor.rootMessageId,
-        });
+        if (turnId) {
+          const assigned = agentManager.setActiveTurnTopicAttribution(
+            mainAgentId,
+            {
+              topicKey: anchor.topicKey,
+              taskId: anchor.taskId,
+              rootMessageId: anchor.rootMessageId,
+            },
+            turnId,
+          );
+          if (assigned) assignedTurnTopics.add(assigned);
+        }
         return {
           content: [],
           structuredContent: ensureValidJson({
@@ -4879,11 +4894,15 @@ function createToolCatalog(
     );
     const main = await findLocalMain(agentId, workspaceId);
     if (!main) return;
+    const initialStamp = agentManager.getTurnTopicAttribution(agentId, sourceTurnId);
+    if (isExplicitToolTopic(initialStamp)) return initialStamp;
     const [rows, tasks, entries] = await Promise.all([
       agentManager.getTimelineRows(agentId),
       taskLedger?.list(workspaceId) ?? [],
       options.listTopicEntries?.({ workspaceId, mainAgentId: main.id }) ?? [],
     ]);
+    const stamped = agentManager.getTurnTopicAttribution(agentId, sourceTurnId);
+    if (isExplicitToolTopic(stamped)) return stamped;
     const messageIds = readDurableItemTurnMessageIds(rows, sourceTurnId);
     const topic = resolveDurableItemTurnTopic({
       agentId,
@@ -4893,8 +4912,29 @@ function createToolCatalog(
       tasks,
       entries,
     });
+    if (stamped && (!topic || topic.rootMessageId !== stamped.rootMessageId)) return stamped;
     if (topic) return topic;
     if (agentId !== main.id || !agentManager.isActiveTurnHumanInitiated(agentId)) return;
+    return resolveHumanTurnTopic({ rows, sourceTurnId, tasks, messageIds });
+  }
+
+  function isExplicitToolTopic(stamped: AuthoritativeTopicAttribution | undefined): boolean {
+    return (
+      stamped !== undefined && (stamped.taskId !== undefined || assignedTurnTopics.has(stamped))
+    );
+  }
+
+  function resolveHumanTurnTopic({
+    rows,
+    sourceTurnId,
+    tasks,
+    messageIds,
+  }: {
+    rows: Awaited<ReturnType<AgentManager["getTimelineRows"]>>;
+    sourceTurnId: string;
+    tasks: readonly WorkspaceTask[];
+    messageIds: ReadonlySet<string>;
+  }) {
     const root = rows.find(
       ({ item, turnId }) =>
         turnId === sourceTurnId &&
@@ -4962,9 +5002,13 @@ function createToolCatalog(
     turnId: string,
     binding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
     inheritedTarget?: { taskId: string; rootMessageId?: string },
-  ): Promise<{ rootMessageId?: string; taskId?: string } | undefined> {
+  ): Promise<{ rootMessageId?: string; taskId?: string; explicitlyAssigned?: true } | undefined> {
     if (binding?.rootMessageId) {
       return { rootMessageId: binding.rootMessageId, taskId: undefined };
+    }
+    const stamped = agentManager.getTurnTopicAttribution(callerId, turnId);
+    if (!binding && stamped && assignedTurnTopics.has(stamped)) {
+      return { ...stamped, explicitlyAssigned: true };
     }
     if (!binding && inheritedTarget?.taskId) {
       return resolveInheritedTaskDelegationTopic(callerId, workspaceId, turnId, inheritedTarget);
@@ -5011,6 +5055,7 @@ function createToolCatalog(
       rootMessageId,
       rootPromptText,
       taskId: binding ? undefined : topic.taskId,
+      ...(topic.explicitlyAssigned ? { explicitlyAssigned: true } : {}),
     };
   }
 
@@ -7743,6 +7788,8 @@ function createToolCatalog(
   ): ReportTopic {
     const taskTopic = reportTopicForDelivery(caller, localParent, taskReport, verified);
     if (!delegation) return taskTopic;
+    if (delegation.explicitlyAssigned)
+      return { rootMessageId: delegation.rootMessageId, taskId: delegation.taskId };
     const inheritedNonResidentTask =
       !delegation.taskId && !isResidentAgentLabels(caller.labels) && taskTopic.taskId
         ? taskTopic

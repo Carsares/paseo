@@ -1,4 +1,5 @@
 import { within } from "@testing-library/dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React, { act, useCallback, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, test, vi } from "vitest";
@@ -86,15 +87,24 @@ test("opens from the workspace menu and shows host update and reconnect states",
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
+  const queryClient = new QueryClient();
   const view = within(document.body);
   try {
-    await act(async () => root.render(<Harness connected />));
+    const render = (connected: boolean) =>
+      act(async () =>
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <Harness connected={connected} />
+          </QueryClientProvider>,
+        ),
+      );
+    await render(true);
     await act(async () => view.getByRole("button", { name: "Workspace actions" }).click());
     const upgrade = await view.findByRole("menuitem", { name: "Upgrade to topic" });
     await act(async () => upgrade.click());
     expect(view.getByText("Update the host to upgrade this workspace.")).toBeTruthy();
 
-    await act(async () => root.render(<Harness connected={false} />));
+    await render(false);
     expect(view.getByText("Reconnect to the host to upgrade this workspace.")).toBeTruthy();
     expect(updateWorkspaceTopic).not.toHaveBeenCalled();
   } finally {
@@ -109,30 +119,33 @@ test("selects the translated upgrade action from the mobile workspace menu", asy
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   await i18n.changeLanguage("zh-CN");
   const onUpgradeToTopic = vi.fn();
+  const queryClient = new QueryClient();
   const container = document.body.appendChild(document.createElement("div"));
   const root = createRoot(container);
   const view = within(document.body);
   try {
     await act(async () =>
       root.render(
-        <WorkspaceHeaderMenuMobile
-          normalizedServerId="test-host"
-          normalizedWorkspaceId={workspaceId}
-          scripts={emptyScripts}
-          currentBranchName="main"
-          showWorkspaceSetup={false}
-          importAgentDisabled={false}
-          copyPathDisabled={false}
-          showCreateBrowserTab={false}
-          createTerminalDisabled
-          onCreateTerminalWithProfile={noop}
-          onCreateBrowser={noop}
-          onOpenImportSheet={noop}
-          onCopyWorkspacePath={noop}
-          onCopyBranchName={noop}
-          onOpenSetupTab={noop}
-          onUpgradeToTopic={onUpgradeToTopic}
-        />,
+        <QueryClientProvider client={queryClient}>
+          <WorkspaceHeaderMenuMobile
+            normalizedServerId="test-host"
+            normalizedWorkspaceId={workspaceId}
+            scripts={emptyScripts}
+            currentBranchName="main"
+            showWorkspaceSetup={false}
+            importAgentDisabled={false}
+            copyPathDisabled={false}
+            showCreateBrowserTab={false}
+            createTerminalDisabled
+            onCreateTerminalWithProfile={noop}
+            onCreateBrowser={noop}
+            onOpenImportSheet={noop}
+            onCopyWorkspacePath={noop}
+            onCopyBranchName={noop}
+            onOpenSetupTab={noop}
+            onUpgradeToTopic={onUpgradeToTopic}
+          />
+        </QueryClientProvider>,
       ),
     );
     await act(async () => view.getByTestId("workspace-header-menu-trigger").click());

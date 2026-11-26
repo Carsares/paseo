@@ -11,6 +11,7 @@ export const topicDelegationScopeSchema = z.object({
   rootMessageId: z.string().min(1),
   rootPromptText: z.string(),
   taskId: z.string().min(1).optional(),
+  explicitlyAssigned: z.literal(true).optional(),
 });
 export type TopicDelegationScope = z.infer<typeof topicDelegationScopeSchema>;
 
@@ -339,6 +340,17 @@ export class TopicDelegationStore {
     )
       return "interrupted";
     return entry.status === "starting" ? "queued" : entry.status;
+  }
+
+  hasOtherTopicParticipant(reporting: Scope & Recipient & Pick<Record, "rootMessageId">) {
+    return this.run(reporting.workspaceId, (records) =>
+      records.some(
+        (entry) =>
+          entry.mainAgentId === reporting.mainAgentId &&
+          entry.rootMessageId === reporting.rootMessageId &&
+          !sameRecipient(entry, reporting),
+      ),
+    );
   }
 
   anchors(scope: Scope): Promise<TopicAnchorSummary[]> {

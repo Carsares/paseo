@@ -255,13 +255,18 @@ function UserMessageAlignmentMenuItem() {
   );
 }
 
-function WorkspaceDirectoryMenuItem() {
+function WorkspaceDirectoryMenuItem({
+  isVisible,
+  onToggle,
+}: {
+  isVisible: boolean;
+  onToggle?: () => void;
+}) {
   const { t } = useTranslation();
-  const { openDirectory, isDirectoryVisible, toggleDirectory } = useTeamDirectoryShell();
-  if (!openDirectory) return null;
+  if (!onToggle) return null;
   return (
-    <DropdownMenuItem testID="workspace-header-team-directory" onSelect={toggleDirectory}>
-      {t(isDirectoryVisible ? "topicWorkbench.directory.hide" : "topicWorkbench.directory.show")}
+    <DropdownMenuItem testID="workspace-header-team-directory" onSelect={onToggle}>
+      {t(isVisible ? "topicWorkbench.directory.hide" : "topicWorkbench.directory.show")}
     </DropdownMenuItem>
   );
 }
@@ -502,7 +507,7 @@ function WorkspaceHeaderMenuDesktopSurface({
 }: DesktopWorkspaceHeaderMenuSurfaceProps) {
   const { t } = useTranslation();
   const { item, dialog } = useWorkspaceDirection(topicStatus?.direction);
-  const { openDirectory } = useTeamDirectoryShell();
+  const { openDirectory, isDirectoryVisible, toggleDirectory } = useTeamDirectoryShell();
   return (
     <>
       <DropdownMenu>
@@ -533,7 +538,10 @@ function WorkspaceHeaderMenuDesktopSurface({
             />
           ) : null}
           {topicModeItems}
-          <WorkspaceDirectoryMenuItem />
+          <WorkspaceDirectoryMenuItem
+            isVisible={isDirectoryVisible}
+            onToggle={openDirectory ? toggleDirectory : undefined}
+          />
           <UserMessageAlignmentMenuItem />
           {conditionalItems}
           {gitActions && runGitAction ? (
@@ -926,7 +934,7 @@ export function WorkspaceHeaderMenuMobile({
   ]);
 
   const { item, dialog } = useWorkspaceDirection(topicStatus?.direction);
-  const { openDirectory } = useTeamDirectoryShell();
+  const { openDirectory, isDirectoryVisible, toggleDirectory } = useTeamDirectoryShell();
   return (
     <>
       <DropdownMenu compactMode="sheet">
@@ -970,7 +978,10 @@ export function WorkspaceHeaderMenuMobile({
             />
           ) : null}
           {topicModeItems}
-          <WorkspaceDirectoryMenuItem />
+          <WorkspaceDirectoryMenuItem
+            isVisible={isDirectoryVisible}
+            onToggle={openDirectory ? toggleDirectory : undefined}
+          />
           <UserMessageAlignmentMenuItem />
           <WorkspacePaneActionItems pane={pane} onCreateTab={onCreateTab} />
           {tabs?.length ? (

@@ -1361,6 +1361,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (const check of stopWaiters) check(recipientId);
   });
 
+  function activeReports(recipientId: string): Admitted[] | undefined {
+    const batch = activeBackgroundTurns.get(recipientId);
+    return batch?.every(({ source }) => isChildSource(source)) ? batch : undefined;
+  }
+
   function withdrawPending(recipientId: string, matches: (message: Admitted) => boolean): number {
     const parent = parentInboxes.get(recipientId);
     const removedParent = parent?.filter((message) => isQueued(message) && matches(message)) ?? [];
@@ -1465,9 +1470,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     },
     withdrawPending: (recipientId, matches) =>
       withdrawPending(recipientId, (message) => matches(message.originalSource)),
-    hasActiveBackgroundTurn: (recipientId) => activeBackgroundTurns.has(recipientId),
+    hasActiveBackgroundTurn: (recipientId) => activeReports(recipientId) !== undefined,
     captureActiveBackgroundTurn: (recipientId) => {
-      const messages = activeBackgroundTurns.get(recipientId);
+      const messages = activeReports(recipientId);
       if (!messages?.length) return undefined;
       return {
         recipientId,
@@ -1487,7 +1492,6 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     },
     requeueBackgroundBatch(batch) {
       if (closed || admissionPaused || !batch.messages.length) return 0;
-      activeBackgroundTurns.delete(batch.recipientId);
       const existingIds = new Set<string>([
         ...(inboxes.get(batch.recipientId)?.messages.map((message) => message.receipt.messageId) ??
           []),

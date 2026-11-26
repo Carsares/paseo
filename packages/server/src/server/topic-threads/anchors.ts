@@ -193,13 +193,14 @@ export function topicAnchorInput(
   };
 }
 
-function indexVisibleQuestions(
+export function indexVisibleQuestions(
   rows: readonly AgentTimelineRow[],
   followupMessageIds: ReadonlySet<string>,
 ) {
   const questions = new Map<
     string,
-    Pick<Extract<AgentTimelineRow["item"], { type: "user_message" }>, "text" | "imageAttachments">
+    Pick<Extract<AgentTimelineRow["item"], { type: "user_message" }>, "text" | "imageAttachments"> &
+      Pick<AgentTimelineRow, "timestamp">
   >();
   const questionRootsByAlias = new Map<string, string>();
   for (const row of rows) {
@@ -213,7 +214,7 @@ function indexVisibleQuestions(
       const ids = [item.messageId, item.clientMessageId, row.providerMessageId];
       if (ids.some((id) => id && followupMessageIds.has(id))) continue;
       const root = item.messageId || item.clientMessageId || legacyQuestionId(row);
-      if (!questions.has(root)) questions.set(root, item);
+      if (!questions.has(root)) questions.set(root, { ...item, timestamp: row.timestamp });
       for (const id of ids) {
         if (id && !questionRootsByAlias.has(id)) questionRootsByAlias.set(id, root);
       }
@@ -231,6 +232,13 @@ export function topicAnchorsBeforeReset(
 ): TopicAnchorInput[] {
   const { questions, questionRootsByAlias } = indexVisibleQuestions(rows, followupMessageIds);
   const anchoredRoots = new Set(existing.map((anchor) => anchor.rootMessageId));
+  const attributedRoots = new Set(
+    existing.flatMap((anchor) =>
+      (anchor.attributedMessages ?? []).map(
+        ({ sourceMessageId }) => questionRootsByAlias.get(sourceMessageId) ?? sourceMessageId,
+      ),
+    ),
+  );
   const required = new Map<string, TopicAnchorInput>();
   const boundRoots = new Set<string>();
   for (const task of tasks) {
@@ -254,7 +262,7 @@ export function topicAnchorsBeforeReset(
     );
   }
   for (const [rootMessageId, { text, imageAttachments }] of questions) {
-    if (boundRoots.has(rootMessageId)) continue;
+    if (boundRoots.has(rootMessageId) || attributedRoots.has(rootMessageId)) continue;
     const bound = existing.filter(
       (anchor) => anchor.taskId && anchor.rootMessageId === rootMessageId,
     );

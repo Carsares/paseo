@@ -1,4 +1,5 @@
 import { NativeReadingEpochContext } from "@/agent-stream/native-reading-position";
+import { getAssistantQuoteTopic } from "@/assistant-selection-copy/composer-quote";
 import { ChatFind, ChatFindExpansion } from "@/agent-stream/chat-find";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import React, {
@@ -1442,6 +1443,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       return itemById;
     }, [streamLayout.liveHead]);
 
+    const resolveQuoteTopicByRowId = useStableEvent((rowId: string) =>
+      getAssistantQuoteTopic(
+        (layoutHistoryItemById.get(rowId) ?? layoutLiveHeadItemById.get(rowId))?.item,
+      ),
+    );
+    const webSelectionProps = { resolveQuoteTopicByRowId };
+
     const {
       spawnTarget,
       handleForkAssistantTurn,
@@ -1669,6 +1677,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         <ToolCallSheetProvider>
           <AllowSubagentForkContext.Provider value={allowSubagentFork}>
             <AssistantSelectionCopySurface
+              {...webSelectionProps}
               style={stylesheet.container}
               serverId={resolvedServerId}
               workspaceId={context.workspaceId}

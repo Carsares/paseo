@@ -168,8 +168,12 @@ export class PiHistoryMapper {
   ): AgentStreamEvent[] {
     const events: AgentStreamEvent[] = [];
     this.assistantIndex += 1;
+    // The transcript parser preserves the ID selected by the live Pi extension.
+    const liveId = "paseoAssistantMessageId" in message && message.paseoAssistantMessageId;
     const messageId =
-      message.responseId || `${this.provider}-history-assistant-${this.assistantIndex}`;
+      (typeof liveId === "string" && liveId) ||
+      message.responseId ||
+      `${this.provider}-history-assistant-${this.assistantIndex}`;
     for (const content of message.content) {
       if (content.type === "text" && content.text) {
         events.push({

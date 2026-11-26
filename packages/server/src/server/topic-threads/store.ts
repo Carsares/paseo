@@ -18,9 +18,11 @@ import { z } from "zod";
 import { normalizePathForIdentity } from "../../utils/path.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import type { WorkspaceTask } from "../agent/task-ledger/index.js";
+import type { AgentTimelineRow } from "../agent/agent-timeline-store-types.js";
 
 import {
   checkTopicAddress,
+  indexVisibleQuestions,
   mergeAnchor,
   requireMatchingAnchor,
   sameThreadScope,
@@ -400,9 +402,7 @@ function detachAttributedMessagesFromOtherAnchors(
     const remaining = anchor.attributedMessages.filter(
       (entry) => !attributedSet.has(entry.sourceMessageId),
     );
-    const nextAnchor: TopicAnchorSummary = { ...anchor, updatedAt: now };
-    if (remaining.length > 0) nextAnchor.attributedMessages = remaining;
-    else delete nextAnchor.attributedMessages;
+    const nextAnchor = { ...anchor, updatedAt: now, attributedMessages: remaining };
     updatedOtherAnchors.push(nextAnchor);
     return nextAnchor;
   });
@@ -481,12 +481,35 @@ function applyMessageAttributionsToFile(
     data.entries = migrateLegacyReplies(data, anchor, removedMessageKey, knownTasks);
   }
   data.anchors = anchors;
+  movePreservedAttributedMessages(data.entries, anchor, attributedMessageIds);
   return {
     anchor,
     updatedAnchors: [...detached.updatedOtherAnchors, anchor],
     attributedMessageIds,
     mode,
   };
+}
+
+function movePreservedAttributedMessages(
+  entries: StoredEntry[],
+  anchor: TopicAnchorSummary,
+  attributedMessageIds: readonly string[],
+) {
+  const movedIds = new Set(attributedMessageIds);
+  for (const entry of entries) {
+    if (
+      !sameThreadScope(entry, anchor) ||
+      !entry.sourceMessageId ||
+      !movedIds.has(entry.sourceMessageId) ||
+      entry.role !== "user_followup" ||
+      entry.origin ||
+      !entry.attributedFromTopicKey
+    )
+      continue;
+    entry.topicKey = anchor.topicKey;
+    entry.taskId = anchor.taskId;
+    entry.rootMessageId = anchor.rootMessageId;
+  }
 }
 
 async function readTopicFileImpl(file: string): Promise<TopicFile> {
@@ -591,6 +614,53 @@ export class TopicThreadStore {
       assertCurrent?.();
       await writeJsonFileAtomic(file, data);
       return result;
+    });
+  }
+
+  preserveAttributedMessages(scope: ThreadScope, rows: readonly AgentTimelineRow[]): Promise<void> {
+    return this.run(scope.workspaceId, async (data, file) => {
+      const anchors = data.anchors.filter(
+        (anchor) => sameThreadScope(anchor, scope) && anchor.attributedMessages?.length,
+      );
+      if (!anchors.length) return;
+      const saved = new Set(
+        data.entries.flatMap((entry) =>
+          sameThreadScope(entry, scope) && entry.role === "user_followup" && entry.sourceMessageId
+            ? [entry.sourceMessageId]
+            : [],
+        ),
+      );
+      const { questions, questionRootsByAlias } = indexVisibleQuestions(rows, saved);
+      let changed = false;
+      for (const anchor of anchors) {
+        for (const { sourceMessageId } of anchor.attributedMessages ?? []) {
+          const root = questionRootsByAlias.get(sourceMessageId) ?? sourceMessageId;
+          const prompt = questions.get(root);
+          if (!prompt || saved.has(sourceMessageId) || saved.has(root)) continue;
+          const entry = this.newEntry(
+            data,
+            {
+              ...scope,
+              topicKey: anchor.topicKey,
+              taskId: anchor.taskId,
+              rootMessageId: anchor.rootMessageId,
+              role: "user_followup",
+              routedAgentId: scope.mainAgentId,
+              sourceMessageId,
+              attributedFromTopicKey: `msg:${root}`,
+              text: prompt.text,
+              imageAttachments: prompt.imageAttachments,
+            },
+            "completed",
+            prompt.timestamp,
+          );
+          data.entries.push(entry);
+          saved.add(sourceMessageId);
+          saved.add(root);
+          changed = true;
+        }
+      }
+      if (changed) await writeJsonFileAtomic(file, data);
     });
   }
 
@@ -737,17 +807,18 @@ export class TopicThreadStore {
 
   private newEntry(
     { entries }: TopicFile,
-    input: Followup & Pick<TopicThreadEntry, "role">,
+    input: Followup &
+      Pick<TopicThreadEntry, "role" | "attributedFromTopicKey" | "imageAttachments">,
     status: "queued" | "completed",
+    timestamp = new Date().toISOString(),
   ): TopicThreadEntry {
-    const now = new Date().toISOString();
     return TopicThreadEntrySchema.parse({
       ...input,
       entryId: randomUUID(),
       status,
       seq: (entries.at(-1)?.seq ?? 0) + 1,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: timestamp,
+      updatedAt: timestamp,
     });
   }
 

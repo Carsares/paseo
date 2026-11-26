@@ -905,8 +905,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             ),
             signal,
           );
-          await finishParentReport(record);
           if (!response.accepted) return;
+          await finishParentReport(record);
           return;
         } catch (error) {
           if (signal.aborted) return;

@@ -101,6 +101,7 @@ import { join } from "path";
 import { getCachedHostMachineKind } from "./host-machine-kind.js";
 import { getHostName } from "./host-name.js";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import {
   AgentRunCancellationError,
@@ -643,6 +644,7 @@ type AgentFinishReportConfirmResult = Pick<
 type ConfirmedAgentFinishReport = NonNullable<AgentFinishReportConfirmResult["confirmedReport"]>;
 
 function parentReportFingerprint(report: AgentFinishReport): string {
+  // Mixed-version hosts must hash the original fields. Escalation travels separately as a delivery hint.
   return createHash("sha256")
     .update(
       JSON.stringify([
@@ -651,7 +653,6 @@ function parentReportFingerprint(report: AgentFinishReport): string {
         report.title,
         report.prompt,
         report.event,
-        ...(report.escalateToParent !== undefined ? [report.escalateToParent] : []),
       ]),
     )
     .digest("hex");
@@ -1772,6 +1773,8 @@ export class VoiceAssistantWebSocketServer {
         prior.taskId === anchor.taskId &&
         (prior.rootPromptText === anchor.rootPromptText ||
           (prior.rootPromptText && prior.rootPromptText !== prior.title)) &&
+        (!anchor.imageAttachments ||
+          isDeepStrictEqual(prior.imageAttachments, anchor.imageAttachments)) &&
         prior.title === anchor.title &&
         prior.leadAgentId === anchor.leadAgentId &&
         prior.leadServerId === anchor.leadServerId
@@ -1780,6 +1783,7 @@ export class VoiceAssistantWebSocketServer {
       const written = await this.persistTopicAnchor(anchor, tasks);
       expected.set(written.topicKey, written);
     }
+    await this.topicThreadStore.preserveAttributedMessages(scope, rows);
     await this.verifyPreservedTopicHistory(scope, expected);
   }
 
@@ -1800,6 +1804,7 @@ export class VoiceAssistantWebSocketServer {
         saved.rootMessageId !== anchor.rootMessageId ||
         saved.taskId !== anchor.taskId ||
         saved.rootPromptText !== anchor.rootPromptText ||
+        !isDeepStrictEqual(saved.imageAttachments, anchor.imageAttachments) ||
         saved.title !== anchor.title ||
         saved.leadAgentId !== anchor.leadAgentId ||
         saved.leadServerId !== anchor.leadServerId
@@ -4288,7 +4293,17 @@ export class VoiceAssistantWebSocketServer {
       await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
       return true;
     }
-    if (tasks.some((task) => task.rootMessageId === rootMessageId && isActiveWorkspaceTask(task))) {
+    if (
+      await this.hasOtherLightweightTopicTrack(
+        {
+          ...scope,
+          rootMessageId,
+          agentId: record.childAgentId,
+          serverId: childServerId,
+        },
+        tasks,
+      )
+    ) {
       return false;
     }
     const source = {
@@ -4370,6 +4385,19 @@ export class VoiceAssistantWebSocketServer {
     );
     await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
     return true;
+  }
+
+  private async hasOtherLightweightTopicTrack(
+    reporting: Parameters<
+      NonNullable<AgentManager["topicDelegations"]>["hasOtherTopicParticipant"]
+    >[0],
+    tasks: readonly WorkspaceTask[],
+  ): Promise<boolean> {
+    return (
+      tasks.some(
+        (task) => task.rootMessageId === reporting.rootMessageId && isActiveWorkspaceTask(task),
+      ) || (await this.agentManager.topicDelegations?.hasOtherTopicParticipant(reporting)) === true
+    );
   }
 
   private isRemoteFinishedSuperseded(

@@ -2,7 +2,10 @@ import type { AgentMetric } from "@getpaseo/protocol/agent-types";
 import React, { memo, useCallback, useMemo, type ReactNode } from "react";
 import { View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { QuoteTopicProvider } from "@/assistant-selection-copy/composer-quote";
+import {
+  getAssistantQuoteTopic,
+  QuoteTopicProvider,
+} from "@/assistant-selection-copy/composer-quote";
 import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { SPACING, type Theme } from "@/styles/theme";
 import type { TurnTiming } from "@/timeline/turn-time";
@@ -294,6 +297,10 @@ function CompletedTurnFooter({
     () => resolveTurnQuoteTopicMetadata({ strategy, items, startIndex }),
     [items, startIndex, strategy],
   );
+  const resolveQuoteTopicByRowId = useCallback(
+    (rowId: string) => getAssistantQuoteTopic(items.find((item) => item.id === rowId)),
+    [items],
+  );
   const boundary = resolveAssistantTurnForkBoundary({
     items,
     startIndex,
@@ -310,7 +317,10 @@ function CompletedTurnFooter({
   );
   return (
     <View style={stylesheet.turnFooterSlot}>
-      <QuoteTopicProvider topic={turnQuoteTopic}>
+      <QuoteTopicProvider
+        topic={turnQuoteTopic}
+        resolveQuoteTopicByRowId={resolveQuoteTopicByRowId}
+      >
         <AssistantTurnFooter
           getContent={items[startIndex]?.kind === "assistant_message" ? getContent : undefined}
           messageIds={resolvedMessageIds}

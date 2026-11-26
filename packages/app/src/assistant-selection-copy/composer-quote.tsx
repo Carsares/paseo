@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { normalizeQuoteTopicMetadata } from "@/attachments/quote";
 import type { QuoteTopicSourceMetadata } from "@/attachments/types";
 import { useKeyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher-context";
+import type { StreamItem } from "@/types/stream";
 
 export interface ComposerQuote extends QuoteTopicSourceMetadata {
   quote: string;
@@ -19,11 +20,30 @@ export interface ComposerQuoteTarget {
 }
 
 interface ComposerQuoteContextValue {
-  addQuote: (input: ComposerQuote) => void;
+  addQuote: (input: ComposerQuote, options?: { useAmbientTopic: false }) => void;
 }
 
+type QuoteTopicByRow = (rowId: string) => QuoteTopicSourceMetadata | undefined;
 const ComposerQuoteContext = createContext<ComposerQuoteContextValue | null>(null);
 const QuoteTopicContext = createContext<QuoteTopicSourceMetadata | null>(null);
+const QuoteTopicByRowContext = createContext<QuoteTopicByRow | undefined>(undefined);
+
+export function getAssistantQuoteTopic(
+  item: StreamItem | undefined,
+): QuoteTopicSourceMetadata | undefined {
+  if (item?.kind !== "assistant_message") return undefined;
+  const { taskId, rootMessageId, messageId } = item;
+  let topicKey = item.topicKey;
+  if (!topicKey && taskId) topicKey = `task:${taskId}`;
+  if (!topicKey && rootMessageId) topicKey = `msg:${rootMessageId}`;
+  if (!topicKey) return undefined;
+  return normalizeQuoteTopicMetadata({
+    topicKey,
+    taskId,
+    rootMessageId,
+    sourceMessageId: messageId ?? item.id,
+  });
+}
 
 /**
  * The draft with a quoted passage and the note written under it appended after a blank line.
@@ -77,9 +97,11 @@ export function ComposerQuoteProvider({
  */
 export function QuoteTopicProvider({
   topic,
+  resolveQuoteTopicByRowId,
   children,
 }: {
   topic: QuoteTopicSourceMetadata | null;
+  resolveQuoteTopicByRowId?: QuoteTopicByRow;
   children?: ReactNode;
 }) {
   const topicKey = topic?.topicKey;
@@ -96,7 +118,17 @@ export function QuoteTopicProvider({
     return Object.keys(normalized).length > 0 ? normalized : null;
   }, [rootMessageId, sourceMessageId, taskId, topicKey]);
 
-  return <QuoteTopicContext.Provider value={value}>{children}</QuoteTopicContext.Provider>;
+  return (
+    <QuoteTopicContext.Provider value={value}>
+      <QuoteTopicByRowContext.Provider value={resolveQuoteTopicByRowId}>
+        {children}
+      </QuoteTopicByRowContext.Provider>
+    </QuoteTopicContext.Provider>
+  );
+}
+
+export function useQuoteTopicByRow(): QuoteTopicByRow | undefined {
+  return useContext(QuoteTopicByRowContext);
 }
 
 export function useQuoteTopicContext(): QuoteTopicSourceMetadata | null {
@@ -110,11 +142,15 @@ export function useComposerQuote(): ComposerQuoteContextValue | null {
     if (!composerQuote) return null;
     if (!topicContext) return composerQuote;
     return {
-      addQuote: (input) =>
-        composerQuote.addQuote({
-          ...topicContext,
-          ...input,
-        }),
+      addQuote: (input, options) =>
+        composerQuote.addQuote(
+          options?.useAmbientTopic === false
+            ? input
+            : {
+                ...topicContext,
+                ...input,
+              },
+        ),
     };
   }, [composerQuote, topicContext]);
 }

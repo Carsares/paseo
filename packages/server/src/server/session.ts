@@ -199,6 +199,7 @@ import {
   AgentManager,
   AgentManagerShuttingDownError,
   AgentRunCancellationError,
+  backgroundReportReplacementRunOptions,
   directHumanPromptRunOptions,
   REMOTE_CHILD_RESERVATION_LABEL,
 } from "./agent/agent-manager.js";
@@ -2450,8 +2451,10 @@ export class Session {
     message: SessionOutboundMessage,
   ): void {
     if (!this.authorization.allowsOutbound(message)) return;
-    if (message.type === "workspace.topic.anchor.updated" && this.emitSubscribedEvent(message))
+    if (message.type === "workspace.topic.anchor.updated") {
+      this.emitSubscribedEvent(message);
       return;
+    }
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
       if (this.supports(capability)) this.emit(message);
       return;
@@ -12548,7 +12551,13 @@ export class Session {
     const text = matchingRow?.item.text;
     if (!text || !isSystemInjectedEnvelope(text)) return [];
     const parsed = parseAgentMessages(text);
-    if (!parsed?.length || !parsed.every((entry) => entry.source !== null)) return [];
+    if (
+      !parsed?.length ||
+      !parsed.every(
+        ({ source }) => source?.kind === "agent-message" || source?.kind === "agent-notification",
+      )
+    )
+      return [];
     return parsed.flatMap((entry) =>
       entry.source ? [{ messageId: entry.id, source: entry.source, prompt: entry.text }] : [],
     );
@@ -12679,9 +12688,7 @@ export class Session {
     const stillRunningBackgroundTurn =
       this.agentManager.hasInFlightRun(agentId) &&
       this.agentManager.isActiveTurnHumanInitiated?.(agentId) !== true &&
-      (backgroundTurn.turnId === undefined ||
-        turnIdAfterWait === undefined ||
-        turnIdAfterWait === backgroundTurn.turnId);
+      turnIdAfterWait === backgroundTurn.turnId;
     if (!stillRunningBackgroundTurn) {
       return { fallbackRequeueMessages: [] };
     }
@@ -12734,29 +12741,40 @@ export class Session {
       isMainControl,
       msg.images,
     );
-    const backgroundTurn = isSlashCommandPrompt(prompt)
-      ? null
-      : await this.inspectRunningBackgroundReportTurn(agentId);
-    const activeTurnBehavior = this.resolveHumanActiveTurnBehavior(
-      msg.activeTurnBehavior,
-      backgroundTurn !== null,
-    );
-    const shouldGraceWait = isMainControl && backgroundTurn !== null;
-    const releaseBackgroundHold = shouldGraceWait
+    const backgroundTurn =
+      isMainControl && !isSlashCommandPrompt(prompt)
+        ? await this.inspectRunningBackgroundReportTurn(agentId)
+        : null;
+    const releaseBackgroundHold = backgroundTurn
       ? this.agentMessages.holdBackgroundDelivery?.(agentId)
       : undefined;
     try {
-      const captured = shouldGraceWait
+      const captured = backgroundTurn
         ? await this.waitAndCaptureInterruptedBackgroundReports(agentId, backgroundTurn)
-        : { fallbackRequeueMessages: [] };
+        : undefined;
+      const runOptions = imageAttachments ? { imageAttachments } : undefined;
+      const reportReplacement =
+        backgroundTurn &&
+        captured &&
+        (captured.interruptedDeliveryBatch || captured.fallbackRequeueMessages.length > 0);
+      const signal = reportReplacement ? this.delivery.requestSignal : undefined;
+      const replacementOptions = reportReplacement
+        ? backgroundReportReplacementRunOptions(runOptions, backgroundTurn.turnId, () =>
+            this.requeueInterruptedBackgroundReports(agentId, captured),
+          )
+        : runOptions;
       const result = await this.sendHumanPrompt(
         {
           agentId,
           prompt,
           messageId: msg.messageId,
-          activeTurnBehavior,
+          activeTurnBehavior: this.resolveHumanActiveTurnBehavior(
+            msg.activeTurnBehavior,
+            Boolean(reportReplacement),
+          ),
           sessionMode: msg.sessionMode,
-          runOptions: imageAttachments ? { imageAttachments } : undefined,
+          runOptions: replacementOptions,
+          ...(signal ? { admit: () => !signal.aborted } : {}),
           clearPendingPermissions: true,
           beforeDispatch,
           isolateFromSourcedRiders: isMainControl,
@@ -12772,7 +12790,6 @@ export class Session {
         );
       }
       if (result.disposition !== "out_of_band") {
-        this.requeueInterruptedBackgroundReports(agentId, captured);
         await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text, imageAttachments);
       }
     } finally {
@@ -13308,14 +13325,12 @@ export class Session {
     const delivered = new Set<object>();
     const notified = new Set<object>();
     for (const subscription of this.eventSubscriptions.values()) {
+      const { source, signal } = subscription.owner;
       if (
+        signal.aborted ||
         !subscription.events.has(event) ||
-        (event === "workspace_setup_progress" &&
-          this.supportsForSource(
-            CLIENT_CAPS.workspaceSetupObservation,
-            subscription.owner.source,
-          )) ||
-        (onlySource && subscription.owner.source !== onlySource)
+        (onlySource && source !== onlySource) ||
+        !this.supportsSubscribedEvent(event, source)
       )
         continue;
       this.emitEventToOwner(subscription, message, notified);
@@ -13327,13 +13342,33 @@ export class Session {
         if (
           (!onlySource || source === onlySource) &&
           !delivered.has(source) &&
-          !this.delivery.isModern(source) &&
-          this.wantsEvent(event, source)
+          this.wantsUnownedEvent(event, source)
         )
           this.onMessageToSource(source, this.workspaceSetupMessageForClient(message, source));
       }
-    } else if (delivered.size === 0 && this.wantsEvent(event)) this.onMessage(message);
+    } else if (delivered.size === 0 && this.wantsUnownedEvent(event, onlySource))
+      this.onMessage(message);
     return true;
+  }
+
+  private supportsSubscribedEvent(event: SessionEventSubscription, source: object): boolean {
+    if (event === "workspace.topic.anchor.updated")
+      return this.supportsForSource(CLIENT_CAPS.workspaceButlerV1, source);
+    if (event === "workspace_setup_progress")
+      return !this.supportsForSource(CLIENT_CAPS.workspaceSetupObservation, source);
+    return true;
+  }
+
+  private wantsUnownedEvent(event: SessionEventSubscription, source?: object): boolean {
+    // COMPAT(workspaceTopicAnchorEvents): added in v0.18.0, remove after 2027-06-01 once older raw listeners are gone.
+    // Owned event support predates this category. Keep the original push until a
+    // subscription on this source takes over.
+    if (event === "workspace.topic.anchor.updated") {
+      return source
+        ? this.supportsForSource(CLIENT_CAPS.workspaceButlerV1, source)
+        : this.supports(CLIENT_CAPS.workspaceButlerV1);
+    }
+    return !this.delivery.isModern(source) && this.wantsEvent(event, source);
   }
 
   private emit(msg: SessionOutboundMessage): void {

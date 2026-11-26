@@ -128,6 +128,7 @@ interface AgentDurableItemsProps {
   workspaceId: string;
   agentId: string | null;
   isPaneFocused?: boolean;
+  pendingOnly?: boolean;
 }
 
 export function AgentDurableItems({ agentId, ...props }: AgentDurableItemsProps) {
@@ -140,13 +141,14 @@ function AgentDurableItemsList({
   workspaceId,
   agentId,
   isPaneFocused = true,
+  pendingOnly = false,
 }: Omit<AgentDurableItemsProps, "agentId"> & { agentId: string }) {
   const workspace = useWorkspaceDurableItems(serverId, workspaceId, isPaneFocused);
   const items = workspace.result.data?.filter(
     (item) =>
       item.workspaceId === workspaceId &&
       item.sourceAgentId === agentId &&
-      item.status === "pending",
+      (!pendingOnly || item.status === "pending"),
   );
   if (!items?.length) return null;
 

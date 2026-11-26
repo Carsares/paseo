@@ -1539,6 +1539,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         workspaceId={workspaceId}
         agentId={agentState.id}
         isPaneFocused={isPaneFocused}
+        pendingOnly={isMainControlStream}
       />
       {hasActiveComposer && !draft ? (
         <AgentTracks
