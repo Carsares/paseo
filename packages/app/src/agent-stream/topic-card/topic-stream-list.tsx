@@ -4,7 +4,6 @@ import type {
   WorkspaceTodoItem,
 } from "@getpaseo/protocol/messages";
 import { useQueryClient } from "@tanstack/react-query";
-import { CheckCheck, Filter, Plus } from "lucide-react-native";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -15,14 +14,11 @@ import {
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from "react-native";
-import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { StyleSheet } from "react-native-unistyles";
 import type { ComposerAttachment } from "@/attachments/types";
 import { submitActiveTopicReply } from "./submit-topic-reply";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { Button } from "@/components/ui/button";
-import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
-import { PressHighlight } from "@/components/ui/press-highlight";
-import { SegmentedControl, type SegmentedControlOption } from "@/components/ui/segmented-control";
 import { useWorkspaceTasks } from "@/composer/workspace-task-ledger/query";
 import { submitDurableItemDecision } from "@/durable-items/model";
 import {
@@ -47,9 +43,7 @@ import {
   useTopicStreamViewStore,
   type DurableTopicDecisionRequest,
   type PendingTopicScrollTarget,
-  type TopicStreamViewMode,
 } from "@/stores/topic-stream-view-store";
-import type { Theme } from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { openSubagentFromTopic } from "@/subagents/open-from-topic";
 import {
@@ -84,12 +78,6 @@ import {
   type TopicViewportBounds,
 } from "./topic-thread-card";
 
-const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
-const ThemedCheckCheck = withUnistyles(CheckCheck, mutedIconMapping);
-const ThemedPlus = withUnistyles(Plus, mutedIconMapping);
-const ThemedFilter = withUnistyles(Filter, mutedIconMapping);
-const SELECTED_STATE = { selected: true } as const;
-const UNSELECTED_STATE = { selected: false } as const;
 const MAX_JUMP_HISTORY_FETCHES = 4;
 // Keep the request ID if the topic view closes before the host acknowledges a retry.
 const retryIntents = new Map<string, string>();
@@ -201,91 +189,6 @@ const TopicCardLayoutSlot = memo(function TopicCardLayoutSlot({
     };
   }, [onClearLayout, topicKey]);
   return <View onLayout={handleLayout}>{children}</View>;
-});
-
-export interface TopicStreamTopBarProps {
-  serverId: string;
-  workspaceId: string;
-  mainAgentId: string;
-  viewMode: TopicStreamViewMode;
-  unreadOnly: boolean;
-  totalUnreadTopics: number;
-  onChangeViewMode: (mode: TopicStreamViewMode) => void;
-  onToggleUnreadOnly: () => void;
-  onMarkAllRead: () => void;
-  onOpenAddTodo: () => void;
-}
-
-export const TopicStreamTopBar = memo(function TopicStreamTopBar({
-  viewMode,
-  unreadOnly,
-  totalUnreadTopics,
-  onChangeViewMode,
-  onToggleUnreadOnly,
-  onMarkAllRead,
-  onOpenAddTodo,
-}: TopicStreamTopBarProps) {
-  const { t } = useTranslation();
-  const modeOptions = useMemo<SegmentedControlOption<TopicStreamViewMode>[]>(
-    () => [
-      {
-        value: "topics",
-        label: t("topicWorkbench.topicStream.modeTopics"),
-        testID: "topic-stream-mode-topics",
-      },
-      {
-        value: "timeline",
-        label: t("topicWorkbench.topicStream.modeTimeline"),
-        testID: "topic-stream-mode-timeline",
-      },
-    ],
-    [t],
-  );
-
-  return (
-    <View style={styles.topBar} testID="topic-stream-top-bar">
-      <SegmentedControl
-        size="sm"
-        options={modeOptions}
-        value={viewMode}
-        onValueChange={onChangeViewMode}
-        testID="topic-stream-mode-switch"
-      />
-      <View style={styles.topBarActions}>
-        {viewMode === "topics" ? (
-          <PressHighlight
-            accessibilityRole="button"
-            accessibilityState={unreadOnly ? SELECTED_STATE : UNSELECTED_STATE}
-            onPress={onToggleUnreadOnly}
-            style={[styles.unreadOnlyPill, unreadOnly && styles.unreadOnlyPillActive]}
-            testID="topic-stream-unread-only"
-          >
-            <ThemedFilter size={13} />
-            <Text style={[styles.unreadOnlyText, unreadOnly && styles.unreadOnlyTextActive]}>
-              {t("topicWorkbench.topicStream.unreadOnly")}
-            </Text>
-          </PressHighlight>
-        ) : null}
-        <ToolbarButton
-          compact
-          disabled={totalUnreadTopics === 0}
-          label={t("topicWorkbench.topicStream.markAllRead")}
-          onPress={onMarkAllRead}
-          testID="topic-stream-mark-all-read"
-        >
-          <ThemedCheckCheck size={14} />
-        </ToolbarButton>
-        <ToolbarButton
-          compact
-          label={t("topicWorkbench.topicStream.addTodo")}
-          onPress={onOpenAddTodo}
-          testID="topic-stream-add-todo"
-        >
-          <ThemedPlus size={14} />
-        </ToolbarButton>
-      </View>
-    </View>
-  );
 });
 
 export interface TopicStreamListProps {
@@ -1518,45 +1421,6 @@ const styles = StyleSheet.create((theme) => ({
   loadOlderBar: {
     alignItems: "center",
     paddingVertical: theme.spacing[1],
-  },
-  topBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: theme.spacing[2],
-    paddingHorizontal: theme.spacing[4],
-    paddingVertical: theme.spacing[2],
-    borderBottomWidth: theme.borderWidth[1],
-    borderBottomColor: theme.colors.border,
-    backgroundColor: theme.colors.surface0,
-  },
-  topBarActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[1.5],
-  },
-  unreadOnlyPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[1],
-    paddingHorizontal: theme.spacing[2],
-    paddingVertical: theme.spacing[1],
-    borderRadius: theme.borderRadius.full,
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surface1,
-  },
-  unreadOnlyPillActive: {
-    borderColor: theme.colors.borderAccent,
-    backgroundColor: theme.colors.surface2,
-  },
-  unreadOnlyText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
-    fontWeight: theme.fontWeight.medium,
-  },
-  unreadOnlyTextActive: {
-    color: theme.colors.foreground,
   },
   emptyCard: {
     width: "100%",

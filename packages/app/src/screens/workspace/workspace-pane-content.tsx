@@ -1,5 +1,6 @@
+import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
 import { ComposerEditingScope } from "@/composer/editing-session";
-import React, { useMemo, type ComponentType } from "react";
+import React, { useMemo, type ComponentType, type ReactNode } from "react";
 import invariant from "tiny-invariant";
 import {
   createPaneFocusContextValue,
@@ -18,6 +19,7 @@ import type { PaneHost } from "@/panels/panel-manifest";
 export interface WorkspacePaneContentModel {
   key: string;
   Component: ComponentType;
+  navigation?: ReactNode;
   paneContextValue: PaneContextValue;
 }
 
@@ -159,6 +161,9 @@ export function WorkspacePaneContent({
             tabId={paneContextValue.tabId}
             targetKey={JSON.stringify(paneContextValue.target)}
           >
+            {content.navigation ? (
+              <PaneContentToolbar>{content.navigation}</PaneContentToolbar>
+            ) : null}
             <Component key={key} />
           </ComposerEditingScope>
         </PaneFocusProvider>

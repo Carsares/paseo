@@ -33,13 +33,15 @@ export interface FilePanelOpenWithMenu {
 export function useFilePanelOpenWithMenu(
   identity: PanelInstanceIdentity,
   testIDBase: string,
+  pageId = OPEN_WITH_PAGE_ID,
 ): FilePanelOpenWithMenu {
-  return useOpenWithMenu(useTabFilePanelChoice(identity), testIDBase);
+  return useOpenWithMenu(useTabFilePanelChoice(identity), testIDBase, pageId);
 }
 
 function useOpenWithMenu(
   choice: FilePanelChoice | null,
   testIDBase: string,
+  pageId: string,
 ): FilePanelOpenWithMenu {
   const { t } = useTranslation();
   const { openWith } = useFilePanelChoiceSnapshot(choice);
@@ -48,13 +50,13 @@ function useOpenWithMenu(
     const title = t("panels.file.filePanels.openWith");
     return {
       trigger: (
-        <MenuSubTrigger id={OPEN_WITH_PAGE_ID} testID={`${testIDBase}-open-with`}>
+        <MenuSubTrigger id={pageId} testID={`${testIDBase}-open-with`}>
           {title}
         </MenuSubTrigger>
       ),
       pages: [
         {
-          id: OPEN_WITH_PAGE_ID,
+          id: pageId,
           title,
           content: (
             <>
@@ -80,7 +82,7 @@ function useOpenWithMenu(
         },
       ],
     };
-  }, [choice, openWith, t, testIDBase]);
+  }, [choice, openWith, pageId, t, testIDBase]);
 }
 
 function OpenWithItem({

@@ -1,8 +1,9 @@
+import { PressHighlight } from "@/components/ui/press-highlight";
 import type { Theme } from "@/styles/theme";
 import { StatusIcon } from "@/components/status-icon";
 import { useCallback, useMemo, type ReactElement, type ReactNode } from "react";
 import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
-import { Check } from "lucide-react-native";
+import { ArrowLeft, Check } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import invariant from "tiny-invariant";
@@ -11,6 +12,7 @@ import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import type { SurfaceBackdrop } from "@/styles/surface-backdrop";
 import { usePanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { useLeaveSheet } from "@/screens/workspace/sheet-pane";
 
 export interface WorkspaceTabPresentation {
   key: string;
@@ -101,6 +103,85 @@ function WorkspaceTabPresentationResolverInner({
 
   return <>{children(presentation)}</>;
 }
+
+const ThemedBackToMainArrow = withUnistyles(ArrowLeft, (theme) => ({
+  color: theme.colors.foregroundMuted,
+}));
+
+export function WorkspaceBackToMain({
+  tab,
+  serverId,
+  workspaceId,
+  onPress,
+  titleTestID,
+}: Omit<WorkspaceTabPresentationResolverProps, "children"> & {
+  onPress: () => void;
+  titleTestID?: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <WorkspaceTabPresentationResolver tab={tab} serverId={serverId} workspaceId={workspaceId}>
+      {({ label }) => (
+        <PressHighlight
+          accessibilityRole="button"
+          accessibilityLabel={t("topicWorkbench.header.backToMainFrom", { name: label })}
+          onPress={onPress}
+          testID="workspace-header-back-to-main"
+          style={backStyles.button}
+          highlightStyle={backStyles.highlight}
+        >
+          <ThemedBackToMainArrow size={16} />
+          <Text numberOfLines={1} style={backStyles.label} testID={titleTestID}>
+            {t("topicWorkbench.header.backToMainFrom", { name: label })}
+          </Text>
+        </PressHighlight>
+      )}
+    </WorkspaceTabPresentationResolver>
+  );
+}
+
+export function WorkspaceSheetBackToMain({
+  tab,
+  serverId,
+  workspaceId,
+  mainAgentId,
+  onBackToMain,
+}: {
+  tab: WorkspaceTabDescriptor;
+  serverId: string;
+  workspaceId: string;
+  mainAgentId: string;
+  onBackToMain: () => void;
+}) {
+  const leaveSheet = useLeaveSheet();
+  const handlePress = useCallback(() => {
+    if (leaveSheet({ kind: "agent", agentId: mainAgentId })) return;
+    onBackToMain();
+  }, [leaveSheet, mainAgentId, onBackToMain]);
+  return (
+    <WorkspaceBackToMain
+      tab={tab}
+      serverId={serverId}
+      workspaceId={workspaceId}
+      onPress={handlePress}
+    />
+  );
+}
+
+const backStyles = StyleSheet.create((theme) => ({
+  button: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexShrink: 1,
+    minWidth: 0,
+    minHeight: 32,
+    gap: theme.spacing[1.5],
+    paddingHorizontal: theme.spacing[1],
+    borderRadius: theme.borderRadius.md,
+  },
+  highlight: { backgroundColor: theme.colors.interactionHighlight },
+  label: { flexShrink: 1, color: theme.colors.foreground, fontSize: theme.fontSize.base },
+}));
 
 interface WorkspaceTabIconProps {
   presentation: WorkspaceTabPresentation;

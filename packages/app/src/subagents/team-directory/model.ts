@@ -349,7 +349,24 @@ function isVisibleLiveEntry(
   entry: LocatedDirectoryAgent,
   pendingArchiveIds?: ReadonlySet<string>,
 ): boolean {
-  return !entry.agent.archivedAt && !pendingArchiveIds?.has(teamDirectoryNodeKey(entry));
+  return (
+    !entry.agent.background &&
+    !entry.agent.archivedAt &&
+    !pendingArchiveIds?.has(teamDirectoryNodeKey(entry))
+  );
+}
+
+/** The directory assigns every eligible local agent a live row, including orphans. */
+export function isLiveTeamDirectoryWorkspaceAgent(
+  agent: TeamDirectoryAgent | undefined,
+  serverId: string,
+  workspaceId: string,
+  pendingArchiveIds?: ReadonlySet<string>,
+): boolean {
+  return (
+    agent?.workspaceId === workspaceId &&
+    isVisibleLiveEntry({ serverId, agentId: agent.id, agent }, pendingArchiveIds)
+  );
 }
 
 function buildDirectoryIndex(
@@ -391,14 +408,11 @@ function resolveMainEntry(input: {
   const mainAgent = mainAgentId ? localAgents?.get(mainAgentId) : undefined;
   if (
     !mainAgent ||
-    mainAgent.workspaceId !== workspaceId ||
-    mainAgent.archivedAt ||
-    mainAgent.background
+    !isLiveTeamDirectoryWorkspaceAgent(mainAgent, serverId, workspaceId, pendingArchiveIds)
   ) {
     return null;
   }
-  const entry: LocatedDirectoryAgent = { serverId, agentId: mainAgent.id, agent: mainAgent };
-  return pendingArchiveIds?.has(teamDirectoryNodeKey(entry)) ? null : entry;
+  return { serverId, agentId: mainAgent.id, agent: mainAgent };
 }
 
 function registerResidentNode(
@@ -473,8 +487,16 @@ function collectWorkspaceRoots(
 ): LocatedDirectoryAgent[] {
   const rootEntries: LocatedDirectoryAgent[] = mainEntry ? [mainEntry] : [];
   for (const entry of ctx.entriesByKey.values()) {
-    if (entry.serverId !== ctx.serverId || entry.agent.workspaceId !== ctx.workspaceId) continue;
-    if (!isVisibleLiveEntry(entry, ctx.pendingArchiveIds)) continue;
+    if (
+      entry.serverId !== ctx.serverId ||
+      !isLiveTeamDirectoryWorkspaceAgent(
+        entry.agent,
+        entry.serverId,
+        ctx.workspaceId,
+        ctx.pendingArchiveIds,
+      )
+    )
+      continue;
     const key = teamDirectoryNodeKey(entry);
     if (ctx.visitedLiveKeys.has(key)) continue;
     if (isSideChatAgent(entry.agent)) {
@@ -600,8 +622,16 @@ function appendOrphanedWorkspaceEntries(
   taskTree: TeamDirectoryTaskBranch[],
 ): void {
   for (const entry of ctx.entriesByKey.values()) {
-    if (entry.serverId !== ctx.serverId || entry.agent.workspaceId !== ctx.workspaceId) continue;
-    if (!isVisibleLiveEntry(entry, ctx.pendingArchiveIds)) continue;
+    if (
+      entry.serverId !== ctx.serverId ||
+      !isLiveTeamDirectoryWorkspaceAgent(
+        entry.agent,
+        entry.serverId,
+        ctx.workspaceId,
+        ctx.pendingArchiveIds,
+      )
+    )
+      continue;
     const key = teamDirectoryNodeKey(entry);
     if (ctx.visitedLiveKeys.has(key)) continue;
     ctx.visitedLiveKeys.add(key);

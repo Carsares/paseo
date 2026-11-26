@@ -1,7 +1,9 @@
 import { Fragment, useMemo, type ReactNode } from "react";
 import { Text } from "react-native";
 import { useTranslation } from "react-i18next";
-import { StyleSheet } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { Users } from "lucide-react-native";
+import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { HeaderToggleButton } from "@/components/headers/header-toggle-button";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useWorkspaceSheetPages } from "@/screens/workspace/sheet-pane";
@@ -34,6 +36,10 @@ interface CompactWorkspaceHeaderProps {
   isCompact: boolean;
   compactTeamDirectory?: (close: () => void) => ReactNode;
   compactConflictAction?: ReactNode;
+  topicHeader?: boolean;
+  titleContent?: ReactNode;
+  modeControl?: ReactNode;
+  desktopTeamAction?: ReactNode;
 }
 
 /** The compact header with the workspace's project row and controls. */
@@ -52,6 +58,10 @@ export function CompactWorkspaceHeader({
   isCompact,
   compactTeamDirectory,
   compactConflictAction,
+  topicHeader,
+  titleContent,
+  modeControl,
+  desktopTeamAction,
 }: CompactWorkspaceHeaderProps) {
   const { t } = useTranslation();
   const stack = useWorkspaceSheetPages();
@@ -75,26 +85,35 @@ export function CompactWorkspaceHeader({
   const symbols = {
     "tab-count": tabSwitcher,
     overflow: children,
-    explorer: explorerAction,
+    explorer: topicHeader && actionsInBar ? null : explorerAction,
   };
+  let teamAction = desktopTeamAction;
+  if (isCompact && stack && compactTeamDirectory) {
+    teamAction = topicHeader ? (
+      <ToolbarButton compact label={teamTitle} onPress={openTeam} testID="workspace-header-team">
+        <ThemedUsers size={16} />
+      </ToolbarButton>
+    ) : (
+      <HeaderToggleButton
+        accessibilityRole="button"
+        accessibilityLabel={teamTitle}
+        onPress={openTeam}
+        testID="workspace-header-team"
+        tooltipLabel={t("topicWorkbench.directory.show")}
+        tooltipKeys={NO_SHORTCUTS}
+        tooltipSide="bottom"
+        style={styles.teamButton}
+      >
+        <Text style={styles.teamLabel} numberOfLines={1}>
+          {teamTitle}
+        </Text>
+      </HeaderToggleButton>
+    );
+  }
   const actions = (
     <>
-      {isCompact && stack && compactTeamDirectory ? (
-        <HeaderToggleButton
-          accessibilityRole="button"
-          accessibilityLabel={teamTitle}
-          onPress={openTeam}
-          testID="workspace-header-team"
-          tooltipLabel={t("topicWorkbench.directory.show")}
-          tooltipKeys={NO_SHORTCUTS}
-          tooltipSide="bottom"
-          style={styles.teamButton}
-        >
-          <Text style={styles.teamLabel} numberOfLines={1}>
-            {teamTitle}
-          </Text>
-        </HeaderToggleButton>
-      ) : null}
+      {teamAction}
+      {modeControl}
       {isCompact ? compactConflictAction : null}
       {resolveWorkspaceBarActions(headerVariant).map((symbol) => (
         <Fragment key={symbol}>{symbols[symbol]}</Fragment>
@@ -110,20 +129,43 @@ export function CompactWorkspaceHeader({
           inDesktopTitlebar={inDesktopTitlebar}
           title={title}
           titleTestID="workspace-header-title"
+          testID={topicHeader ? "workspace-topic-header" : undefined}
+          titleContent={titleContent}
           subtitle={projectRow}
           loading={isLoading}
-          actions={actionsInBar ? undefined : actions}
+          actions={actionsInBar && !topicHeader ? undefined : actions}
         />
       ) : null}
-      <WorkspaceWindowActions isRouteFocused={isRouteFocused} isCompact={isCompact}>
-        {actions}
-      </WorkspaceWindowActions>
+      {topicHeader ? null : (
+        <WorkspaceWindowActions isRouteFocused={isRouteFocused} isCompact={isCompact}>
+          {actions}
+        </WorkspaceWindowActions>
+      )}
     </IconButtonChromeProvider>
   );
 }
 
 // Panel changes only affect the portaled controls. Keep their subscription below the
 // workspace and header so opening a sidebar does not render the chat or rebuild its actions.
+export function TopicWorkspaceExplorerActions({
+  topicHeader,
+  isRouteFocused,
+  isCompact,
+  explorerAction,
+}: {
+  topicHeader: boolean;
+  isRouteFocused: boolean;
+  isCompact: boolean;
+  explorerAction: ReactNode;
+}) {
+  if (!topicHeader || !explorerAction) return null;
+  return (
+    <WorkspaceWindowActions isRouteFocused={isRouteFocused} isCompact={isCompact}>
+      {explorerAction}
+    </WorkspaceWindowActions>
+  );
+}
+
 function WorkspaceWindowActions({
   isRouteFocused,
   isCompact,
@@ -145,3 +187,5 @@ const styles = StyleSheet.create((theme) => ({
   teamButton: { width: "auto", minWidth: 44, paddingHorizontal: theme.spacing[2] },
   teamLabel: { color: theme.colors.foreground, fontSize: theme.fontSize.sm },
 }));
+
+const ThemedUsers = withUnistyles(Users, (theme) => ({ color: theme.colors.foregroundMuted }));

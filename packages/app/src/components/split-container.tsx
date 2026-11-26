@@ -1,6 +1,7 @@
 import {
   AdaptiveWorkspaceChrome,
   type WorkspaceCompactHeaderTabs,
+  type WorkspaceCompactHeaderActions,
 } from "@/screens/workspace/adaptive-workspace-chrome";
 import { useWorkspaceTabDrag } from "./workspace-tab-drag-context";
 import {
@@ -67,7 +68,9 @@ import { isNative } from "@/constants/platform";
 interface SplitContainerProps {
   layout: WorkspaceLayout;
   /** The full workspace header: title, project row and workspace actions. */
-  renderMainHeader?: () => ReactNode;
+  renderMainHeader?: (pane?: WorkspaceCompactHeaderActions["pane"]) => ReactNode;
+  /** A directory entry can replace a conversation tab in a single presented pane. */
+  isTabInTeamDirectory?: (tab: WorkspaceTabDescriptor) => boolean;
   /**
    * The compact workspace header. With one presented pane it carries that pane's tab switcher in
    * place of its tab rail; above a split it carries workspace controls only.
@@ -192,16 +195,11 @@ export function SplitContainer({
   onExitFocusMode,
   renderMainHeader,
   renderCompactHeader,
+  isTabInTeamDirectory,
 }: SplitContainerProps) {
   const inheritedWindowChromeCorners = useWindowChromeCorners();
   const windowChromeCorners = inheritedWindowChromeCorners;
   const { activeDragTabId, dropPreview, tabDropPreview } = useWorkspaceTabDrag();
-  const [maximizedPane, setMaximizedPane] = useState<{
-    workspaceKey: string;
-    paneId: string;
-  } | null>(null);
-  const maximizedPaneId =
-    maximizedPane?.workspaceKey === workspaceKey ? maximizedPane.paneId : null;
   const explorerSidebarPaneId = useWorkspaceLayoutStore((state) =>
     selectExplorerSidebarPaneId(state, workspaceKey),
   );
@@ -211,27 +209,13 @@ export function SplitContainer({
     [layout.root, explorerSidebarPaneId],
   );
   const workspaceHasMultiplePanes = Boolean(mainRoot && hasMultipleVisiblePanes(mainRoot));
-  useEffect(() => {
-    if (
-      maximizedPaneId &&
-      (focusModeEnabled ||
-        !workspaceHasMultiplePanes ||
-        !mainRoot ||
-        !splitNodeContainsPane(mainRoot, maximizedPaneId))
-    ) {
-      setMaximizedPane(null);
-    }
-  }, [focusModeEnabled, mainRoot, maximizedPaneId, workspaceHasMultiplePanes]);
-  const handleTogglePaneMaximized = useCallback(
-    (paneId: string) => {
-      setMaximizedPane((current) =>
-        current?.workspaceKey === workspaceKey && current.paneId === paneId
-          ? null
-          : { workspaceKey, paneId },
-      );
-    },
-    [workspaceKey],
-  );
+  const { maximizedPaneId, handleTogglePaneMaximized } = useMaximizedPane({
+    workspaceKey,
+    mainRoot,
+    canMaximize: workspaceHasMultiplePanes && !focusModeEnabled,
+    focusedPaneId: layout.focusedPaneId,
+    onFocusPane,
+  });
   const splitRoot = useMemo(
     () =>
       resolveSplitContainerRoot({
@@ -319,6 +303,7 @@ export function SplitContainer({
                 onExitFocusMode={onExitFocusMode}
                 renderMainHeader={renderMainHeader}
                 renderCompactHeader={renderCompactHeader}
+                isTabInTeamDirectory={isTabInTeamDirectory}
               />
             ) : null}
           </View>
@@ -326,6 +311,58 @@ export function SplitContainer({
       </View>
     </RenderProfile>
   );
+}
+
+function useMaximizedPane({
+  workspaceKey,
+  mainRoot,
+  canMaximize,
+  focusedPaneId,
+  onFocusPane,
+}: {
+  workspaceKey: string;
+  mainRoot: SplitNode | null;
+  canMaximize: boolean;
+  focusedPaneId: string | null;
+  onFocusPane: (paneId: string) => void;
+}) {
+  const [maximizedPane, setMaximizedPane] = useState<{
+    workspaceKey: string;
+    paneId: string;
+  } | null>(null);
+  const requestedPaneId =
+    maximizedPane?.workspaceKey === workspaceKey ? maximizedPane.paneId : null;
+  const focusMovedToAnotherMainPane =
+    mainRoot &&
+    focusedPaneId &&
+    focusedPaneId !== requestedPaneId &&
+    splitNodeContainsPane(mainRoot, focusedPaneId);
+  const maximizedPaneId =
+    requestedPaneId &&
+    mainRoot &&
+    canMaximize &&
+    !focusMovedToAnotherMainPane &&
+    splitNodeContainsPane(mainRoot, requestedPaneId)
+      ? requestedPaneId
+      : null;
+  useEffect(() => {
+    if (requestedPaneId && !maximizedPaneId) {
+      setMaximizedPane((current) => (current === maximizedPane ? null : current));
+    }
+  }, [maximizedPane, maximizedPaneId, requestedPaneId]);
+
+  const handleTogglePaneMaximized = useCallback(
+    (paneId: string) => {
+      if (maximizedPaneId === paneId) {
+        setMaximizedPane(null);
+        return;
+      }
+      onFocusPane(paneId);
+      setMaximizedPane({ workspaceKey, paneId });
+    },
+    [maximizedPaneId, onFocusPane, workspaceKey],
+  );
+  return { maximizedPaneId, handleTogglePaneMaximized };
 }
 
 function SplitGroupChild({
@@ -453,6 +490,7 @@ function SplitNodeView({
   ownsWorkspaceHeader,
   renderMainHeader,
   renderCompactHeader,
+  isTabInTeamDirectory,
 }: SplitNodeViewProps) {
   const [groupContainerSize, setGroupContainerSize] = useState(0);
   const groupId = node.kind === "group" ? node.group.id : null;
@@ -546,6 +584,7 @@ function SplitNodeView({
             ownsWorkspaceHeader={ownsWorkspaceHeader}
             renderMainHeader={renderMainHeader}
             renderCompactHeader={renderCompactHeader}
+            isTabInTeamDirectory={isTabInTeamDirectory}
           />
         </WindowChromeRegion>
       </RetainedPanel>
@@ -614,6 +653,7 @@ function SplitNodeView({
               ownsWorkspaceHeader={ownsWorkspaceHeader}
               renderMainHeader={renderMainHeader}
               renderCompactHeader={renderCompactHeader}
+              isTabInTeamDirectory={isTabInTeamDirectory}
             />
           </SplitGroupChild>
           {index < node.group.children.length - 1 &&
@@ -675,6 +715,7 @@ const SplitPaneView = memo(function SplitPaneView({
   ownsWorkspaceHeader,
   renderMainHeader,
   renderCompactHeader,
+  isTabInTeamDirectory,
 }: SplitPaneViewProps) {
   recordRenderProfileReasons(`SplitPaneView:${pane.id}`, ["render"]);
   const paneRef = useRef<View | null>(null);
@@ -689,15 +730,35 @@ const SplitPaneView = memo(function SplitPaneView({
   );
   const paneTabs = useMemo(() => paneState.tabs.map((tab) => tab.descriptor), [paneState.tabs]);
   const activeTabDescriptor = paneState.activeTab?.descriptor ?? null;
+  const visibleRailTabs = useMemo(
+    () =>
+      ownsWorkspaceHeader && !workspaceHasMultiplePanes && !focusModeEnabled && isTabInTeamDirectory
+        ? paneTabs.filter((tab) => !isTabInTeamDirectory(tab))
+        : paneTabs,
+    [
+      focusModeEnabled,
+      isTabInTeamDirectory,
+      ownsWorkspaceHeader,
+      paneTabs,
+      workspaceHasMultiplePanes,
+    ],
+  );
+  const hideConversationOnlyRail = paneTabs.length > 0 && visibleRailTabs.length === 0;
+  const visibleDropPreviewIndex =
+    tabDropPreview?.paneId === pane.id
+      ? paneTabs
+          .slice(0, tabDropPreview.indicatorIndex)
+          .filter((tab) => visibleRailTabs.includes(tab)).length
+      : null;
   const desktopTabRowItems = useMemo<WorkspaceDesktopTabRowItem[]>(
     () =>
-      paneTabs.map((tab) => ({
+      visibleRailTabs.map((tab) => ({
         tab,
         isActive: tab.key === activeTabDescriptor?.key,
         isCloseHovered: hoveredCloseTabKey === tab.key,
         isClosingTab: closingTabIds.has(tab.tabId),
       })),
-    [activeTabDescriptor?.key, closingTabIds, hoveredCloseTabKey, paneTabs],
+    [activeTabDescriptor?.key, closingTabIds, hoveredCloseTabKey, visibleRailTabs],
   );
 
   useEffect(() => {
@@ -736,16 +797,16 @@ const SplitPaneView = memo(function SplitPaneView({
 
   const paneId = pane.id;
   const handleCloseTabsToLeft = useCallback(
-    (tabId: string) => onCloseTabsToLeft(tabId, paneTabs),
-    [onCloseTabsToLeft, paneTabs],
+    (tabId: string) => onCloseTabsToLeft(tabId, visibleRailTabs),
+    [onCloseTabsToLeft, visibleRailTabs],
   );
   const handleCloseTabsToRight = useCallback(
-    (tabId: string) => onCloseTabsToRight(tabId, paneTabs),
-    [onCloseTabsToRight, paneTabs],
+    (tabId: string) => onCloseTabsToRight(tabId, visibleRailTabs),
+    [onCloseTabsToRight, visibleRailTabs],
   );
   const handleCloseOtherTabs = useCallback(
-    (tabId: string) => onCloseOtherTabs(tabId, paneTabs),
-    [onCloseOtherTabs, paneTabs],
+    (tabId: string) => onCloseOtherTabs(tabId, visibleRailTabs),
+    [onCloseOtherTabs, visibleRailTabs],
   );
   const handleReorderTabs = useCallback(
     (nextTabs: WorkspaceTabDescriptor[]) => {
@@ -833,47 +894,49 @@ const SplitPaneView = memo(function SplitPaneView({
         testID={`workspace-pane-${pane.id}`}
       >
         <AdaptiveWorkspaceChrome compactHeader={compactHeader}>
-          {ownsWorkspaceHeader ? renderMainHeader?.() : null}
-          <WindowChromeRegion corners={focusModeEnabled ? "both" : "none"}>
-            <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
-              <TitlebarDragRegion />
-              <WorkspaceDesktopTabsRow
-                paneId={pane.id}
-                isFocused={isFocused && isWorkspaceFocused}
-                tabs={desktopTabRowItems}
-                normalizedServerId={normalizedServerId}
-                normalizedWorkspaceId={normalizedWorkspaceId}
-                setHoveredCloseTabKey={setHoveredCloseTabKey}
-                onNavigateTab={onNavigateTab}
-                onCloseTab={onCloseTab}
-                onCopyResumeCommand={onCopyResumeCommand}
-                onCopyAgentId={onCopyAgentId}
-                onCopyTerminalId={onCopyTerminalId}
-                onCopyFilePath={onCopyFilePath}
-                onReloadAgent={onReloadAgent}
-                onRenameTab={onRenameTab}
-                onCloseTabsToLeft={handleCloseTabsToLeft}
-                onCloseTabsToRight={handleCloseTabsToRight}
-                onCloseOtherTabs={handleCloseOtherTabs}
-                onCreateNewTab={onCreateNewTab}
-                onReorderTabs={handleReorderTabs}
-                ownsKeyboardShortcuts={false}
-                externalDndContext
-                activeDragTabId={activeDragTabId}
-                tabDropPreviewIndex={
-                  tabDropPreview?.paneId === pane.id ? tabDropPreview.indicatorIndex : null
-                }
-                showPaneSplitActions={!focusModeEnabled}
-                showPaneMaximizeAction={workspaceHasMultiplePanes && !focusModeEnabled}
-                paneMaximized={paneId === maximizedPaneId}
-                onTogglePaneMaximized={handleTogglePaneMaximized}
-                onSplitRight={handleSplitRight}
-                onSplitDown={handleSplitDown}
-                focusModeEnabled={Boolean(focusModeEnabled)}
-                onExitFocusMode={onExitFocusMode}
-              />
-            </WindowChromeSafeArea>
-          </WindowChromeRegion>
+          {ownsWorkspaceHeader
+            ? renderMainHeader?.(hideConversationOnlyRail ? compactHeaderActions.pane : undefined)
+            : null}
+          {hideConversationOnlyRail ? null : (
+            <WindowChromeRegion corners={focusModeEnabled ? "both" : "none"}>
+              <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
+                <TitlebarDragRegion />
+                <WorkspaceDesktopTabsRow
+                  paneId={pane.id}
+                  isFocused={isFocused && isWorkspaceFocused}
+                  tabs={desktopTabRowItems}
+                  normalizedServerId={normalizedServerId}
+                  normalizedWorkspaceId={normalizedWorkspaceId}
+                  setHoveredCloseTabKey={setHoveredCloseTabKey}
+                  onNavigateTab={onNavigateTab}
+                  onCloseTab={onCloseTab}
+                  onCopyResumeCommand={onCopyResumeCommand}
+                  onCopyAgentId={onCopyAgentId}
+                  onCopyTerminalId={onCopyTerminalId}
+                  onCopyFilePath={onCopyFilePath}
+                  onReloadAgent={onReloadAgent}
+                  onRenameTab={onRenameTab}
+                  onCloseTabsToLeft={handleCloseTabsToLeft}
+                  onCloseTabsToRight={handleCloseTabsToRight}
+                  onCloseOtherTabs={handleCloseOtherTabs}
+                  onCreateNewTab={onCreateNewTab}
+                  onReorderTabs={handleReorderTabs}
+                  ownsKeyboardShortcuts={false}
+                  externalDndContext
+                  activeDragTabId={activeDragTabId}
+                  tabDropPreviewIndex={visibleDropPreviewIndex}
+                  showPaneSplitActions={!focusModeEnabled}
+                  showPaneMaximizeAction={workspaceHasMultiplePanes && !focusModeEnabled}
+                  paneMaximized={paneId === maximizedPaneId}
+                  onTogglePaneMaximized={handleTogglePaneMaximized}
+                  onSplitRight={handleSplitRight}
+                  onSplitDown={handleSplitDown}
+                  focusModeEnabled={Boolean(focusModeEnabled)}
+                  onExitFocusMode={onExitFocusMode}
+                />
+              </WindowChromeSafeArea>
+            </WindowChromeRegion>
+          )}
         </AdaptiveWorkspaceChrome>
 
         <View style={styles.paneContent}>

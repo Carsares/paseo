@@ -149,6 +149,7 @@ export interface WorkspaceTeamDirectoryProps {
   onOpenAgentBeside: (address: AgentAddress) => void;
   onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
   onAskFirstQuestion?: () => void;
+  onCreateConversation?: () => void;
 }
 
 interface MemberRowActionHandlers {
@@ -758,6 +759,20 @@ function useTeamTopicReadContext(
   }, [isSupported, mainAgentId, snapshot, tasksQuery.data, threadEntries, topicAnchors]);
 }
 
+function keepMainConversationVisible(
+  groups: TeamDirectoryActivityGroups,
+  isTopicWorkspace: boolean,
+) {
+  if (!isTopicWorkspace) return groups;
+  const main = groups.collapsibleInactiveMembers.find((node) => node.isMain);
+  if (!main) return groups;
+  return {
+    ...groups,
+    pinnedInactiveMembers: [main, ...groups.pinnedInactiveMembers],
+    collapsibleInactiveMembers: groups.collapsibleInactiveMembers.filter((node) => node !== main),
+  };
+}
+
 export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   serverId,
   workspaceId,
@@ -772,6 +787,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   onOpenAgentBeside,
   onOpenProviderSubrun,
   onAskFirstQuestion,
+  onCreateConversation,
 }: WorkspaceTeamDirectoryProps) {
   const { t } = useTranslation();
   const active = useRetainedPanelActive();
@@ -915,8 +931,12 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   );
 
   const activityGroups = useMemo(
-    () => selectTeamActivityGroups(directory, focusedAddress, focusedProviderSubagentId),
-    [directory, focusedAddress, focusedProviderSubagentId],
+    () =>
+      keepMainConversationVisible(
+        selectTeamActivityGroups(directory, focusedAddress, focusedProviderSubagentId),
+        isTopicWorkspace,
+      ),
+    [directory, focusedAddress, focusedProviderSubagentId, isTopicWorkspace],
   );
   const attributeGroups = useMemo(
     () => selectTeamAttributeGroups(directory, focusedAddress),
@@ -1163,6 +1183,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
                     onActivatePreset={handleActivatePreset}
                     onOpenProviderSubrun={onOpenProviderSubrun}
                     onAskFirstQuestion={onAskFirstQuestion}
+                    onCreateConversation={onCreateConversation}
                     rowActions={rowActions}
                   />
                 ) : (
@@ -1182,6 +1203,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
                     onActivatePreset={handleActivatePreset}
                     onOpenProviderSubrun={onOpenProviderSubrun}
                     onAskFirstQuestion={onAskFirstQuestion}
+                    onCreateConversation={onCreateConversation}
                     rowActions={rowActions}
                   />
                 )}
@@ -1214,15 +1236,17 @@ const AddResidentTrigger = memo(function AddResidentTrigger({
   presetResidents,
   onCreateResident,
   onActivatePreset,
+  onCreateConversation,
 }: {
   presetResidents: readonly TeamDirectoryPresetResident[];
   onCreateResident?: () => void;
   onActivatePreset: (profileId: string) => void;
+  onCreateConversation?: () => void;
 }) {
   const { t } = useTranslation();
-  if (!onCreateResident && presetResidents.length === 0) return null;
+  if (!onCreateConversation && !onCreateResident && presetResidents.length === 0) return null;
 
-  if (presetResidents.length === 0 && onCreateResident) {
+  if (!onCreateConversation && presetResidents.length === 0 && onCreateResident) {
     return (
       <ToolbarButton
         compact
@@ -1241,11 +1265,26 @@ const AddResidentTrigger = memo(function AddResidentTrigger({
         kind="menu"
         compact
         testID="team-directory-create-resident"
-        label={t("topicWorkbench.directory.addResidentMenuTitle")}
+        label={t(
+          onCreateConversation
+            ? "topicWorkbench.directory.addTeamMember"
+            : "topicWorkbench.directory.addResidentMenuTitle",
+        )}
       >
         <ThemedPlus size={14} />
       </ToolbarButton>
       <DropdownMenuContent align="end">
+        {onCreateConversation ? (
+          <DropdownMenuItem
+            onSelect={onCreateConversation}
+            testID="team-directory-create-conversation"
+          >
+            {t("topicWorkbench.directory.createConversation")}
+          </DropdownMenuItem>
+        ) : null}
+        {onCreateConversation && (presetResidents.length > 0 || onCreateResident) ? (
+          <DropdownMenuSeparator />
+        ) : null}
         {presetResidents.map((preset) => (
           <PresetResidentMenuItem
             key={preset.profileId}
@@ -1335,6 +1374,7 @@ const DirectoryActivityModeContent = memo(function DirectoryActivityModeContent(
   onActivatePreset,
   onOpenProviderSubrun,
   onAskFirstQuestion,
+  onCreateConversation,
   rowActions,
 }: {
   directory: TeamDirectoryData;
@@ -1350,6 +1390,7 @@ const DirectoryActivityModeContent = memo(function DirectoryActivityModeContent(
   onActivatePreset: (profileId: string) => void;
   onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
   onAskFirstQuestion?: () => void;
+  onCreateConversation?: () => void;
   rowActions: MemberRowActionHandlers;
 }) {
   const { t } = useTranslation();
@@ -1372,6 +1413,7 @@ const DirectoryActivityModeContent = memo(function DirectoryActivityModeContent(
             presetResidents={directory.presetResidents}
             onCreateResident={onCreateResident}
             onActivatePreset={onActivatePreset}
+            onCreateConversation={onCreateConversation}
           />
         </View>
 
@@ -1484,6 +1526,7 @@ const DirectoryAttributeModeContent = memo(function DirectoryAttributeModeConten
   onActivatePreset,
   onOpenProviderSubrun,
   onAskFirstQuestion,
+  onCreateConversation,
   rowActions,
 }: {
   directory: TeamDirectoryData;
@@ -1501,13 +1544,14 @@ const DirectoryAttributeModeContent = memo(function DirectoryAttributeModeConten
   onActivatePreset: (profileId: string) => void;
   onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
   onAskFirstQuestion?: () => void;
+  onCreateConversation?: () => void;
   rowActions: MemberRowActionHandlers;
 }) {
   const { t } = useTranslation();
   const hasLevelOne =
     attributeGroups.levelOne.expandedMembers.length > 0 ||
     attributeGroups.levelOne.foldedInactiveMembers.length > 0 ||
-    Boolean(onCreateResident) ||
+    Boolean(onCreateResident || onCreateConversation) ||
     directory.presetResidents.length > 0 ||
     cleanupStatus.kind !== "idle";
   const hasLevelTwo =
@@ -1568,6 +1612,7 @@ const DirectoryAttributeModeContent = memo(function DirectoryAttributeModeConten
                 presetResidents={directory.presetResidents}
                 onCreateResident={onCreateResident}
                 onActivatePreset={onActivatePreset}
+                onCreateConversation={onCreateConversation}
               />
             </View>
           </View>

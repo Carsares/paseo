@@ -1,6 +1,7 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
+import type { WorkspaceCreateRequest } from "@getpaseo/protocol/messages";
 import { connectDaemonClient } from "./daemon-client-loader";
 import { withProjectOwnership } from "./project-ownership";
 import { createTempDirectory, createTempGitRepo } from "./workspace";
@@ -72,6 +73,7 @@ export interface SeedDaemonClient {
         };
     title?: string;
     background?: boolean;
+    topic?: WorkspaceCreateRequest["topic"];
   }): Promise<{
     workspace: SeedWorkspaceDescriptor | null;
     error: string | null;
@@ -117,6 +119,7 @@ export interface SeedDaemonClient {
     thinkingOptionId?: string;
     featureValues?: Record<string, unknown>;
     initialPrompt?: string;
+    workspaceRole?: "main";
     labels?: Record<string, string>;
     background?: boolean;
   }): Promise<{ id: string; status: string }>;
@@ -149,6 +152,8 @@ export interface SeedDaemonClient {
   }>;
   updateAgent(agentId: string, updates: { name?: string }): Promise<void>;
   setAgentMode(agentId: string, modeId: string): Promise<unknown>;
+  setAgentParent(agentId: string, parentAgentId: string): Promise<{ parentAgentId: string }>;
+  setAgentResident(agentId: string, resident: boolean, options?: { role?: string }): Promise<void>;
   waitForAgentUpsert(
     agentId: string,
     predicate: (snapshot: { status: string }) => boolean,
@@ -240,6 +245,7 @@ export async function seedWorkspace(options: {
   repoPrefix: string;
   title?: string;
   background?: boolean;
+  topic?: WorkspaceCreateRequest["topic"];
   port?: number;
   /** Repo fixture options; only applies to git projects (the default). */
   repo?: Parameters<typeof createTempGitRepo>[1];
@@ -256,6 +262,7 @@ export async function seedWorkspace(options: {
       source: { kind: "directory", path: project.path },
       title: options.title,
       background: options.background,
+      topic: options.topic,
     });
     if (!created.workspace) {
       throw new Error(created.error ?? `Failed to create workspace ${project.path}`);

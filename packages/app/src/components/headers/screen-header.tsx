@@ -1,9 +1,9 @@
 import { ComposerDockBackground } from "@/composer/dock";
-import { useMemo, type ReactNode } from "react";
+import { useMemo, type ComponentProps, type ComponentPropsWithRef, type ReactNode } from "react";
 import type { LayoutChangeEvent } from "react-native";
 import { View, type StyleProp, type ViewStyle } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import {
   HEADER_INNER_HEIGHT,
   HEADER_INNER_HEIGHT_MOBILE,
@@ -12,6 +12,22 @@ import {
 } from "@/constants/layout";
 import { WindowChromeSafeArea } from "@/utils/desktop-window";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
+import type { Theme } from "@/styles/theme";
+
+type ScreenHeaderRowProps = Omit<
+  ComponentProps<typeof WindowChromeSafeArea>,
+  "style" | "placement"
+> &
+  Pick<ComponentPropsWithRef<typeof View>, "ref"> & { rowStyle: StyleProp<ViewStyle> };
+
+// Keep the style array on the native row so the theme wrapper only maps padding.
+function ScreenHeaderRow({ rowStyle, ...props }: ScreenHeaderRowProps) {
+  return <WindowChromeSafeArea {...props} placement="inline" style={rowStyle} />;
+}
+
+const ThemedScreenHeaderRow = withUnistyles(ScreenHeaderRow);
+const compactRowPadding = (theme: Theme) => ({ horizontalPadding: theme.spacing[2] });
+const wideRowPadding = (theme: Theme) => ({ horizontalPadding: theme.spacing[3] });
 
 interface ScreenHeaderProps {
   left?: ReactNode;
@@ -19,6 +35,7 @@ interface ScreenHeaderProps {
   leftStyle?: StyleProp<ViewStyle>;
   rightStyle?: StyleProp<ViewStyle>;
   borderless?: boolean;
+  testID?: string;
   onRowLayout?: (event: LayoutChangeEvent) => void;
 }
 
@@ -32,14 +49,13 @@ export function ScreenHeader({
   leftStyle,
   rightStyle,
   borderless,
+  testID,
   onRowLayout,
 }: ScreenHeaderProps) {
-  const { theme } = useUnistyles();
   const insets = useSafeAreaInsets();
   const isMobile = useIsCompactFormFactor();
   // Only add extra padding on mobile for better touch targets; on desktop, only use safe area insets
   const topPadding = isMobile ? HEADER_TOP_PADDING_MOBILE : 0;
-  const baseHorizontalPadding = isMobile ? theme.spacing[2] : theme.spacing[3];
 
   const innerStyle = useMemo(
     () => [styles.inner, { paddingTop: insets.top + topPadding }],
@@ -51,17 +67,16 @@ export function ScreenHeader({
 
   return (
     <ComposerDockBackground style={styles.header} testID="composer-dock-header">
-      <View style={innerStyle}>
-        <WindowChromeSafeArea
-          placement="inline"
-          horizontalPadding={baseHorizontalPadding}
+      <View style={innerStyle} testID={testID}>
+        <ThemedScreenHeaderRow
+          uniProps={isMobile ? compactRowPadding : wideRowPadding}
           onLayout={onRowLayout}
-          style={rowStyle}
+          rowStyle={rowStyle}
         >
           <TitlebarDragRegion />
           <View style={leftCombinedStyle}>{left}</View>
           <View style={rightCombinedStyle}>{right}</View>
-        </WindowChromeSafeArea>
+        </ThemedScreenHeaderRow>
       </View>
     </ComposerDockBackground>
   );

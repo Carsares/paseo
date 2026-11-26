@@ -1,6 +1,9 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceDurableItem } from "@getpaseo/protocol/messages";
 import { describe, expect, it, vi } from "vitest";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import { usePanelStore } from "@/stores/panel-store";
+import { revealWorkspaceConversation } from "./conversation-navigation";
 import {
   deriveTopicHeaderModel,
   DURABLE_ITEMS_PAGE_SIZE,
@@ -32,6 +35,69 @@ const baseInput = {
   },
   durableItems: { status: "ready", pendingCount: 0 },
 } as const;
+
+describe("revealWorkspaceConversation", () => {
+  it.each(["split-panes", "compact"] as const)(
+    "moves the existing Explorer conversation to the center in %s mode",
+    (layoutMode) => {
+      const workspaceKey = `test:reveal-explorer-${layoutMode}`;
+      const store = useWorkspaceLayoutStore.getState();
+      store.setLayoutMode("split-panes");
+      const explorer = store.showExplorerSidebar(workspaceKey)!;
+      const agent = { kind: "agent", agentId: "specialist" } as const;
+      const tabId = store.openTab({
+        workspaceKey,
+        target: agent,
+        intent: "reveal",
+        placement: { mode: "pane", paneId: explorer },
+      })!;
+      store.setTabState(workspaceKey, tabId, { retained: true });
+      store.setLayoutMode(layoutMode);
+      usePanelStore.getState().showMobileFileExplorer();
+      expect(store.getTabDestination(workspaceKey, tabId)).toMatchObject({ host: "explorer" });
+
+      revealWorkspaceConversation(workspaceKey, agent.agentId, null);
+
+      expect(store.getTabDestination(workspaceKey, tabId)).toMatchObject({
+        host: "main",
+        paneId: "main",
+      });
+      expect(
+        store.getWorkspaceTabs(workspaceKey).filter((tab) => tab.target.kind === "agent"),
+      ).toMatchObject([{ tabId, state: { retained: true } }]);
+      expect(usePanelStore.getState().mobilePanel.target).toBe("agent");
+    },
+  );
+
+  it("focuses a conversation's existing split pane", () => {
+    const workspaceKey = "test:reveal-existing-split";
+    const store = useWorkspaceLayoutStore.getState();
+    store.setLayoutMode("split-panes");
+    store.openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "specialist" },
+      intent: "reveal",
+    });
+    const sidePaneId = store.splitPaneEmpty(workspaceKey, {
+      targetPaneId: "main",
+      position: "right",
+    })!;
+    const tabId = store.openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "main-control" },
+      intent: "reveal",
+      placement: { mode: "pane", paneId: sidePaneId },
+    })!;
+    store.focusPane(workspaceKey, "main");
+
+    revealWorkspaceConversation(workspaceKey, "main-control", "main");
+
+    expect(store.getTabDestination(workspaceKey, tabId)).toMatchObject({ paneId: sidePaneId });
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace[workspaceKey]?.focusedPaneId).toBe(
+      sidePaneId,
+    );
+  });
+});
 
 function makeDurableItem(index: number): WorkspaceDurableItem {
   return {

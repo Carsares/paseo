@@ -77,9 +77,10 @@ export async function seedSubagent(
     title: input.title,
     modeId: "load-test",
     model: "ten-second-stream",
-    labels: {
-      [PARENT_AGENT_ID_LABEL]: input.parentId,
-    },
+  });
+  await workspace.client.setAgentParent(child.id, input.parentId);
+  await expect(workspace.client.fetchAgent({ agentId: child.id })).resolves.toMatchObject({
+    agent: { id: child.id, labels: { [PARENT_AGENT_ID_LABEL]: input.parentId } },
   });
   return { id: child.id, title: input.title };
 }

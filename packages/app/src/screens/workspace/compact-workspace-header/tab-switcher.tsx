@@ -1,5 +1,5 @@
 import { workspaceTabSwitcherPopoverLayout } from "../workspace-tab-layout";
-import { memo, useCallback, useContext, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useContext, useMemo, useRef, useState, type ContextType } from "react";
 import { Keyboard, Pressable, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { Crown, SquarePen, SquareTerminal } from "lucide-react-native";
@@ -38,7 +38,27 @@ function withMainTabBadge(
   return { ...presentation, icon: Crown, label: `${presentation.label} [${badge}]` };
 }
 
-function getFallbackTabOptionLabel(
+export function useWorkspaceTabFallbackLabels() {
+  const { t } = useTranslation();
+  return useMemo(
+    () => ({
+      newTab: t("workspace.tabs.actions.newTab"),
+      newAgent: t("workspace.tabs.fallback.newAgent"),
+      setup: t("workspace.tabs.fallback.setup"),
+      workspaceSetup: t("workspace.tabs.fallback.workspaceSetup"),
+      terminal: t("workspace.tabs.fallback.terminal"),
+      browser: t("workspace.tabs.fallback.browser"),
+      agent: t("workspace.tabs.fallback.agent"),
+      changes: t("panels.diff.changesLabel"),
+      files: t("panels.files.label"),
+      pullRequest: t("panels.pullRequest.label"),
+      gitGraph: t("gitWorkbench.graphTitle"),
+    }),
+    [t],
+  );
+}
+
+export function getFallbackTabOptionLabel(
   tab: WorkspaceTabDescriptor,
   labels: {
     newTab: string;
@@ -146,16 +166,7 @@ function getFallbackTabOptionDescription(
   return tab.target.path;
 }
 
-interface MobileWorkspaceTabSwitcherProps {
-  paneId?: string;
-  tabs: WorkspaceTabDescriptor[];
-  activeTabKey: string;
-  normalizedServerId: string;
-  normalizedWorkspaceId: string;
-  onSelectSwitcherTab: (key: string) => void;
-  createTerminalDisabled: boolean;
-  onCreateDraftTab: (input?: { paneId?: string }) => void;
-  onCreateTerminal: (input?: { paneId?: string }) => void;
+export interface MobileWorkspaceTabMenuActions {
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
   onCopyAgentId: (agentId: string) => Promise<void> | void;
   onCopyTerminalId: (terminalId: string) => Promise<void> | void;
@@ -168,16 +179,38 @@ interface MobileWorkspaceTabSwitcherProps {
   onCloseOtherTabs: (tabId: string) => Promise<void> | void;
 }
 
-function MobileWorkspaceTabOption({
+interface MobileWorkspaceTabSwitcherProps extends MobileWorkspaceTabMenuActions {
+  paneId?: string;
+  tabs: WorkspaceTabDescriptor[];
+  activeTabKey: string;
+  normalizedServerId: string;
+  normalizedWorkspaceId: string;
+  onSelectSwitcherTab: (key: string) => void;
+  createTerminalDisabled: boolean;
+  onCreateDraftTab: (input?: { paneId?: string }) => void;
+  onCreateTerminal: (input?: { paneId?: string }) => void;
+}
+
+type MobileWorkspaceTabMenuInput = MobileWorkspaceTabMenuActions & {
+  tab: WorkspaceTabDescriptor;
+  tabIndex: number;
+  tabCount: number;
+  mainTabIndex: number;
+  mainTabContext?: ContextType<typeof WorkspaceMainTabContext>;
+  openWithPageId?: string;
+  normalizedServerId: string;
+  normalizedWorkspaceId: string;
+};
+
+export function useMobileWorkspaceTabMenu({
   tab,
   tabIndex,
   tabCount,
   mainTabIndex,
+  mainTabContext,
+  openWithPageId,
   normalizedServerId,
   normalizedWorkspaceId,
-  selected,
-  active,
-  onPress,
   onCopyResumeCommand,
   onCopyAgentId,
   onCopyTerminalId,
@@ -188,30 +221,10 @@ function MobileWorkspaceTabOption({
   onCloseTabsAbove,
   onCloseTabsBelow,
   onCloseOtherTabs,
-}: {
-  tab: WorkspaceTabDescriptor;
-  tabIndex: number;
-  tabCount: number;
-  mainTabIndex: number;
-  normalizedServerId: string;
-  normalizedWorkspaceId: string;
-  selected: boolean;
-  active: boolean;
-  onPress: () => void;
-  onCopyResumeCommand: (agentId: string) => Promise<void> | void;
-  onCopyAgentId: (agentId: string) => Promise<void> | void;
-  onCopyTerminalId: (terminalId: string) => Promise<void> | void;
-  onCopyFilePath: (path: string) => Promise<void> | void;
-  onReloadAgent: (agentId: string) => Promise<void> | void;
-  onRenameTab: (tab: WorkspaceTabDescriptor) => void;
-  onCloseTab: (tabId: string) => Promise<void> | void;
-  onCloseTabsAbove: (tabId: string) => Promise<void> | void;
-  onCloseTabsBelow: (tabId: string) => Promise<void> | void;
-  onCloseOtherTabs: (tabId: string) => Promise<void> | void;
-}) {
+}: MobileWorkspaceTabMenuInput) {
   const { t, i18n } = useTranslation();
-  const mainTab = useContext(WorkspaceMainTabContext);
-  const isMain = isWorkspaceMainTab(tab, mainTab?.mainAgentId);
+  const inheritedMainTab = useContext(WorkspaceMainTabContext);
+  const mainTab = mainTabContext === undefined ? inheritedMainTab : mainTabContext;
   const hierarchyLabels = useMemo(
     () => getWorkspaceTabHierarchyLabels(i18n.language),
     [i18n.language],
@@ -300,26 +313,32 @@ function MobileWorkspaceTabOption({
     ],
   );
 
-  const fallbackLabels = useMemo(
-    () => ({
-      newTab: t("workspace.tabs.actions.newTab"),
-      newAgent: t("workspace.tabs.fallback.newAgent"),
-      setup: t("workspace.tabs.fallback.setup"),
-      terminal: t("workspace.tabs.fallback.terminal"),
-      browser: t("workspace.tabs.fallback.browser"),
-      agent: t("workspace.tabs.fallback.agent"),
-      changes: t("panels.diff.changesLabel"),
-      files: t("panels.files.label"),
-      pullRequest: t("panels.pullRequest.label"),
-      gitGraph: t("gitWorkbench.graphTitle"),
-    }),
-    [t],
-  );
-  const fallbackLabel = getFallbackTabOptionLabel(tab, fallbackLabels);
   const openWith = useFilePanelOpenWithMenu(
     { serverId: normalizedServerId, workspaceId: normalizedWorkspaceId, tabId: tab.tabId },
     menuTestIDBase,
+    openWithPageId,
   );
+  return { menuTestIDBase, menuEntries, openWith };
+}
+
+function MobileWorkspaceTabOption({
+  selected,
+  active,
+  onPress,
+  ...menuInput
+}: MobileWorkspaceTabMenuInput & {
+  selected: boolean;
+  active: boolean;
+  onPress: () => void;
+}) {
+  const { tab, normalizedServerId, normalizedWorkspaceId } = menuInput;
+  const { i18n } = useTranslation();
+  const mainTab = useContext(WorkspaceMainTabContext);
+  const isMain = isWorkspaceMainTab(tab, mainTab?.mainAgentId);
+  const badge = getWorkspaceTabHierarchyLabels(i18n.language).badge;
+  const { menuTestIDBase, menuEntries, openWith } = useMobileWorkspaceTabMenu(menuInput);
+  const fallbackLabels = useWorkspaceTabFallbackLabels();
+  const fallbackLabel = getFallbackTabOptionLabel(tab, fallbackLabels);
   const trailingAccessory = useMemo(
     () => (
       <MobileTabTrailingAccessory
@@ -335,14 +354,14 @@ function MobileWorkspaceTabOption({
   const renderPresentation = useCallback(
     (presentation: WorkspaceTabPresentation) => (
       <WorkspaceTabOptionRow
-        presentation={isMain ? withMainTabBadge(presentation, hierarchyLabels.badge) : presentation}
+        presentation={isMain ? withMainTabBadge(presentation, badge) : presentation}
         selected={selected}
         active={active}
         onPress={onPress}
         trailingAccessory={trailingAccessory}
       />
     ),
-    [selected, active, onPress, trailingAccessory, isMain, hierarchyLabels.badge],
+    [selected, active, onPress, trailingAccessory, isMain, badge],
   );
 
   return (
@@ -380,22 +399,7 @@ export const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitch
   const { t } = useTranslation();
   const mainAgentId = useContext(WorkspaceMainTabContext)?.mainAgentId;
   const mainTabIndex = tabs.findIndex((tab) => isWorkspaceMainTab(tab, mainAgentId));
-  const tabFallbackLabels = useMemo(
-    () => ({
-      newTab: t("workspace.tabs.actions.newTab"),
-      newAgent: t("workspace.tabs.fallback.newAgent"),
-      setup: t("workspace.tabs.fallback.setup"),
-      workspaceSetup: t("workspace.tabs.fallback.workspaceSetup"),
-      terminal: t("workspace.tabs.fallback.terminal"),
-      browser: t("workspace.tabs.fallback.browser"),
-      agent: t("workspace.tabs.fallback.agent"),
-      changes: t("panels.diff.changesLabel"),
-      files: t("panels.files.label"),
-      pullRequest: t("panels.pullRequest.label"),
-      gitGraph: t("gitWorkbench.graphTitle"),
-    }),
-    [t],
-  );
+  const tabFallbackLabels = useWorkspaceTabFallbackLabels();
 
   const tabSwitcherOptions = useMemo(
     () =>

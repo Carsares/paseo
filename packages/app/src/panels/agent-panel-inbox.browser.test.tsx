@@ -15,6 +15,10 @@ import {
   CHAT_OUTLINE_GUTTER_INSET,
   CHAT_OUTLINE_MIN_PANEL_WIDTH,
 } from "@/agent-stream/chat-outline/geometry";
+import {
+  TopicStreamModeControl,
+  TopicStreamModeHeaderProvider,
+} from "@/agent-stream/topic-card/topic-stream-mode-control";
 import { CHAT_COLUMN_RAIL_DATASET, ChatColumnRailSurface } from "@/chat-rail";
 import { CommandCenterProvider } from "@/command-center/provider";
 import { ToastProvider } from "@/contexts/toast-context";
@@ -119,6 +123,7 @@ afterEach(() => {
   useTopicStreamViewStore
     .getState()
     .setActiveReplyTopic(buildTopicAgentKey(serverId, agentId), null);
+  useTopicStreamViewStore.getState().closeTodoEditor();
   container.remove();
 });
 
@@ -218,6 +223,7 @@ async function mountTopicConversation(
   width: number,
   queueWhenRunning = false,
   additionalTopicItems: StreamItem[] = [],
+  modeInHeader = false,
 ) {
   compactTestLayout = width < 600;
   await page.viewport(width, 760);
@@ -297,7 +303,20 @@ async function mountTopicConversation(
         <ConversationShell>
           <TeamMessageJumpProvider store={createTeamMessageJumpStore()}>
             <ConversationPane>
-              <AgentConversationPanel />
+              <TopicStreamModeHeaderProvider
+                serverId={serverId}
+                agentId={modeInHeader ? agentId : null}
+              >
+                {modeInHeader ? (
+                  <TopicStreamModeControl
+                    serverId={serverId}
+                    agentId={agentId}
+                    workspaceId={pane.workspaceId}
+                    compact={width < 600}
+                  />
+                ) : null}
+                <AgentConversationPanel />
+              </TopicStreamModeHeaderProvider>
             </ConversationPane>
           </TeamMessageJumpProvider>
         </ConversationShell>
@@ -306,6 +325,85 @@ async function mountTopicConversation(
   );
   await vi.waitFor(() => expect(view.getByTestId("topic-stream-list")).toBeTruthy());
 }
+
+it.each([
+  { width: 1000, language: "en", topicsName: "Topic stream", timelineName: "Full timeline" },
+  { width: 390, language: "en", topicsName: "Topic stream", timelineName: "Full timeline" },
+  { width: 320, language: "zh-CN", topicsName: "任务话题流", timelineName: "完整时间线" },
+])(
+  "switches the active conversation from the header at $width px ($language)",
+  async ({ width, language, topicsName, timelineName }) => {
+    await i18n.changeLanguage(language);
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    vi.spyOn(client, "markWorkspaceTopicRead").mockImplementation(() => new Promise(() => {}));
+    const markAllRead = vi
+      .spyOn(client, "markAllWorkspaceTopicsRead")
+      .mockResolvedValue({ requestId: "mark-all", snapshots: [], error: null });
+    const agentKey = buildTopicAgentKey(serverId, agentId);
+    const switcher = page.getByTestId("topic-stream-mode-switch");
+    const topicsOption = page.getByTestId("topic-stream-mode-topics");
+    const timelineOption = page.getByTestId("topic-stream-mode-timeline");
+    const isCompact = width < 600;
+    const actionTrigger = isCompact ? switcher : page.getByTestId("topic-stream-actions");
+    await mountTopicConversation(
+      client,
+      true,
+      width,
+      false,
+      [
+        {
+          kind: "assistant_message",
+          id: "unread-answer",
+          messageId: "unread-answer",
+          text: "Unread answer",
+          timestamp: new Date("2026-04-20T00:01:00.000Z"),
+          timelineCursor: { epoch: "browser-epoch", seq: 2 },
+        },
+      ],
+      true,
+    );
+
+    expect(view.queryByTestId("topic-stream-top-bar")).toBeNull();
+    expect(view.getAllByTestId("topic-stream-mode-switch")).toHaveLength(1);
+    if (isCompact) {
+      await expect.element(switcher).toHaveAccessibleName(topicsName);
+      const { width: buttonWidth, height: buttonHeight } = switcher
+        .element()
+        .getBoundingClientRect();
+      expect([buttonWidth, buttonHeight]).toEqual([44, 44]);
+      await userEvent.click(switcher);
+      await expect.element(topicsOption).toHaveAttribute("aria-checked", "true");
+      await expect.element(timelineOption).toHaveAttribute("aria-checked", "false");
+    }
+    await userEvent.click(timelineOption);
+    await expect.element(page.getByTestId("topic-stream-list")).not.toBeInTheDocument();
+    expect(useTopicStreamViewStore.getState().viewModeByAgentKey[agentKey]).toBe("timeline");
+
+    if (isCompact) {
+      await expect.element(switcher).toHaveAccessibleName(timelineName);
+    }
+    await userEvent.click(actionTrigger);
+    if (isCompact) {
+      await expect.element(topicsOption).toHaveAttribute("aria-checked", "false");
+      await expect.element(timelineOption).toHaveAttribute("aria-checked", "true");
+    }
+    expect(page.getByTestId("topic-stream-unread-only").query()).toBeNull();
+    await userEvent.click(page.getByTestId("topic-stream-mark-all-read"));
+    expect(markAllRead).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ workspaceId: pane.workspaceId, mainAgentId: agentId, maxSeq: 2 }),
+    );
+    await userEvent.click(actionTrigger);
+    await userEvent.click(page.getByTestId("topic-stream-add-todo"));
+    expect(useTopicStreamViewStore.getState().todoEditorRequest).toEqual({
+      serverId,
+      workspaceId: pane.workspaceId,
+    });
+    if (isCompact) await userEvent.click(switcher);
+    await userEvent.click(topicsOption);
+    await expect.element(page.getByTestId("topic-stream-list")).toBeInTheDocument();
+    expect(useTopicStreamViewStore.getState().viewModeByAgentKey[agentKey]).toBe("topics");
+  },
+);
 
 it("preserves a wide draft when the viewport marks its topic read and the filter hides it", async () => {
   const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
@@ -353,6 +451,8 @@ it("preserves a wide draft when the viewport marks its topic read and the filter
       });
     });
     await expect.element(input).not.toBeInTheDocument();
+    expect(view.getByTestId("topic-stream-top-bar")).toBeTruthy();
+    await userEvent.click(page.getByTestId("topic-stream-actions"));
     await userEvent.click(page.getByTestId("topic-stream-unread-only"));
     await expect.element(input).toHaveValue("Draft while reading");
   } finally {

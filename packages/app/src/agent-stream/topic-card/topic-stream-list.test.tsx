@@ -7,7 +7,7 @@ import type {
   WorkspaceTopicDecideResponse,
 } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSidebarAttention } from "@/components/sidebar/sidebar-unread-conclusions";
@@ -33,7 +33,6 @@ import type { StreamItem } from "@/types/stream";
 import {
   topicMatchesScrollTarget,
   TopicStreamList,
-  TopicStreamTopBar,
   useTopicStreamMarkAllRead,
 } from "./topic-stream-list";
 
@@ -204,30 +203,6 @@ function makePaneContextValue(): PaneContextValue {
     openFileInWorkspace: vi.fn(),
     openImportSheet: vi.fn(),
   };
-}
-
-function TestTopBarHarness({ streamItems }: { streamItems: readonly StreamItem[] }) {
-  const { totalUnreadTopics, markAllRead } = useTopicStreamMarkAllRead({
-    serverId: SERVER_ID,
-    workspaceId: WORKSPACE_ID,
-    mainAgentId: MAIN_AGENT_ID,
-    streamItems,
-    streamHead: [],
-  });
-  return (
-    <TopicStreamTopBar
-      serverId={SERVER_ID}
-      workspaceId={WORKSPACE_ID}
-      mainAgentId={MAIN_AGENT_ID}
-      viewMode="topics"
-      unreadOnly={false}
-      totalUnreadTopics={totalUnreadTopics}
-      onChangeViewMode={vi.fn()}
-      onToggleUnreadOnly={vi.fn()}
-      onMarkAllRead={markAllRead}
-      onOpenAddTodo={vi.fn()}
-    />
-  );
 }
 
 describe("TopicStreamList & read-watermark integration", () => {
@@ -607,7 +582,7 @@ describe("TopicStreamList & read-watermark integration", () => {
     },
   );
 
-  it("counts attention and cached thread entries in TopicStreamTopBar mark-all-read", () => {
+  it("counts attention and cached thread entries for mark-all-read", () => {
     seedSession({
       supportsTopicThreads: true,
       supportsTopicReadState: true,
@@ -631,14 +606,24 @@ describe("TopicStreamList & read-watermark integration", () => {
     ];
     qc.setQueryData(workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), entries);
 
-    render(
-      <QueryClientProvider client={qc}>
-        <TestTopBarHarness streamItems={makeStreamItems()} />
-      </QueryClientProvider>,
+    const items = makeStreamItems();
+    const { result } = renderHook(
+      () =>
+        useTopicStreamMarkAllRead({
+          serverId: SERVER_ID,
+          workspaceId: WORKSPACE_ID,
+          mainAgentId: MAIN_AGENT_ID,
+          streamItems: items,
+          streamHead: [],
+        }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+        ),
+      },
     );
 
-    const markAllBtn = screen.getByTestId("topic-stream-mark-all-read") as HTMLButtonElement;
-    expect(markAllBtn.disabled).toBe(false);
+    expect(result.current.totalUnreadTopics).toBeGreaterThan(0);
   });
 
   it("submits per-workspace observed watermark snapshot in clearSidebarAttention without calling blind clearAgentAttention on topic main", async () => {

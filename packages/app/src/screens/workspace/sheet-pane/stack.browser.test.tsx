@@ -1,4 +1,4 @@
-import { act, useCallback, useState } from "react";
+import { act, useCallback, useMemo, useState } from "react";
 import { PortalProvider } from "@gorhom/portal";
 import { NavigationContext } from "expo-router/react-navigation";
 import { afterEach, expect, it, vi } from "vitest";
@@ -6,15 +6,21 @@ import { page } from "vitest/browser";
 import { createRoot, type Root } from "react-dom/client";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { MenuRoot, MenuSurface, MenuTrigger } from "@/components/ui/menu";
+import { ComposerTrackRow } from "@/composer/tracks";
 import { DiffDocumentWorkspaceCacheProvider } from "@/git/diff-document/workspace-cache";
 import { GraphSheet } from "@/git/graph/sheet";
 import { MobilePanelsProvider } from "@/mobile-panels/provider";
 import { PaneProvider, type PaneContextValue } from "@/panels/pane-context";
+import { ensurePanelsRegistered } from "@/panels/register-panels";
 import { useRetainedPanelActive } from "@/components/retained-panel";
+import { WorkspaceSheetBackToMain } from "@/screens/workspace/workspace-tab-presentation";
+import type { SheetTab } from "@/stores/workspace-layout-store";
 import { SheetTabs } from "../sheet-tabs";
 import {
   SheetPaneHostProvider,
   useActiveWorkspaceSheetOpener,
+  useSheetPanePage,
   useWorkspaceSheetPages,
   type SheetPaneHost,
   type WorkspaceSheetPage,
@@ -23,12 +29,15 @@ import { i18n } from "@/i18n/i18next";
 void i18n;
 
 vi.mock("@gorhom/bottom-sheet", async (importOriginal) => {
-  const [actual, { Portal }, { createElement, forwardRef, useImperativeHandle }] =
-    await Promise.all([
-      importOriginal<typeof import("@gorhom/bottom-sheet")>(),
-      import("@gorhom/portal"),
-      import("react"),
-    ]);
+  const [
+    actual,
+    { Portal },
+    { createElement, forwardRef, useImperativeHandle, useState: useReactState },
+  ] = await Promise.all([
+    importOriginal<typeof import("@gorhom/bottom-sheet")>(),
+    import("@gorhom/portal"),
+    import("react"),
+  ]);
   const noop = () => {};
   return {
     ...actual,
@@ -37,10 +46,27 @@ vi.mock("@gorhom/bottom-sheet", async (importOriginal) => {
         {
           children,
           containerStyle,
-        }: { children: React.ReactNode; containerStyle?: React.CSSProperties },
+          onDismiss,
+        }: {
+          children: React.ReactNode;
+          containerStyle?: React.CSSProperties;
+          onDismiss?: () => void;
+        },
         ref,
       ) => {
-        useImperativeHandle(ref, () => ({ present: () => {} }), []);
+        const [presented, setPresented] = useReactState(false);
+        useImperativeHandle(
+          ref,
+          () => ({
+            present: () => setPresented(true),
+            dismiss: () => {
+              setPresented(false);
+              onDismiss?.();
+            },
+          }),
+          [onDismiss, setPresented],
+        );
+        if (!presented) return null;
         return createElement(
           Portal,
           null,
@@ -344,4 +370,121 @@ it("places compact Git surfaces in the shared sheet and reactivates the retained
   await expect.element(body).toHaveAttribute("data-active", "true");
   expect(body.element()).toBe(element);
   expect(element.scrollTop).toBe(80);
+});
+
+function SpecialistSheetBody() {
+  return <div data-testid="specialist-sheet-body">Specialist sheet</div>;
+}
+
+const specialistSheetTab: SheetTab = {
+  tab: {
+    tabId: "agent_specialist-1",
+    target: { kind: "agent", agentId: "specialist-1" },
+    createdAt: 0,
+  },
+  policy: { openAsTab: true },
+  parentTabId: null,
+};
+
+function TrackSheetMenu({ openerAgentId }: { openerAgentId: string }) {
+  const openerPane = useMemo<PaneContextValue>(
+    () => ({
+      ...graphPane,
+      tabId: `agent_${openerAgentId}`,
+      target: { kind: "agent", agentId: openerAgentId },
+    }),
+    [openerAgentId],
+  );
+  return (
+    <PaneProvider value={openerPane}>
+      <TrackSheetMenuInner />
+    </PaneProvider>
+  );
+}
+
+function TrackSheetMenuInner() {
+  const buildSheetPage = useSheetPanePage();
+  const pages = useMemo(() => [buildSheetPage(specialistSheetTab)], [buildSheetPage]);
+  return (
+    <MenuRoot compactMode="sheet">
+      <MenuTrigger testID="open-track-menu">
+        <span>Subagents</span>
+      </MenuTrigger>
+      <MenuSurface pages={pages} sheetTitle="Subagents" testID="track-sheet-menu">
+        <ComposerTrackRow opensPage={specialistSheetTab.tab.tabId} testID="open-specialist-sheet">
+          <span>Specialist</span>
+        </ComposerTrackRow>
+      </MenuSurface>
+    </MenuRoot>
+  );
+}
+
+function SpecialistRouteHarness({
+  openerAgentId,
+  onBackToMain,
+}: {
+  openerAgentId: string;
+  onBackToMain: () => void;
+}) {
+  const specialistHost = useMemo<SheetPaneHost>(
+    () => ({
+      ...host,
+      buildContent: (tab, closeCurrentTab) => ({
+        key: tab.key,
+        Component: SpecialistSheetBody,
+        navigation: (
+          <WorkspaceSheetBackToMain
+            tab={tab}
+            serverId={host.serverId}
+            workspaceId={host.workspaceId}
+            mainAgentId="main-agent"
+            onBackToMain={onBackToMain}
+          />
+        ),
+        paneContextValue: {
+          ...graphPane,
+          host: "sheet",
+          tabId: tab.tabId,
+          target: tab.target,
+          closeCurrentTab,
+        },
+      }),
+    }),
+    [onBackToMain],
+  );
+  return (
+    <WorkspaceRoute value={specialistHost}>
+      <TrackSheetMenu openerAgentId={openerAgentId} />
+    </WorkspaceRoute>
+  );
+}
+
+it("closes MenuSheetPane when returning to Main from a subagent opened off Main, and falls back otherwise", async () => {
+  ensurePanelsRegistered();
+  const onBackToMain = vi.fn();
+
+  const renderApp = createAppRenderer();
+  const renderWithOpener = (openerAgentId: string) =>
+    renderApp(<SpecialistRouteHarness openerAgentId={openerAgentId} onBackToMain={onBackToMain} />);
+
+  // Opened from Main: leaving the sheet lands directly back on Main without redundant reveal.
+  await renderWithOpener("main-agent");
+  await act(async () => page.getByTestId("open-track-menu").click());
+  await act(async () => page.getByTestId("open-specialist-sheet").click());
+  await expect.element(page.getByTestId("specialist-sheet-body")).toBeVisible();
+  const backToMain = page.getByTestId("workspace-header-back-to-main");
+  await expect.element(backToMain).toBeVisible();
+  await act(async () => backToMain.click());
+  await expect.element(page.getByTestId("specialist-sheet-body")).not.toBeInTheDocument();
+  await expect.element(backToMain).not.toBeInTheDocument();
+  expect(onBackToMain).not.toHaveBeenCalled();
+
+  // Opened from another specialist: closes MenuSheetPane and falls back to onBackToMain.
+  await renderWithOpener("other-specialist");
+  await act(async () => page.getByTestId("open-track-menu").click());
+  await act(async () => page.getByTestId("open-specialist-sheet").click());
+  await expect.element(page.getByTestId("specialist-sheet-body")).toBeVisible();
+  await act(async () => page.getByTestId("workspace-header-back-to-main").click());
+  await expect.element(page.getByTestId("specialist-sheet-body")).not.toBeInTheDocument();
+  expect(onBackToMain).toHaveBeenCalledOnce();
 });

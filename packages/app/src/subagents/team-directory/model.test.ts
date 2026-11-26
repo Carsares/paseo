@@ -13,6 +13,7 @@ import type { AgentProfile, ProviderSubagentDescriptorPayload } from "@getpaseo/
 import { describe, expect, it } from "vitest";
 import {
   isDirectlyCleanableTaskMember,
+  isLiveTeamDirectoryWorkspaceAgent,
   isMemberActivelyWorking,
   selectTeamActivityGroups,
   selectTeamAttributeGroups,
@@ -48,6 +49,43 @@ function parentLabel(parentId: string) {
 }
 
 describe("selectTeamDirectoryData", () => {
+  it("shares live tab eligibility with directory rows for orphans and excluded agents", () => {
+    const agents = [
+      main,
+      makeAgent("orphan", { labels: parentLabel("missing") }),
+      makeAgent("background", { background: true, labels: parentLabel(main.id) }),
+      makeAgent("pending"),
+      makeAgent("archived", { archivedAt: new Date(1000) }),
+      makeAgent("elsewhere", { workspaceId: "ws-2" }),
+    ];
+    const pendingArchiveIds = new Set(["host:pending"]);
+    const data = selectTeamDirectoryData({
+      serverId: "host",
+      workspaceId: "ws-1",
+      mainAgentId: main.id,
+      agentMaps: { host: new Map(agents.map((agent) => [agent.id, agent])) },
+      pendingArchiveIds,
+      fallbackTitle: "Agent",
+    });
+    const groups = selectTeamActivityGroups(data, null);
+    const expected = ["main", "orphan"];
+    expect(
+      [
+        ...groups.activeMembers,
+        ...groups.pinnedInactiveMembers,
+        ...groups.collapsibleInactiveMembers,
+      ]
+        .map((row) => row.agentId)
+        .sort(),
+    ).toEqual(expected);
+    expect(
+      agents
+        .filter((agent) =>
+          isLiveTeamDirectoryWorkspaceAgent(agent, "host", "ws-1", pendingArchiveIds),
+        )
+        .map((agent) => agent.id),
+    ).toEqual(expected);
+  });
   it("sorts task members by needs_input/blocked > running > unread > idle and bubbles urgent L2 branches", () => {
     const idleChild = makeAgent("idle-l1", {
       labels: parentLabel("main"),

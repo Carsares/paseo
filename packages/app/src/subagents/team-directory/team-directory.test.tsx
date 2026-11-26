@@ -173,11 +173,13 @@ function makeAgent(id: string, overrides: Partial<Agent> = {}): Agent {
 
 function setupDirectory({
   supportsIdleArchive,
+  focusedAgentId = "main-1",
   extraAgents = [],
   mainStreamTail = [],
   topicReadSnapshot,
 }: {
   supportsIdleArchive: boolean;
+  focusedAgentId?: string;
   extraAgents?: Agent[];
   mainStreamTail?: StreamItem[];
   topicReadSnapshot?: WorkspaceTopicReadSnapshot;
@@ -263,7 +265,7 @@ function setupDirectory({
           workspaceId={WORKSPACE_ID}
           mainAgentId="main-1"
           isTopicWorkspace
-          focusedAgentId="main-1"
+          focusedAgentId={focusedAgentId}
           focusedProviderSubagentId={null}
           onHide={vi.fn()}
           onOpenAgent={onOpenAgent}
@@ -303,6 +305,18 @@ it("collapses non-focused idle members by default in activity mode and hides bat
   expect(screen.getByTestId("team-directory-row-task-idle")).toBeTruthy();
   expect(screen.getByTestId("team-directory-row-resident-1")).toBeTruthy();
   expect(archiveAgent).not.toHaveBeenCalled();
+});
+
+it("lets a selected specialist switch to main without expanding inactive conversations", () => {
+  const { onOpenAgent } = setupDirectory({
+    supportsIdleArchive: false,
+    focusedAgentId: "resident-1",
+  });
+
+  expect(screen.getByTestId("team-directory-row-resident-1")).toBeTruthy();
+  expect(screen.queryByTestId("team-directory-row-task-idle")).toBeNull();
+  fireEvent.click(screen.getByTestId("team-directory-row-main-1"));
+  expect(onOpenAgent).toHaveBeenCalledWith(expect.objectContaining({ agentId: "main-1" }));
 });
 
 it("archives cleanable idle subagents via client.archiveAgent(..., { onlyIfIdle: true }) directly from the inactive header", async () => {

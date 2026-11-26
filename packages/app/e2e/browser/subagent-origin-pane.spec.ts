@@ -118,7 +118,8 @@ test("opening an already-tabbed subagent reveals its left tab without a duplicat
     await page.keyboard.press("Meta+Alt+Shift+ArrowLeft");
     await expect(left.getByTestId(`workspace-tab-agent_${pair.child.id}`)).toBeVisible();
     await right.getByTestId(`workspace-tab-agent_${pair.parent.id}`).click();
-    await openSubagentsTrack(page);
+    await right.getByTestId("subagents-track-header").click();
+    await expect(page.getByTestId("subagents-track-header-panel")).toBeVisible();
     await page.getByTestId(`subagents-track-row-${pair.child.id}`).click();
 
     await expect(left.getByTestId(`workspace-tab-agent_${pair.child.id}`)).toBeVisible();

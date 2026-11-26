@@ -32,6 +32,8 @@ interface CompactHeaderProps {
   onBack?: () => void;
   title?: string;
   titleTestID?: string;
+  testID?: string;
+  titleContent?: ReactNode;
   /** A line under the title. */
   subtitle?: ReactNode;
   /** Show a placeholder instead of the title while it loads. */
@@ -54,6 +56,8 @@ export function CompactHeader({
   onBack,
   title,
   titleTestID,
+  testID,
+  titleContent,
   subtitle,
   loading = false,
   actions,
@@ -75,7 +79,7 @@ export function CompactHeader({
 
   return (
     <IconButtonChromeProvider value="header-island">
-      <View style={rootStyle}>
+      <View style={rootStyle} testID={testID}>
         <View
           style={[
             usesTitlebarHeight ? styles.titlebarRow : styles.row,
@@ -86,12 +90,14 @@ export function CompactHeader({
             {navigation === "menu" ? <SidebarMenuToggle /> : <BackButton onBack={onBack} />}
           </View>
           <View style={styles.titleGroup}>
-            <CompactHeaderTitle
-              loading={loading}
-              title={title}
-              titleTestID={titleTestID}
-              subtitle={subtitle}
-            />
+            {titleContent ?? (
+              <CompactHeaderTitle
+                loading={loading}
+                title={title}
+                titleTestID={titleTestID}
+                subtitle={subtitle}
+              />
+            )}
           </View>
           {actions ? <View style={styles.island}>{actions}</View> : null}
         </View>

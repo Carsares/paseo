@@ -107,6 +107,27 @@ function MobileTabDropdownMenuItem({
   );
 }
 
+export function MobileTabMenuEntries({
+  menuEntries,
+  openWith,
+}: {
+  menuEntries: WorkspaceTabMenuEntry[];
+  /** A file tab's "Open with…" row and its page. */
+  openWith?: FilePanelOpenWithMenu;
+}): ReactElement {
+  return (
+    <>
+      {menuEntries.map((entry) => {
+        if (entry.kind === "separator") return <DropdownMenuSeparator key={entry.key} />;
+        if (entry.kind === "file-panel-open-with") {
+          return <Fragment key={entry.key}>{openWith?.trigger}</Fragment>;
+        }
+        return <MobileTabDropdownMenuItem key={entry.key} entry={entry} />;
+      })}
+    </>
+  );
+}
+
 export function MobileTabTrailingAccessory({
   menuTestIDBase,
   presentationLabel,
@@ -139,13 +160,7 @@ export function MobileTabTrailingAccessory({
         pages={openWith?.pages}
         testID={menuTestIDBase}
       >
-        {menuEntries.map((entry) => {
-          if (entry.kind === "separator") return <DropdownMenuSeparator key={entry.key} />;
-          if (entry.kind === "file-panel-open-with") {
-            return <Fragment key={entry.key}>{openWith?.trigger}</Fragment>;
-          }
-          return <MobileTabDropdownMenuItem key={entry.key} entry={entry} />;
-        })}
+        <MobileTabMenuEntries menuEntries={menuEntries} openWith={openWith} />
       </DropdownMenuContent>
     </DropdownMenu>
   );

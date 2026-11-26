@@ -8,17 +8,18 @@ import type { TFunction } from "i18next";
 import { SquarePen, X } from "lucide-react-native";
 import { AgentLimitRecovery } from "./agent-limit-recovery";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
+import { TopicStreamList } from "@/agent-stream/topic-card/topic-stream-list";
 import {
-  TopicStreamList,
-  TopicStreamTopBar,
-  useTopicStreamMarkAllRead,
-} from "@/agent-stream/topic-card/topic-stream-list";
+  TopicStreamModeControl,
+  useTopicStreamModeInHeader,
+  useTopicStreamMode,
+} from "@/agent-stream/topic-card/topic-stream-mode-control";
+import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
 import {
   buildTopicAgentKey,
   buildTopicReplyDraftKey,
   type ActiveTopicReplyTarget,
   useTopicStreamViewStore,
-  type TopicStreamViewMode,
 } from "@/stores/topic-stream-view-store";
 import {
   deliverQueuedTopicReply,
@@ -775,91 +776,34 @@ function useSuppressTopicFocusClear(
     return Boolean(agent && isWorkspaceRootAgent(agent, workspaceId) && isMainControlAgent(agent));
   });
   const supportsTopicReadState = useHostFeature(serverId, "workspaceTopicReadState");
-  const topicAgentKey = agentId ? buildTopicAgentKey(serverId, agentId) : null;
-  const topicViewMode = useTopicStreamViewStore((state) =>
-    topicAgentKey ? (state.viewModeByAgentKey[topicAgentKey] ?? "topics") : "topics",
-  );
+  const topicViewMode = useTopicStreamMode(serverId, agentId);
   return isTopicMainControl && supportsTopicReadState && topicViewMode === "topics";
 }
 
-function useMainControlTopicStreamControls(input: {
+function FallbackTopicStreamToolbar({
+  serverId,
+  workspaceId,
+  agentId,
+  enabled,
+}: {
   serverId: string;
   workspaceId: string;
   agentId: string;
-  isMainControlStream: boolean;
-}) {
-  const { serverId, workspaceId, agentId, isMainControlStream } = input;
-  const mainControlAgentKey = buildTopicAgentKey(serverId, agentId);
-  const viewMode = useTopicStreamViewStore(
-    (state) => state.viewModeByAgentKey[mainControlAgentKey] ?? "topics",
-  );
-  const unreadOnly = useTopicStreamViewStore(
-    (state) => state.unreadOnlyByAgentKey[mainControlAgentKey] ?? false,
-  );
-  const setViewMode = useTopicStreamViewStore((state) => state.setViewMode);
-  const toggleUnreadOnly = useTopicStreamViewStore((state) => state.toggleUnreadOnly);
-  const openTodoEditor = useTopicStreamViewStore((state) => state.openTodoEditor);
-  const handleChangeViewMode = useCallback(
-    (mode: TopicStreamViewMode) => setViewMode(mainControlAgentKey, mode),
-    [mainControlAgentKey, setViewMode],
-  );
-  const handleToggleUnreadOnly = useCallback(
-    () => toggleUnreadOnly(mainControlAgentKey),
-    [mainControlAgentKey, toggleUnreadOnly],
-  );
-  const handleOpenAddTodo = useCallback(() => {
-    openTodoEditor({ serverId, workspaceId });
-  }, [openTodoEditor, serverId, workspaceId]);
-  const mainStreamTail = useAgentStreamTail(serverId, isMainControlStream ? agentId : undefined);
-  const mainStreamHead = useSessionStore((state) =>
-    isMainControlStream ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,
-  );
-  const { totalUnreadTopics, markAllRead } = useTopicStreamMarkAllRead({
-    serverId,
-    workspaceId,
-    mainAgentId: isMainControlStream ? agentId : null,
-    streamItems: mainStreamTail ?? EMPTY_STREAM_ITEMS,
-    streamHead: mainStreamHead ?? EMPTY_STREAM_ITEMS,
-  });
-  return {
-    viewMode,
-    unreadOnly,
-    useTopicCards: isMainControlStream && viewMode === "topics",
-    totalUnreadTopics,
-    handleChangeViewMode,
-    handleToggleUnreadOnly,
-    handleOpenAddTodo,
-    handleMarkAllTopicsRead: markAllRead,
-  };
-}
-
-function MainControlStreamHeaderBar({
-  enabled,
-  serverId,
-  workspaceId,
-  mainAgentId,
-  controls,
-}: {
   enabled: boolean;
-  serverId: string;
-  workspaceId: string;
-  mainAgentId: string;
-  controls: ReturnType<typeof useMainControlTopicStreamControls>;
 }) {
-  if (!enabled) return null;
+  const { host } = usePaneContext();
+  const modeInHeader = useTopicStreamModeInHeader(serverId, agentId);
+  const compact = useIsCompactFormFactor();
+  if (!enabled || (host !== "sheet" && modeInHeader)) return null;
   return (
-    <TopicStreamTopBar
-      serverId={serverId}
-      workspaceId={workspaceId}
-      mainAgentId={mainAgentId}
-      viewMode={controls.viewMode}
-      unreadOnly={controls.unreadOnly}
-      totalUnreadTopics={controls.totalUnreadTopics}
-      onChangeViewMode={controls.handleChangeViewMode}
-      onToggleUnreadOnly={controls.handleToggleUnreadOnly}
-      onMarkAllRead={controls.handleMarkAllTopicsRead}
-      onOpenAddTodo={controls.handleOpenAddTodo}
-    />
+    <PaneContentToolbar testID="topic-stream-top-bar">
+      <TopicStreamModeControl
+        serverId={serverId}
+        agentId={agentId}
+        workspaceId={workspaceId}
+        compact={compact}
+      />
+    </PaneContentToolbar>
   );
 }
 
@@ -1423,12 +1367,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       hasCachedHistory,
       showHistorySyncError,
     });
-  const topicControls = useMainControlTopicStreamControls({
-    serverId,
-    workspaceId,
-    agentId,
-    isMainControlStream,
-  });
+  const useTopicCards = useTopicStreamMode(serverId, agentId) === "topics" && isMainControlStream;
   const handleFocusCompactComposer = useCallback(() => {
     composerEditingSession.focus();
   }, [composerEditingSession]);
@@ -1445,7 +1384,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         isSubmitLoading={false}
         agentInputDraft={agentInputDraft}
         editingSession={composerEditingSession}
-        hidePendingInboxBar={topicControls.useTopicCards}
+        hidePendingInboxBar={useTopicCards}
         onAttentionInputFocus={onAttentionInputFocus}
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={handleComposerHeightChange}
@@ -1532,17 +1471,16 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const streamContent = (
     <View style={animatedStaticStyles.content}>
       {showsComposer ? null : <SheetAgentFacts serverId={serverId} agentId={agentId} />}
-      <MainControlStreamHeaderBar
+      <FallbackTopicStreamToolbar
         enabled={isMainControlStream}
         serverId={serverId}
         workspaceId={workspaceId}
-        mainAgentId={agentId}
-        controls={topicControls}
+        agentId={agentId}
       />
       <RenderProfile id={`AgentStreamSection:${agentId}`}>
         <AgentStreamSection
           isSubagent={isSubagent}
-          useTopicCards={topicControls.useTopicCards}
+          useTopicCards={useTopicCards}
           isPaneFocused={isPaneFocused}
           workspaceId={workspaceId}
           streamViewRef={streamViewRef}

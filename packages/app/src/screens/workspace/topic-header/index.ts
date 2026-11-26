@@ -18,4 +18,8 @@ export {
   type TopicHeaderTeamStatus,
 } from "./model";
 export { CompactWorkspaceRebaseConflictAction } from "./compact-rebase-conflict-action";
-export { TopicHeaderBar, type TopicHeaderBarProps } from "./topic-header";
+export {
+  TopicDirectoryToggle,
+  useTopicHeaderMenuStatus,
+  type TopicHeaderMenuStatus,
+} from "./topic-header";
