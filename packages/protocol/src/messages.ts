@@ -780,6 +780,13 @@ export const UserMessageForkContextSchema = z.object({
   boundaryMessageId: z.string().optional(),
 });
 
+export const MessageImageAttachmentSchema = z.object({
+  id: z.string().min(1),
+  fileName: z.string().min(1),
+  mimeType: z.string().min(1),
+  size: z.number().int().positive(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
@@ -789,6 +796,7 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     messageId: z.string().optional(),
     clientMessageId: z.string().optional(),
     forkContext: UserMessageForkContextSchema.optional(),
+    imageAttachments: z.array(MessageImageAttachmentSchema).optional(),
   }),
   z.object({
     type: z.literal("assistant_message"),
@@ -3222,6 +3230,7 @@ export const TopicThreadEntrySchema = z.object({
   routedAgentId: z.string().min(1),
   sourceMessageId: z.string().min(1).optional(),
   text: z.string(),
+  imageAttachments: z.array(MessageImageAttachmentSchema).optional(),
   status: z.enum(["queued", "running", "completed", "error"]),
   retryable: z.boolean().optional(),
   seq: z.number().int().nonnegative(),
@@ -3234,6 +3243,19 @@ export const TopicThreadEntrySchema = z.object({
 });
 export type TopicThreadEntry = z.infer<typeof TopicThreadEntrySchema>;
 
+const TopicDelegationSummarySchema = z.object({
+  reportIds: z.array(z.string()).optional(),
+  taskId: z.string().min(1).optional(),
+  updatedAt: z.iso.datetime(),
+  messageId: z.string().min(1),
+  agentId: z.string().min(1),
+  serverId: z.string().min(1),
+  title: z.string().optional(),
+  turnId: z.string().optional(),
+  status: z.enum(["queued", "running", "ended", "completed", "interrupted", "error"]),
+});
+export type TopicDelegationSummary = z.infer<typeof TopicDelegationSummarySchema>;
+
 export const TopicAnchorSummarySchema = z.object({
   workspaceId: z.string().min(1),
   mainAgentId: z.string().min(1),
@@ -3241,10 +3263,12 @@ export const TopicAnchorSummarySchema = z.object({
   taskId: z.string().min(1).optional(),
   rootMessageId: z.string().min(1).optional(),
   rootPromptText: z.string(),
+  imageAttachments: z.array(MessageImageAttachmentSchema).optional(),
   title: z.string().optional(),
   leadAgentId: z.string().min(1).optional(),
   leadServerId: z.string().min(1).optional(),
   leadTitle: z.string().optional(),
+  delegations: z.array(TopicDelegationSummarySchema).optional(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
 });
@@ -3371,6 +3395,7 @@ export const WorkspaceTopicAnchorUpdatedMessageSchema = z.object({
     workspaceId: z.string().min(1),
     mainAgentId: z.string().min(1),
     anchor: TopicAnchorSummarySchema,
+    subscriptionId: z.string().optional(),
   }),
 });
 export type WorkspaceTopicAnchorUpdatedMessage = z.infer<
@@ -5096,6 +5121,7 @@ export type HubExecutionControlRequest = z.infer<typeof HubExecutionControlReque
 // These connection event streams have no directory bootstrap or timeline membership.
 export const SessionEventSubscriptionSchema = z.enum([
   "project.update",
+  "workspace.topic.anchor.updated",
   "providers_snapshot_update",
   "agent_attention_required",
   "agent_permission_request",
@@ -5810,6 +5836,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceTodos: z.boolean().optional(),
         // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
         workspaceButlerV1: z.boolean().optional(),
+        workspaceTopicAnchorEvents: z.boolean().optional(),
         workspaceTopicReplyRetry: z.boolean().optional(),
         // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         checkoutGitStagingV1: z.boolean().optional(),

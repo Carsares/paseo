@@ -11,7 +11,7 @@ import { PendingSubagentInboxBar } from "./agent-panel-inbox";
 import { TopicStreamList } from "@/agent-stream/topic-card/topic-stream-list";
 import {
   TopicStreamModeControl,
-  useTopicStreamModeInHeader,
+  useTopicStreamToolbarInPane,
   useTopicStreamMode,
 } from "@/agent-stream/topic-card/topic-stream-mode-control";
 import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
@@ -799,10 +799,11 @@ function FallbackTopicStreamToolbar({
   agentId: string;
   enabled: boolean;
 }) {
-  const { host } = usePaneContext();
-  const modeInHeader = useTopicStreamModeInHeader(serverId, agentId);
+  const { host, tabId } = usePaneContext();
+  const active = useRetainedPanelActive();
+  const ownsToolbar = useTopicStreamToolbarInPane(serverId, workspaceId, agentId, tabId);
   const compact = useIsCompactFormFactor();
-  if (!enabled || (host !== "sheet" && modeInHeader)) return null;
+  if (!enabled || !active || (host !== "sheet" && !ownsToolbar)) return null;
   return (
     <PaneContentToolbar testID="topic-stream-top-bar">
       <TopicStreamModeControl
@@ -1578,6 +1579,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const dock = (
     <ChatSurface
       serverId={serverId}
+      allowOutline={!useTopicCards || !workspaceId}
       disabled={isArchivingCurrentAgent}
       fullscreen={isComposerFullscreen}
     >
@@ -1642,7 +1644,11 @@ function AgentPendingRewindFiles({
   cwd: string;
   toastApi: ToastApi;
 }) {
-  if (!agent || draft || isArchiving) return null;
+  const canRecoverFiles = useSessionStore((state) => {
+    const subject = resolveChatAgentFromSession(state, scope.serverId, agent?.id);
+    return subject !== null && !isMainControlAgent(subject);
+  });
+  if (!agent || draft || isArchiving || !canRecoverFiles) return null;
   return (
     <ToastApiProvider api={toastApi}>
       <AgentPendingRewindFileNotice {...scope} agentId={agent.id} />
@@ -1716,11 +1722,13 @@ function wrapAgentCommandProvider({
 
 function ChatSurface({
   serverId,
+  allowOutline,
   children,
   disabled,
   fullscreen,
 }: {
   serverId: string;
+  allowOutline: boolean;
   children: [ReactNode, ReactNode, ReactNode];
   disabled: boolean;
   fullscreen: boolean;
@@ -1729,7 +1737,7 @@ function ChatSurface({
   // closes everything the chat opened.
   return (
     <OverlayDismissalScope>
-      <ChatColumnRailSurface serverId={serverId}>
+      <ChatColumnRailSurface serverId={serverId} allowOutline={allowOutline}>
         <FileDropZone style={styles.container} disabled={disabled}>
           <ComposerDock fullscreen={fullscreen}>{children}</ComposerDock>
         </FileDropZone>

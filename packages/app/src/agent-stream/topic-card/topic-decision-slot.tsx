@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { AdaptiveTextInput } from "@/components/adaptive-text-input";
+import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { Button } from "@/components/ui/button";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge } from "@/components/ui/status-badge";
@@ -320,7 +321,7 @@ const StandaloneDurableItemRedirectSection = memo(function StandaloneDurableItem
         </Text>
       </View>
 
-      {item.summary ? <Text style={styles.bodyText}>{item.summary}</Text> : null}
+      {item.summary ? <MarkdownRenderer text={item.summary} compact /> : null}
 
       <Text style={styles.legacyNotice} testID={`topic-decision-standalone-hint-${topicKey}`}>
         {t(
@@ -443,7 +444,7 @@ const DurableItemDecisionSection = memo(function DurableItemDecisionSection({
         </Text>
       </View>
 
-      {item.summary ? <Text style={styles.bodyText}>{item.summary}</Text> : null}
+      {item.summary ? <MarkdownRenderer text={item.summary} compact /> : null}
 
       {item.evidence.length > 0 && serverId && workspaceId ? (
         <View style={styles.evidenceList}>
@@ -953,9 +954,9 @@ export const TopicDecisionSlot = memo(function TopicDecisionSlot({
         />
       </View>
 
-      <Text style={styles.bodyText} testID={`topic-decision-question-${topic.topicKey}`}>
-        {prompt.question}
-      </Text>
+      <View testID={`topic-decision-question-${topic.topicKey}`}>
+        <MarkdownRenderer text={prompt.question} compact />
+      </View>
 
       {prompt.options.length > 0 ? (
         <View style={styles.optionsWrap} testID={`topic-decision-options-${topic.topicKey}`}>
@@ -1019,11 +1020,6 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foreground,
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.semibold,
-  },
-  bodyText: {
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.sm,
-    lineHeight: theme.lineHeight.content,
   },
   evidenceList: {
     gap: theme.spacing[1.5],

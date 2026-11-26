@@ -1,3 +1,4 @@
+import { mergeTopicDelegationAnchors } from "./agent/tools/topic-delegation.js";
 import { rewindDirectoriesOverlap } from "./agent-rewind-scope.js";
 import { handleHostProxyRequest, isHostProxyRequest } from "./network/host-proxy-rpc.js";
 import { isProtectedProxyIngress } from "./network/host-proxy-ingress.js";
@@ -812,6 +813,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly taskLedger: WorkspaceTaskLedgerStore;
   private readonly unsubscribeTaskLedger: () => void;
+  private readonly unsubscribeTopicDelegations?: () => void;
   private readonly pendingTaskUpdates = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly durableItems: DurableItemStore;
   private readonly unsubscribeDurableItems: () => void;
@@ -1144,6 +1146,7 @@ export class VoiceAssistantWebSocketServer {
       this.scheduleWorkspaceTaskUpdate(workspaceId),
     );
     this.topicThreadStore = new TopicThreadStore(paseoHome);
+    this.unsubscribeTopicDelegations = this.observeTopicDelegations();
     this.topicReadState = new TopicReadStateStore(join(paseoHome, "topic-read-state"));
     this.todos = new WorkspaceTodoStore(join(paseoHome, "todos"));
     this.topicReplyRouter = createTopicReplyRouter({
@@ -1648,6 +1651,35 @@ export class VoiceAssistantWebSocketServer {
     this.pendingTaskUpdates.set(workspaceId, timer);
   }
 
+  private observeTopicDelegations() {
+    const delegations = this.agentManager.topicDelegations;
+    return delegations?.subscribe((scope) => {
+      void this.publishTopicDelegations(delegations, scope).catch((err) =>
+        this.logger.warn({ err, ...scope }, "Failed to publish topic delegation"),
+      );
+    });
+  }
+
+  private async publishTopicDelegations(
+    store: NonNullable<AgentManager["topicDelegations"]>,
+    scope: Parameters<NonNullable<AgentManager["topicDelegations"]>["anchors"]>[0],
+  ) {
+    const [{ anchors }, dispatches] = await Promise.all([
+      this.topicThreadStore.listWithAnchors(scope),
+      store.anchors(scope),
+    ]);
+    if (this.connectionLifecycle === "stopping") return;
+    for (const anchor of mergeTopicDelegationAnchors(anchors, dispatches)) {
+      if (!anchor.delegations?.length) continue;
+      this.broadcast(
+        wrapSessionMessage({
+          type: "workspace.topic.anchor.updated",
+          payload: { ...scope, anchor },
+        }),
+      );
+    }
+  }
+
   async persistTopicAnchor(
     anchor: Parameters<TopicThreadStore["upsertAnchor"]>[0],
     knownTasks?: readonly TopicTaskBinding[],
@@ -1782,6 +1814,7 @@ export class VoiceAssistantWebSocketServer {
     workspaceTopicReadState?: true;
     workspaceTodos?: true;
     workspaceButlerV1?: true;
+    workspaceTopicAnchorEvents?: true;
   } {
     const features: {
       workspaceTopicThreads?: true;
@@ -1789,9 +1822,13 @@ export class VoiceAssistantWebSocketServer {
       workspaceTopicReadState?: true;
       workspaceTodos?: true;
       workspaceButlerV1?: true;
+      workspaceTopicAnchorEvents?: true;
     } = {};
     if (this.featureOverrides.workspaceTopicThreads !== false)
-      features.workspaceTopicThreads = features.workspaceTopicReplyRetry = true;
+      features.workspaceTopicThreads =
+        features.workspaceTopicReplyRetry =
+        features.workspaceTopicAnchorEvents =
+          true;
     if (this.featureOverrides.workspaceTopicReadState !== false)
       features.workspaceTopicReadState = true;
     if (this.featureOverrides.workspaceTodos !== false) features.workspaceTodos = true;
@@ -1924,6 +1961,7 @@ export class VoiceAssistantWebSocketServer {
   public async close(options?: { waitForAgentMessages?: boolean }): Promise<void> {
     this.prepareForShutdown();
     this.unsubscribeTaskLedger();
+    this.unsubscribeTopicDelegations?.();
     this.unsubscribeDurableItems();
     for (const timer of this.pendingTaskUpdates.values()) clearTimeout(timer);
     this.pendingTaskUpdates.clear();
@@ -2519,7 +2557,32 @@ export class VoiceAssistantWebSocketServer {
       durableItems: this.durableItems,
       topicReadState: this.topicReadState,
       todos: this.todos,
-      topicReplyRouter: this.topicReplyRouter,
+      topicReplyRouter: {
+        reply: this.topicReplyRouter.reply,
+        list: async (request) => {
+          const delegations = this.agentManager.topicDelegations;
+          if (!delegations) return this.topicReplyRouter.list(request);
+          const response = await this.topicReplyRouter.list({ ...request, topicKey: undefined });
+          if (response.payload.error) return response;
+          const { anchors, entries } = response.payload;
+          const dispatches = await delegations.anchors(request).catch((err) => {
+            this.logger.warn(
+              { err, workspaceId: request.workspaceId },
+              "Failed to read topic delegations",
+            );
+            return [];
+          });
+          const merged = mergeTopicDelegationAnchors(anchors ?? [], dispatches);
+          response.payload.anchors = request.topicKey
+            ? merged.filter((anchor) => anchor.topicKey === request.topicKey)
+            : merged;
+          if (request.topicKey)
+            response.payload.entries = entries.filter(
+              (entry) => entry.topicKey === request.topicKey,
+            );
+          return response;
+        },
+      },
       topicThreadStore: this.topicThreadStore,
       persistTopicAnchor: (anchor) => this.persistTopicAnchor(anchor),
       decideWorkspaceTopic:
@@ -4175,6 +4238,40 @@ export class VoiceAssistantWebSocketServer {
     });
   }
 
+  // Retry the association from the durable parent report if a crash interrupted the tool.
+  private async recordDelegationReport(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    childServerId: string,
+    taskId: string | undefined,
+    rootMessageId: string | undefined,
+  ) {
+    const store = this.agentManager.topicDelegations;
+    if (!store || !report.parentReportStatus || !rootMessageId || childServerId !== this.serverId)
+      return;
+    const reportIdentity = decodeParentReportIdentity(report.id);
+    const turnId = record.reportTurnId ?? reportIdentity.turnId;
+    if (!turnId) return;
+    const main =
+      this.agentManager.getAgent(record.callerAgentId) ??
+      (await this.agentStorage.get(record.callerAgentId));
+    if (!main?.workspaceId) return;
+    const delegation = await store.forReport({
+      workspaceId: main.workspaceId,
+      mainAgentId: record.callerAgentId,
+      agentId: record.childAgentId,
+      serverId: childServerId,
+      turnId,
+    });
+    if (delegation?.rootMessageId !== rootMessageId) return;
+    if (delegation.taskId && taskId && delegation.taskId !== taskId) return;
+    await store.recordReport(
+      { ...delegation, turnId },
+      reportIdentity.id,
+      report.parentReportStatus,
+    );
+  }
+
   async dispatchFinishReport(
     record: FinishSubscription,
     report: AgentFinishReport,
@@ -4288,6 +4385,7 @@ export class VoiceAssistantWebSocketServer {
           : report.reportedAt;
         if (explicit && record.serverId)
           await this.applyRemoteReportSupersession(record, report.id);
+        await this.recordDelegationReport(record, report, childServerId, taskId, rootMessageId);
         if (
           taskId &&
           explicit &&

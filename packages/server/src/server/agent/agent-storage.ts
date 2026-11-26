@@ -30,6 +30,7 @@ import { controlsFromFeatures } from "@getpaseo/protocol/option-controls";
 import { foldFeatureValues } from "./option-controls.js";
 import { isTimelinePrefixFilename, TimelinePrefixStore } from "./timeline-prefix-store.js";
 import { worktreeIdentitySchema } from "./checkpoints/worktree.js";
+import { topicDelegationTurnSchema } from "./tools/topic-delegation.js";
 
 const confirmedRewindSchema = z.object({
   operationId: z.uuid(),
@@ -41,6 +42,21 @@ const confirmedRewindSchema = z.object({
 });
 
 export type ConfirmedRewind = z.infer<typeof confirmedRewindSchema>;
+
+function projectRestartTopicDelegation(agent: ManagedAgent, existing: StoredAgentRecord | null) {
+  if (agent.lifecycle === "running") return agent.activeForegroundDelegation;
+  if (
+    !existing ||
+    (!existing.resumeOnStartup && existing.lastStatus === "running") ||
+    existing.workspaceId !== agent.workspaceId ||
+    existing.resetEpoch !== agent.resetEpoch
+  ) {
+    return undefined;
+  }
+  // Recovery can open an idle session before the provider accepts a turn.
+  // Keep the original dispatch through that window and shutdown closure.
+  return existing.restartTopicDelegation;
+}
 
 function appendConfirmedRewind(
   agent: ManagedAgent,
@@ -125,6 +141,7 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   resetEpoch: z.number().int().nonnegative().optional(),
   consecutiveErrors: z.number().int().nonnegative().optional(),
   resumeOnStartup: z.boolean().optional(),
+  restartTopicDelegation: topicDelegationTurnSchema.optional(),
   lastModeId: z.string().nullable().optional(),
   config: SERIALIZABLE_CONFIG_SCHEMA,
   launchEnv: z.record(z.string(), z.string()).optional(),
@@ -483,9 +500,17 @@ export class AgentStorage {
 
   async clearAgentRecovery(agentId: string): Promise<void> {
     await this.load();
-    await this.queueRecordMutation(agentId, (record) =>
-      record?.resumeOnStartup ? { ...record, resumeOnStartup: false } : null,
-    );
+    await this.queueRecordMutation(agentId, (record) => {
+      if (!record) return null;
+      const keepActiveDelegation = record.lastStatus === "running";
+      if (!record.resumeOnStartup && (keepActiveDelegation || !record.restartTopicDelegation))
+        return null;
+      return {
+        ...record,
+        resumeOnStartup: false,
+        restartTopicDelegation: keepActiveDelegation ? record.restartTopicDelegation : undefined,
+      };
+    });
   }
 
   private queueRecordWrite(record: StoredAgentRecord, requireWritable?: boolean): Promise<void> {
@@ -845,6 +870,7 @@ export class AgentStorage {
         if (existing?.background) record.background = true;
         record.resumeOnStartup =
           existing?.resumeOnStartup && agent.lifecycle !== "idle" && agent.lifecycle !== "error";
+        record.restartTopicDelegation = projectRestartTopicDelegation(agent, existing);
         return record;
       },
       options?.requireWritable,

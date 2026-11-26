@@ -31,7 +31,12 @@ export function WorkspaceHeaderProjectRow({
   return (
     <View style={styles.row}>
       {showProject ? (
-        <Text testID="workspace-header-subtitle" style={styles.project} numberOfLines={1}>
+        <Text
+          testID="workspace-header-subtitle"
+          style={styles.project}
+          numberOfLines={1}
+          ellipsizeMode="tail"
+        >
           {subtitle}
         </Text>
       ) : null}

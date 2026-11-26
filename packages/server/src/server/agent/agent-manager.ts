@@ -212,6 +212,7 @@ import {
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
 } from "./agent-run-state.js";
+import type { TopicDelegationStore, TopicDelegationTurn } from "./tools/topic-delegation.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import {
   assertNoFileRewind,
@@ -342,6 +343,7 @@ function submittedPromptText(prompt: AgentPromptInput): string {
 
 const directHumanPrompt = Symbol("directHumanPrompt");
 const topicFollowup = Symbol("topicFollowup");
+const restartDelegation = Symbol("restartDelegation");
 
 interface TopicTaskScope {
   workspaceId: string;
@@ -352,7 +354,16 @@ interface TopicTaskScope {
 type ForegroundRunMetadata = AgentRunOptions & {
   [directHumanPrompt]?: true;
   [topicFollowup]?: TopicTaskScope;
+  [restartDelegation]?: TopicDelegationTurn;
 };
+
+export function restartRecoveryRunOptions(original?: TopicDelegationTurn): AgentRunOptions {
+  const options: ForegroundRunMetadata = {
+    recoveryIntent: "automatic",
+    [restartDelegation]: original,
+  };
+  return options;
+}
 
 /** Set at verified human ingress, before the manager admits the prompt. */
 export function directHumanPromptRunOptions(options?: AgentRunOptions): AgentRunOptions {
@@ -856,6 +867,7 @@ export interface AgentManagerOptions {
   idFactory?: () => string;
   registry?: AgentStorage;
   taskLedger?: WorkspaceTaskLedgerStore;
+  topicDelegations?: TopicDelegationStore;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   preserveTopicHistory?: (
     scope: { workspaceId: string; mainAgentId: string },
@@ -1044,6 +1056,7 @@ interface ManagedAgentBase extends StoredAgentTurnState {
   lastUserMessageAt: Date | null;
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
+  activeForegroundDelegation?: TopicDelegationTurn;
   lastTurnCompletion?: { event: TurnTerminalEvent; lastMessage: string | null };
   failedConversationLimit?: FailedConversationLimit;
   limitContinuation?: AgentLimitContinuation;
@@ -1831,11 +1844,13 @@ export class AgentManager {
   private readonly taskLedgerArchivedRuntimes = new WeakSet<TaskLedgerAgent>();
   private readonly taskLedgerLifecycles = new WeakMap<ManagedAgent, string>();
   private readonly taskLedger?: WorkspaceTaskLedgerStore;
+  readonly topicDelegations?: TopicDelegationStore;
   private readonly touchedFilesBySession = new WeakMap<AgentSession, Map<string, string[]>>();
   private readonly topicTaskRuns = new WeakMap<
     PendingForegroundRun,
     { session: AgentSession; scope: TopicTaskScope }
   >();
+  private readonly foregroundDispatchIds = new WeakMap<PendingForegroundRun, string>();
   private readonly foregroundTaskIntent = new WeakMap<
     PendingForegroundRun,
     "unbound" | "binding" | "recovery"
@@ -1894,6 +1909,7 @@ export class AgentManager {
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
     this.taskLedger = options.taskLedger;
+    this.topicDelegations = options.topicDelegations;
     this.workspaceRegistry = options.workspaceRegistry;
     this.preserveTopicHistory = options.preserveTopicHistory;
     if (options.rewindDirectories) this.configureRewindCheckpoints(options.rewindDirectories);
@@ -8477,6 +8493,106 @@ export class AgentManager {
     );
   }
 
+  captureDelegationReport(agentId: string) {
+    if (!this.topicDelegations) return;
+    const run = this.runs.getPendingRun(agentId);
+    const agent = this.agents.get(agentId);
+    if (!run || run.settled || !agent?.workspaceId) return;
+    const messageId = this.foregroundDispatchIds.get(run);
+    if (!messageId || run.start.status === "failed") return;
+    return {
+      workspaceId: agent.workspaceId,
+      messageId,
+      turnId: run.start.status === "started" ? run.start.turnId : run.token,
+    };
+  }
+
+  private async recordPendingDelegation(
+    agent: ActiveManagedAgent,
+    pendingRun: PendingForegroundRun,
+    options?: ForegroundRunMetadata,
+  ) {
+    const original = options?.[restartDelegation];
+    const messageId = original?.messageId ?? options?.clientMessageId;
+    if (!this.topicDelegations || !agent.workspaceId || !messageId) return;
+    const dispatch = {
+      workspaceId: agent.workspaceId,
+      serverId: this.serverId ?? "self",
+      agentId: agent.id,
+      messageId,
+    };
+    try {
+      if (
+        original &&
+        (original.workspaceId !== dispatch.workspaceId ||
+          original.serverId !== dispatch.serverId ||
+          original.agentId !== dispatch.agentId)
+      )
+        return;
+      const associated = original
+        ? await this.topicDelegations.associateRecoveryRun(original, pendingRun.token)
+        : await this.topicDelegations.associateRun(dispatch, pendingRun.token);
+      if (associated) this.foregroundDispatchIds.set(pendingRun, messageId);
+    } catch (err) {
+      this.logger.warn(
+        { err, agentId: agent.id, messageId },
+        "Could not associate pending delegation",
+      );
+    }
+  }
+
+  private recordDelegationStart(
+    agent: ActiveManagedAgent,
+    turnId: string,
+    run: PendingForegroundRun,
+    options?: ForegroundRunMetadata,
+  ) {
+    const messageId = this.foregroundDispatchIds.get(run);
+    agent.activeForegroundDelegation = undefined;
+    if (!this.topicDelegations || !agent.workspaceId || !messageId) return;
+    const dispatch = {
+      workspaceId: agent.workspaceId,
+      serverId: this.serverId ?? "self",
+      agentId: agent.id,
+      messageId,
+      turnId,
+    };
+    agent.activeForegroundDelegation = dispatch;
+    const original = options?.[restartDelegation];
+    const start = original
+      ? this.topicDelegations.confirmRecoveryRun(original, run.token, turnId)
+      : this.topicDelegations.start(dispatch);
+    this.trackBackgroundTask(
+      start.catch((err) =>
+        this.logger.warn(
+          { err, agentId: agent.id, messageId },
+          "Could not record delegation start",
+        ),
+      ),
+    );
+  }
+
+  private recordDelegationTerminal(
+    agent: ActiveManagedAgent,
+    event: TurnTerminalEvent,
+    turnId: string | undefined,
+  ) {
+    const dispatch = agent.activeForegroundDelegation;
+    if (!this.topicDelegations || !dispatch || dispatch.turnId !== turnId) return;
+    const status = {
+      turn_completed: "ended",
+      turn_canceled: "interrupted",
+      turn_failed: "error",
+    } as const;
+    this.trackBackgroundTask(
+      this.topicDelegations
+        .finish(dispatch, status[event.type])
+        .catch((err) =>
+          this.logger.warn({ err, agentId: agent.id, turnId }, "Could not record delegation end"),
+        ),
+    );
+  }
+
   private recordTaskDispatch(
     agent: ActiveManagedAgent,
     messageId?: string,
@@ -8674,7 +8790,7 @@ export class AgentManager {
     this.assertCommandSessionCurrent(agent);
     this.touchUpdatedAt(agent);
     if (options?.clientMessageId) {
-      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
+      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted", options);
       this.emitState(agent);
     }
     const dispatch = (event: AgentStreamEvent): void => {
@@ -9056,6 +9172,7 @@ export class AgentManager {
       if (isExplicitParentReportingLabels(agent.labels)) {
         notification = await this.registerExceptionalParentFinish?.(agent);
       }
+      await this.recordPendingDelegation(agent, pendingRun, params.options);
       const result = await this.startAdmittedProviderTurn(params, providerPrompt, ledger?.valid);
       notify = true;
       if (ledger) {
@@ -9153,6 +9270,7 @@ export class AgentManager {
       if (options?.clientMessageId) {
         this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
           messageId: options.clientMessageId,
+          imageAttachments: options.imageAttachments,
         });
       }
       await this.handleStreamEvent(agent, {
@@ -9187,6 +9305,7 @@ export class AgentManager {
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
         messageId: options.clientMessageId,
+        imageAttachments: options.imageAttachments,
       });
     }
     await this.handleStreamEvent(agent, {
@@ -9649,7 +9768,9 @@ export class AgentManager {
       agent.attention = { requiresAttention: false };
       agent.lifecycle = "running";
       this.touchUpdatedAt(agent);
-      this.recordTaskDispatch(agent, options?.clientMessageId, turnId, pendingRun);
+      const messageId = options?.clientMessageId;
+      this.recordDelegationStart(agent, turnId, pendingRun, options);
+      this.recordTaskDispatch(agent, messageId, turnId, pendingRun);
       // AgentManager owns the accepted-turn boundary. Publish liveness before the canonical
       // prompt so clients can retire optimistic activity without painting an idle frame.
       // The provider's duplicate start for this turn is suppressed at the ingestion boundary.
@@ -9669,6 +9790,7 @@ export class AgentManager {
       if (options?.clientMessageId) {
         this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted", {
           messageId: options.clientMessageId,
+          imageAttachments: options.imageAttachments,
           turnId,
           providerMessageId:
             stagedSubmittedPromptEcho?.item.type === "user_message"
@@ -9731,6 +9853,7 @@ export class AgentManager {
       this.runs.rememberFinalizedTurn(mutableAgent, turnId);
     }
     mutableAgent.activeForegroundTurnId = null;
+    mutableAgent.activeForegroundDelegation = undefined;
     this.applyActiveTurnTerminal(mutableAgent, turnId);
     const terminalError = mutableAgent.lastError;
     const shouldHoldBusyForReplacement = mutableAgent.pendingReplacement && !terminalError;
@@ -9826,6 +9949,7 @@ export class AgentManager {
           options?.clientMessageId,
           expectedTurnId,
           admission.providerMessageId,
+          options?.imageAttachments,
         );
         const accepted = this.notifyAgentRunAccepted(agentId, options, prompt);
         if (accepted) await accepted;
@@ -9921,6 +10045,7 @@ export class AgentManager {
                 options?.clientMessageId,
                 expectedTurnId,
                 admission.providerMessageId,
+                options?.imageAttachments,
               );
               const accepted = this.notifyAgentRunAccepted(
                 agentId,
@@ -10198,12 +10323,14 @@ export class AgentManager {
     clientMessageId: string | undefined,
     expectedTurnId: string,
     providerMessageId: string | undefined,
+    imageAttachments?: AgentRunOptions["imageAttachments"],
   ): Promise<void> {
     if (!clientMessageId) {
       return;
     }
     this.recordSubmittedPrompt(agent, prompt, clientMessageId, "accepted", {
       messageId: clientMessageId,
+      imageAttachments,
       turnId: expectedTurnId,
       ...(providerMessageId ? { providerMessageId } : {}),
     });
@@ -11983,6 +12110,7 @@ export class AgentManager {
       pendingReplacement: false,
       activeForegroundTurnId: null,
       activeTurnId: null,
+      activeForegroundDelegation: undefined,
       activeTurnStartedAt: null,
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
@@ -12806,6 +12934,7 @@ export class AgentManager {
       this.runs.settleTerminalRun(agent.id, turnId);
       if (disposition !== "stale" && !fromHistoryReader) {
         this.recordTaskTerminal(agent, event, turnId, isForegroundEvent);
+        if (isForegroundEvent) this.recordDelegationTerminal(agent, event, turnId);
       }
       this.publishTerminalReadiness(agent, turnId, isForegroundEvent, disposition);
     };
@@ -13458,7 +13587,11 @@ export class AgentManager {
     prompt: AgentPromptInput,
     clientMessageId: string,
     outcome: "accepted" | "rejected",
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: Pick<AgentRunOptions, "imageAttachments"> & {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+    },
   ): void {
     const forkContext = extractSubmittedPromptForkContext(prompt);
     const items = projectAgentMessages(
@@ -13467,6 +13600,9 @@ export class AgentManager {
         text: submittedPromptText(prompt),
         clientMessageId,
         ...(forkContext ? { forkContext } : {}),
+        ...(options?.imageAttachments?.length
+          ? { imageAttachments: options.imageAttachments }
+          : {}),
         ...(options?.messageId ? { messageId: options.messageId } : {}),
       },
       { submitted: true },

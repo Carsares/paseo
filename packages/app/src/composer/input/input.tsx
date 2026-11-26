@@ -60,10 +60,6 @@ import { useSessionStore } from "@/stores/session-store";
 import { useVoiceOptional } from "@/contexts/voice-context";
 import { useToast } from "@/contexts/toast-context";
 import { resolveVoiceUnavailableMessage } from "@/utils/server-info-capabilities";
-import {
-  collectImageFilesFromClipboardData,
-  filesToImageAttachments,
-} from "@/utils/image-attachments-from-files";
 import type { ComposerAttachment } from "@/attachments/types";
 import type { ImageAttachment, MessagePayload, TextReplacement } from "@/composer/types";
 import { focusWithRetries } from "@/utils/web-focus";
@@ -89,6 +85,7 @@ import { useComposerHeight } from "./height";
 import { ComposerInputPresentation } from "./presentation";
 import { resolveComposerInputMode, type ComposerInputMode } from "@/composer/input-mode";
 import { pasteLinkedClipboardText } from "@/composer/pasted-text";
+import { useWebImagePaste } from "./use-web-image-paste";
 import type { NativePastedFile } from "@/composer/native-pasted-image";
 import {
   EditingTextInput,
@@ -515,62 +512,6 @@ function getTextInputNativeElement(current: ComposerTextInputHandle | null): HTM
   if (!current) return null;
   const native = typeof current.getNativeRef === "function" ? current.getNativeRef() : current;
   return native instanceof HTMLElement ? native : null;
-}
-
-interface PasteEffectArgs {
-  textarea: HTMLElement | null;
-  isConnected: boolean;
-  disabled: boolean;
-  isDictating: boolean;
-  isRealtimeVoiceForCurrentAgent: boolean;
-  onAddImages: ((images: ImageAttachment[]) => void) | undefined;
-}
-
-function usePasteEffect(args: PasteEffectArgs): void {
-  const {
-    textarea,
-    isConnected,
-    disabled,
-    isDictating,
-    isRealtimeVoiceForCurrentAgent,
-    onAddImages,
-  } = args;
-
-  useEffect(() => {
-    if (!isWeb) return;
-
-    if (!textarea) return;
-
-    let disposed = false;
-    const handlePaste = (event: ClipboardEvent) => {
-      if (disabled || isDictating || isRealtimeVoiceForCurrentAgent) return;
-
-      const imageFiles = collectImageFilesFromClipboardData(event.clipboardData);
-      if (imageFiles.length === 0) {
-        if (pasteLinkedClipboardText(textarea, event.clipboardData)) event.preventDefault();
-        return;
-      }
-      if (!isConnected || !onAddImages) return;
-
-      event.preventDefault();
-
-      void filesToImageAttachments(imageFiles)
-        .then((pastedAttachments) => {
-          if (disposed || pastedAttachments.length === 0) return;
-          onAddImages(pastedAttachments);
-          return;
-        })
-        .catch((error) => {
-          console.error("[MessageInput] Failed to process pasted images:", error);
-        });
-    };
-
-    textarea.addEventListener("paste", handlePaste);
-    return () => {
-      disposed = true;
-      textarea.removeEventListener?.("paste", handlePaste);
-    };
-  }, [disabled, textarea, isConnected, isDictating, isRealtimeVoiceForCurrentAgent, onAddImages]);
 }
 
 function useAutoFocusOnWebEffect(
@@ -1787,7 +1728,22 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       resetComposerHeight?.();
     }, [resetComposerHeight]);
 
+    const handleWebPasteError = useCallback(
+      () => toast.error(t("composer.errors.pasteImageFailed")),
+      [t, toast],
+    );
+    const { isPasting, hasPendingPaste } = useWebImagePaste({
+      editor: webTextArea,
+      scope: textReplacement.key,
+      enabled: ![disabled, readOnly, isDictating, isRealtimeVoiceForCurrentAgent].some(Boolean),
+      onImages: isConnected ? onAddImages : undefined,
+      onError: handleWebPasteError,
+      onTextPaste: pasteLinkedClipboardText,
+    });
+    const isSendBlocked = isSubmitDisabled || isPasting;
+
     const handleSendMessage = useCallback(() => {
+      if (hasPendingPaste()) return;
       const liveValue = textInputRef.current?.getText() ?? valueRef.current;
       if (!preserveHeightOnSubmit) {
         updateLiveTextPresence("");
@@ -1808,6 +1764,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       allowEmptySubmit,
       attachments,
       cwd,
+      hasPendingPaste,
       onSubmit,
       isAgentRunning,
       hasExternalContent,
@@ -1817,19 +1774,26 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       exitFullscreen,
     ]);
 
-    const handleQueueMessage = useCallback(
-      () =>
-        queueMessageImpl({
-          value: textInputRef.current?.getText() ?? valueRef.current,
-          attachments,
-          cwd,
-          onQueue,
-          replaceText,
-          onMinimizeHeight: minimizeInputHeight,
-          exitFullscreen,
-        }),
-      [attachments, cwd, onQueue, replaceText, minimizeInputHeight, exitFullscreen],
-    );
+    const handleQueueMessage = useCallback(() => {
+      if (hasPendingPaste()) return;
+      queueMessageImpl({
+        value: textInputRef.current?.getText() ?? valueRef.current,
+        attachments,
+        cwd,
+        onQueue,
+        replaceText,
+        onMinimizeHeight: minimizeInputHeight,
+        exitFullscreen,
+      });
+    }, [
+      attachments,
+      cwd,
+      hasPendingPaste,
+      onQueue,
+      replaceText,
+      minimizeInputHeight,
+      exitFullscreen,
+    ]);
 
     const handleDefaultSendAction = useCallback(() => {
       runDefaultSendAction({
@@ -1867,15 +1831,6 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       handleAlternateSendAction();
     }, [alternateSendAction, handleAlternateSendAction]);
 
-    usePasteEffect({
-      textarea: webTextArea,
-      isConnected,
-      disabled,
-      isDictating,
-      isRealtimeVoiceForCurrentAgent,
-      onAddImages,
-    });
-
     const handleSelectionChange = useCallback(
       (event: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
         const start = event.nativeEvent.selection?.start ?? 0;
@@ -1903,7 +1858,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           sendShortcut,
           isAgentRunning,
           onQueue,
-          isSubmitDisabled,
+          isSubmitDisabled: isSendBlocked,
           isSubmitLoading,
           disabled,
           handleAlternateSendAction,
@@ -1917,7 +1872,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         sendShortcut,
         isAgentRunning,
         onQueue,
-        isSubmitDisabled,
+        isSendBlocked,
         isSubmitLoading,
         disabled,
         handleAlternateSendAction,
@@ -1939,7 +1894,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const { canPressLoadingButton, isSendButtonDisabled, defaultActionQueues } =
       computeSendButtonState({
         disabled,
-        isSubmitDisabled,
+        isSubmitDisabled: isSendBlocked,
         isSubmitLoading,
         onSubmitLoadingPress,
         defaultSendBehavior,

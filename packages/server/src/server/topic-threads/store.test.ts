@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { TopicThreadStore } from "./store.js";
+import { TopicThreadStore, type TopicDelivery } from "./store.js";
 
 const followup = {
   workspaceId: "workspace",
@@ -50,6 +50,68 @@ test("only one store can claim an active follow-up, and a declined handoff can r
     await expect(store.begin({ ...followup, text: "Changed" })).rejects.toThrow("already used");
   } finally {
     retry.release?.();
+  }
+});
+
+test("writes retry attachments with the claim and keeps the original delivery", async () => {
+  const attachments: TopicDelivery["attachments"] = [
+    { type: "text", mimeType: "text/plain", text: "Original" },
+  ];
+  const replacement: TopicDelivery["attachments"] = [
+    { type: "text", mimeType: "text/plain", text: "Replacement" },
+  ];
+  const original = await store.begin(followup, undefined, undefined, { attachments });
+  try {
+    await store.update(followup.workspaceId, original.entry.entryId, "error");
+  } finally {
+    original.release?.();
+  }
+  const retry = { ...followup, sourceMessageId: "retry-message" };
+  const claim = (target: TopicThreadStore, assertCurrent?: () => void) =>
+    target.begin(
+      retry,
+      undefined,
+      assertCurrent,
+      undefined,
+      original.entry.entryId,
+      undefined,
+      replacement,
+    );
+  await expect(
+    claim(store, () => {
+      throw new Error("Guard declined");
+    }),
+  ).rejects.toThrow("Guard declined");
+  expect(await store.list(followup)).toMatchObject([{ status: "error", retryable: true }]);
+
+  const attempt = await claim(store);
+  attempt.release?.();
+  const reopened = new TopicThreadStore(home);
+  expect(await reopened.getDelivery(followup, { entryId: original.entry.entryId })).toMatchObject({
+    delivery: { attachments },
+  });
+  expect(await reopened.getDelivery(followup, { entryId: attempt.entry.entryId })).toMatchObject({
+    delivery: { attachments },
+    retryAttachments: replacement,
+  });
+  const recovered = await reopened.begin(
+    { ...retry, sourceMessageId: "reopen-message" },
+    async () => false,
+    undefined,
+    undefined,
+    attempt.entry.entryId,
+    undefined,
+    attachments,
+  );
+  try {
+    expect(recovered.entry).toMatchObject({
+      entryId: attempt.entry.entryId,
+      sourceMessageId: retry.sourceMessageId,
+    });
+    expect(recovered.retryAttachments).toEqual(replacement);
+    expect((await reopened.list(followup))[1]).not.toHaveProperty("retryAttachments");
+  } finally {
+    recovered.release?.();
   }
 });
 

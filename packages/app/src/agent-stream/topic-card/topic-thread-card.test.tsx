@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render as renderComponent, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { DisclosureRow } from "@/agent-stream/disclosure";
@@ -60,6 +61,15 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
+
+function render(node: ReactNode) {
+  const queryClient = new QueryClient();
+  return renderComponent(node, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 function makeTopic(): TopicUnit {
   return {
@@ -157,7 +167,7 @@ function createViewportRef(holdRow: StreamViewportHandle["holdRow"]) {
   return { current: { holdRow } as unknown as StreamViewportHandle };
 }
 
-it("renders user prompt first, toggles process via useDisclosureHold, flushes topic inbox, and opens lead beside", () => {
+it("renders user prompt first, toggles process via useDisclosureHold, flushes topic inbox, and opens lead beside", async () => {
   const holdRow = vi.fn((_rowId: string, apply: () => void) => apply());
   const viewportRef = createViewportRef(holdRow);
   const onAutoMarkRead = vi.fn();
@@ -195,9 +205,8 @@ it("renders user prompt first, toggles process via useDisclosureHold, flushes to
     "Audit the WebSocket reconnect path",
   );
   expect(screen.getByTestId("topic-new-replies-divider")).toBeTruthy();
-  expect(screen.getByTestId("topic-reply-subagent-rep-1").textContent).toContain(
-    "Found missing jitter in reconnect backoff.",
-  );
+  const reportText = await screen.findByText("Found missing jitter in reconnect backoff.");
+  expect(screen.getByTestId("topic-reply-subagent-rep-1").contains(reportText)).toBe(true);
   expect(screen.queryByTestId("topic-process-steps-task:T-100")).toBeNull();
 
   fireEvent.click(screen.getByTestId("topic-process-toggle-task:T-100"));
@@ -354,11 +363,11 @@ it("hides per-topic flush button when no concrete taskId exists and preserves dr
   fireEvent.click(sendBtn);
   await vi.waitFor(() => {
     expect(onSubmitDesktopReply).toHaveBeenCalledTimes(1);
+    expect((sendBtn as HTMLButtonElement).disabled).toBe(false);
   });
   const firstClientMessageId = onSubmitDesktopReply.mock.calls[0]![3];
   expect(typeof firstClientMessageId).toBe("string");
   expect(firstClientMessageId.length).toBeGreaterThan(0);
-  expect((sendBtn as HTMLButtonElement).disabled).toBe(false);
 
   // Retrying the same draft reuses the EXACT SAME clientMessageId for server idempotency.
   fireEvent.click(sendBtn);
@@ -368,8 +377,8 @@ it("hides per-topic flush button when no concrete taskId exists and preserves dr
   expect(onSubmitDesktopReply.mock.calls[1]![3]).toBe(firstClientMessageId);
 });
 
-it("persists long subagent report expansion in topic-stream-view-store across remounts", () => {
-  const longText = "Detailed analysis line. ".repeat(20);
+it("persists long subagent report expansion in topic-stream-view-store across remounts", async () => {
+  const longText = "Detailed analysis line. ".repeat(20).trimEnd();
   const topicWithLongReply: TopicUnit = {
     ...makeTopic(),
     replies: [
@@ -400,11 +409,11 @@ it("persists long subagent report expansion in topic-stream-view-store across re
 
   const firstMount = render(<TopicThreadCard {...props} />);
   fireEvent.click(screen.getByTestId("topic-reply-expand-rep-long"));
-  expect(screen.getByTestId("topic-reply-subagent-rep-long").textContent).toContain(longText);
+  expect(await screen.findByText(longText)).toBeTruthy();
   firstMount.unmount();
 
   render(<TopicThreadCard {...props} />);
-  expect(screen.getByTestId("topic-reply-subagent-rep-long").textContent).toContain(longText);
+  expect(await screen.findByText(longText)).toBeTruthy();
 });
 
 function makeTopicWithConflicts(): TopicUnit {

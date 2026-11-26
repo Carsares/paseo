@@ -45,6 +45,7 @@ export type PullRequestOpenLocation = "main" | "side" | "explorer";
 /** What a sidebar workspace row shows in the space to the right of its title. */
 export type SidebarWorkspaceTrailing = "diff" | "timestamp" | "none";
 /** How much of an agent's work the chat shows between the user's message and the reply. */
+export type UserMessageAlignment = "left" | "right";
 export type ChatDisplay = "full" | "collapseToolCalls" | "collapseTurns";
 
 const ThemePreferenceSchema = z.enum([
@@ -126,6 +127,7 @@ export interface AppSettings {
   showAgentInteractions: boolean;
   defaultWorkspaceMainAgent: boolean;
   chatDisplay: ChatDisplay;
+  userMessageAlignment: UserMessageAlignment;
   chatOutlineEnabled: boolean;
   vimKeybindings: boolean;
   sendShortcut: SendShortcut;
@@ -189,6 +191,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   showAgentInteractions: false,
   defaultWorkspaceMainAgent: false,
   chatDisplay: "collapseTurns",
+  userMessageAlignment: "right",
   chatOutlineEnabled: true,
   vimKeybindings: false,
   sendShortcut: "enter",
@@ -305,6 +308,7 @@ const StoredAppSettingsSchema = z
     showAgentInteractions: z.boolean().catch(false),
     defaultWorkspaceMainAgent: z.boolean().catch(false),
     chatDisplay: z.enum(["full", "collapseToolCalls", "collapseTurns"]).optional().catch("full"),
+    userMessageAlignment: z.enum(["left", "right"]).catch("right"),
     // COMPAT(toolCallDetailLevel): replaced by chatDisplay in v0.13, remove after 2027-04-24.
     toolCallDetailLevel: z
       .enum(["overview", "detailed"])

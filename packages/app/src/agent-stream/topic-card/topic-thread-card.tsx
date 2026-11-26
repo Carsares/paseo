@@ -1,4 +1,6 @@
 import type { ComposerAttachment } from "@/attachments/types";
+import { createQuoteAttachment, type QuoteComposerAttachment } from "@/attachments/quote";
+import type { ComposerQuote } from "@/assistant-selection-copy/composer-quote";
 import type { TopicRetryCandidate } from "./model";
 import type {
   TopicReplyRouteMode,
@@ -34,6 +36,7 @@ import { isNative } from "@/constants/platform";
 import {
   buildDurableDecisionKey,
   buildTopicDisclosureKey,
+  buildTopicReplyDraftKey,
   useTopicStreamViewStore,
 } from "@/stores/topic-stream-view-store";
 import type { Theme } from "@/styles/theme";
@@ -49,7 +52,8 @@ import {
   type TopicDecisionSubmitResult,
 } from "./topic-decision-slot";
 import { TopicInlineComposer } from "./topic-inline-composer";
-import { TopicReplyRow } from "./topic-reply-row";
+import type { MessageImageReader } from "@/components/read-only-message-images";
+import { TopicReplyRow, TopicUserMessage } from "./topic-reply-row";
 import { type SeenTopicWatermark, useTopicViewportRead } from "./use-topic-viewport-read";
 
 const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -251,6 +255,7 @@ export function computeSeenTopicWatermark(input: {
 function lifecycleBadgeVariant(status: TopicLifecycleStatus): StatusBadgeVariant {
   switch (status) {
     case "unread":
+    case "completed":
       return "success";
     case "blocked":
     case "interrupted":
@@ -259,7 +264,8 @@ function lifecycleBadgeVariant(status: TopicLifecycleStatus): StatusBadgeVariant
       return "error";
     case "dispatching":
     case "aggregating":
-    case "settled":
+    case "awaitingReport":
+    case "replied":
       return "muted";
   }
 }
@@ -312,20 +318,19 @@ const TopicCardHeader = memo(function TopicCardHeader({
       <View style={styles.headerRow}>
         <View style={styles.headerContent}>
           <View style={styles.headerMeta}>
-            <StatusBadge
-              size="xs"
-              variant={lifecycleBadgeVariant(topic.lifecycleStatus)}
-              label={t(`topicWorkbench.topicStream.status.${topic.lifecycleStatus}`)}
-            />
+            {topic.lifecycleStatus ? (
+              <StatusBadge
+                size="xs"
+                variant={lifecycleBadgeVariant(topic.lifecycleStatus)}
+                label={t(`topicWorkbench.topicStream.status.${topic.lifecycleStatus}`)}
+              />
+            ) : null}
             {topic.leadTitle ? (
               <Text style={styles.leadChip} numberOfLines={1}>
                 {topic.leadTitle}
               </Text>
             ) : null}
           </View>
-          <Text style={styles.rootPromptText} testID="topic-card-root-prompt">
-            {topic.rootPrompt.text || topic.task?.title || topic.topicKey}
-          </Text>
         </View>
 
         <View
@@ -389,6 +394,36 @@ const TopicCardHeader = memo(function TopicCardHeader({
     </HoverEnvelope>
   );
 });
+
+function TopicRootPrompt({
+  topic,
+  imageReader,
+}: {
+  topic: TopicUnit;
+  imageReader?: MessageImageReader;
+}) {
+  return topic.rootPrompt.item ||
+    topic.rootPrompt.text ||
+    topic.rootPrompt.imageAttachments?.length ? (
+    <TopicUserMessage
+      text={topic.rootPrompt.text}
+      textTestId="topic-card-root-prompt"
+      images={topic.rootPrompt.item?.images}
+      imageAttachments={topic.rootPrompt.imageAttachments}
+      imageReader={imageReader}
+    />
+  ) : (
+    <Text style={styles.rootPromptText} testID="topic-card-root-prompt">
+      {topic.task?.title || topic.topicKey}
+    </Text>
+  );
+}
+
+function isStreamingMainReply(reply: TopicReplyItem, id: string | undefined) {
+  return (
+    (reply.kind === "main_conclusion" || reply.kind === "main_progress") && reply.item.id === id
+  );
+}
 
 const TopicLinkedTodoRow = memo(function TopicLinkedTodoRow({
   todo,
@@ -480,6 +515,7 @@ const TopicProcessDisclosure = memo(function TopicProcessDisclosure({
 });
 
 export interface TopicThreadCardProps {
+  imageReader?: MessageImageReader;
   agentKey: string;
   serverId?: string;
   workspaceId?: string;
@@ -491,6 +527,7 @@ export interface TopicThreadCardProps {
   cardLayout?: TopicLayoutRect | null;
   isHighlighted?: boolean;
   isReplying?: boolean;
+  streamingConclusionId?: string;
   isFlushingInbox?: boolean;
   supportsButlerV1?: boolean;
   durableItemsOnline?: boolean;
@@ -528,7 +565,12 @@ export interface TopicThreadCardProps {
     attachments?: ComposerAttachment[],
   ) => Promise<boolean> | boolean;
   onRetryTopic?: (topic: TopicUnit, retry: TopicRetryCandidate) => void;
-  onActivateCompactReply: (topic: TopicUnit, routeMode: TopicReplyRouteMode) => void;
+  retryUploadNames?: ReadonlyMap<string, string[]>;
+  onActivateCompactReply: (
+    topic: TopicUnit,
+    routeMode: TopicReplyRouteMode,
+    quote?: QuoteComposerAttachment,
+  ) => void;
   onConvertToTodo: (input: {
     topic: TopicUnit;
     title: string;
@@ -604,17 +646,50 @@ const TopicCardDecision = memo(function TopicCardDecision({
   );
 });
 
+function RetryUploadBar({
+  names,
+  reply,
+  disabled,
+  onRetry,
+}: {
+  names: string[];
+  reply: Extract<TopicReplyItem, { kind: "thread_entry" }>;
+  disabled: boolean;
+  onRetry: (reply: TopicReplyItem) => void;
+}) {
+  const { t } = useTranslation();
+  const handlePress = useCallback(() => onRetry(reply), [onRetry, reply]);
+  return (
+    <View style={styles.retryBar}>
+      <Text style={styles.retryLabel}>
+        {t("topicWorkbench.topicStream.retryUploadFiles", { files: names.join(", ") })}
+      </Text>
+      <Button
+        size="sm"
+        variant="secondary"
+        disabled={disabled}
+        onPress={handlePress}
+        testID={`topic-reply-reupload-${reply.entry.entryId}`}
+      >
+        {t("topicWorkbench.topicStream.retryWithUpload")}
+      </Button>
+    </View>
+  );
+}
+
 export const TopicThreadCard = memo(function TopicThreadCard({
   agentKey,
   serverId,
   workspaceId,
   topic,
+  imageReader,
   isPaneFocused,
   isVisibleInViewport,
   viewportBounds,
   cardLayout,
   isHighlighted = false,
   isReplying = false,
+  streamingConclusionId,
   isFlushingInbox = false,
   supportsButlerV1,
   durableItemsOnline,
@@ -632,6 +707,7 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   onOpenAgentBeside,
   onSubmitDesktopReply,
   onRetryTopic,
+  retryUploadNames,
   onActivateCompactReply,
   onConvertToTodo,
   onToggleTodoStatus,
@@ -639,6 +715,8 @@ export const TopicThreadCard = memo(function TopicThreadCard({
 }: TopicThreadCardProps) {
   const { t } = useTranslation();
   const hold = useDisclosureHold();
+  const isCompact = useIsCompactFormFactor();
+  const [quoteFocusId, setQuoteFocusId] = useState<string>();
 
   const disclosureKey = buildTopicDisclosureKey(agentKey, topic.topicKey);
   const processExpanded = useTopicStreamViewStore(
@@ -765,6 +843,29 @@ export const TopicThreadCard = memo(function TopicThreadCard({
     (routeMode: TopicReplyRouteMode) => onActivateCompactReply(topic, routeMode),
     [onActivateCompactReply, topic],
   );
+  const handleQuote = useCallback(
+    ({ quote, label }: ComposerQuote) => {
+      if (isReplying) return;
+      const attachment = createQuoteAttachment({ text: quote, label });
+      if (!attachment.text) return;
+      if (isCompact) {
+        onActivateCompactReply(topic, "auto", attachment);
+        return;
+      }
+      const draftKey = buildTopicReplyDraftKey({
+        serverId: serverId ?? "",
+        workspaceId: workspaceId ?? "",
+        agentId: agentKey,
+        topicKey: topic.topicKey,
+      });
+      useTopicStreamViewStore.getState().updateInlineReplyDraft(draftKey, (draft) => ({
+        ...draft,
+        attachments: [...draft.attachments, attachment],
+      }));
+      setQuoteFocusId(attachment.id);
+    },
+    [agentKey, isCompact, isReplying, onActivateCompactReply, serverId, topic, workspaceId],
+  );
 
   const flushableTaskId = resolveFlushableTaskId(topic);
   const handleFlushInbox = useCallback(() => {
@@ -776,6 +877,7 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   const showRetryBanner =
     (topic.lifecycleStatus === "error" || topic.lifecycleStatus === "interrupted") &&
     topic.retryCandidate !== null &&
+    !retryUploadNames?.has(topic.retryCandidate.entryId) &&
     Boolean(onRetryTopic);
 
   return (
@@ -794,6 +896,8 @@ export const TopicThreadCard = memo(function TopicThreadCard({
         onConvertPromptToTodo={handleConvertPromptToTodo}
       />
 
+      <TopicRootPrompt topic={topic} imageReader={imageReader} />
+
       <View style={styles.railBody} onLayout={handleRailBodyLayout}>
         {topic.fileConflicts.length > 0 ? (
           <TopicConflictBanner
@@ -811,29 +915,49 @@ export const TopicThreadCard = memo(function TopicThreadCard({
           onToggle={toggleProcess}
         />
 
-        {topic.replies.map((reply, index) => (
-          <ReplyLayoutSlot
-            key={reply.id}
-            replyId={reply.id}
-            onRecordReplyLayout={handleRecordReplyLayout}
-          >
-            <TopicReplyRow
-              agentKey={agentKey}
-              topicKey={topic.topicKey}
-              reply={reply}
-              showNewDivider={topic.firstUnreadReplyIndex === index}
-              unreadCountForDivider={topic.unreadReplyCount}
-              isRetrying={isReplying}
-              onOpenAgentBeside={handleOpenReplyAgentBeside}
-              onConvertToTodo={handleConvertReplyToTodo}
-              onRetryReply={
-                onRetryTopic && reply.kind === "thread_entry" && reply.entry.retryable === true
-                  ? handleRetryReply
-                  : undefined
-              }
-            />
-          </ReplyLayoutSlot>
-        ))}
+        {topic.replies.map((reply, index) => {
+          const uploadNames =
+            reply.kind === "thread_entry" && reply.entry.retryable === true
+              ? retryUploadNames?.get(reply.entry.entryId)
+              : undefined;
+          return (
+            <ReplyLayoutSlot
+              key={reply.id}
+              replyId={reply.id}
+              onRecordReplyLayout={handleRecordReplyLayout}
+            >
+              <TopicReplyRow
+                agentKey={agentKey}
+                topicKey={topic.topicKey}
+                reply={reply}
+                imageReader={imageReader}
+                showNewDivider={topic.firstUnreadReplyIndex === index}
+                unreadCountForDivider={topic.unreadReplyCount}
+                isRetrying={isReplying}
+                isStreaming={isStreamingMainReply(reply, streamingConclusionId) || undefined}
+                onQuote={handleQuote}
+                onOpenAgentBeside={handleOpenReplyAgentBeside}
+                onConvertToTodo={handleConvertReplyToTodo}
+                onRetryReply={
+                  onRetryTopic &&
+                  !uploadNames &&
+                  reply.kind === "thread_entry" &&
+                  reply.entry.retryable === true
+                    ? handleRetryReply
+                    : undefined
+                }
+              />
+              {uploadNames && onRetryTopic && reply.kind === "thread_entry" ? (
+                <RetryUploadBar
+                  names={uploadNames}
+                  reply={reply}
+                  disabled={isReplying}
+                  onRetry={handleRetryReply}
+                />
+              ) : null}
+            </ReplyLayoutSlot>
+          );
+        })}
 
         {showRetryBanner ? (
           <View style={styles.retryBar} testID={`topic-card-retry-bar-${topic.topicKey}`}>
@@ -911,6 +1035,7 @@ export const TopicThreadCard = memo(function TopicThreadCard({
           leadTitle={topic.leadTitle}
           hasLeadAgent={Boolean(topic.leadAgentId)}
           isSubmitting={isReplying}
+          quoteFocusId={quoteFocusId}
           onSubmitDesktopReply={handleSubmitDesktop}
           onActivateCompactReply={handleActivateCompact}
         />

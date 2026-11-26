@@ -1,26 +1,41 @@
+import type { MessageImageAttachment } from "@getpaseo/protocol/agent-types";
+import {
+  ReadOnlyMessageImages,
+  type MessageImageReader,
+} from "@/components/read-only-message-images";
+import { useUserMessageAlignment } from "@/hooks/use-settings";
+import type { UserMessageImageAttachment } from "@/types/stream";
 import {
   CheckSquare,
   ChevronDown,
   ChevronRight,
   Columns2,
   CornerDownRight,
+  Quote,
   RotateCcw,
   Sparkles,
 } from "lucide-react-native";
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import type { ComposerQuote } from "@/assistant-selection-copy/composer-quote";
+import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
 import { useIsCompactFormFactor } from "@/constants/layout";
-import { isNative } from "@/constants/platform";
+import { isNative, isWeb } from "@/constants/platform";
 import { buildTopicDisclosureKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
 import type { Theme } from "@/styles/theme";
 import type { AgentSourceStatus } from "../agent-interactions";
 import { useDisclosureHold } from "../disclosure";
+import {
+  extractReplyQuoteSummary,
+  extractScopedWebSelection,
+  extractSubagentPreviewText,
+} from "../reply-quote";
 import { HoverEnvelope } from "./hover-envelope";
 import type { TopicReplyItem } from "./model";
 
@@ -33,6 +48,7 @@ const ThemedChevronRight = withUnistyles(ChevronRight, mutedIconMapping);
 const ThemedSparkles = withUnistyles(Sparkles, accentIconMapping);
 const ThemedCornerDownRight = withUnistyles(CornerDownRight, mutedIconMapping);
 const ThemedRetry = withUnistyles(RotateCcw, mutedIconMapping);
+const ThemedQuote = withUnistyles(Quote, mutedIconMapping);
 
 const COLLAPSE_THRESHOLD_CHARS = 260;
 const toggleBoolean = (value: boolean) => !value;
@@ -87,7 +103,7 @@ function extractFirstTodoLine(rawText: string): string {
 }
 
 function resolveReplySourceMessageId(reply: TopicReplyItem): string | undefined {
-  if (reply.kind === "main_conclusion") return reply.messageId;
+  if (reply.kind === "main_conclusion" || reply.kind === "main_progress") return reply.messageId;
   if (reply.kind === "thread_entry") return reply.entry.sourceMessageId;
   return reply.id;
 }
@@ -98,13 +114,60 @@ function resolveReplyAuthorAgentId(reply: TopicReplyItem): string | undefined {
   return undefined;
 }
 
+export function TopicUserMessage({
+  text,
+  textTestId,
+  images,
+  imageAttachments,
+  imageReader,
+  children,
+}: {
+  text: string;
+  textTestId?: string;
+  images?: readonly UserMessageImageAttachment[];
+  imageAttachments?: readonly MessageImageAttachment[];
+  imageReader?: MessageImageReader;
+  children?: React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const alignment = useUserMessageAlignment();
+  return (
+    <View
+      style={[
+        styles.userBubble,
+        alignment === "left" ? styles.userBubbleLeft : styles.userBubbleRight,
+      ]}
+      testID="topic-user-message"
+    >
+      <Text style={styles.userLabel}>{t("topicWorkbench.topicStream.userMessageLabel")}</Text>
+      {images?.length || imageAttachments?.length ? (
+        <ReadOnlyMessageImages
+          images={images}
+          imageAttachments={imageAttachments}
+          imageReader={imageReader}
+        />
+      ) : null}
+      {text || textTestId ? (
+        <Text style={styles.bodyText} testID={textTestId}>
+          {text}
+        </Text>
+      ) : null}
+      {children}
+    </View>
+  );
+}
+
 export interface TopicReplyRowProps {
   agentKey?: string;
   topicKey?: string;
   reply: TopicReplyItem;
+  imageReader?: MessageImageReader;
   showNewDivider?: boolean;
   unreadCountForDivider?: number;
   isRetrying?: boolean;
+  isStreaming?: boolean;
+  quoteLabel?: string;
+  onQuote?: (input: ComposerQuote) => void;
   onOpenAgentBeside: (agentId: string, serverId?: string) => void;
   onConvertToTodo: (input: {
     title: string;
@@ -113,6 +176,89 @@ export interface TopicReplyRowProps {
     authorAgentId?: string;
   }) => void;
   onRetryReply?: (reply: TopicReplyItem) => void;
+}
+
+function TopicReplyQuoteButton({
+  id,
+  text,
+  sourceTitle,
+  bodyRef,
+  quoteLabel,
+  onQuote,
+}: {
+  id: string;
+  text: string;
+  sourceTitle: string;
+  bodyRef: React.RefObject<View | null>;
+  quoteLabel?: string;
+  onQuote?: TopicReplyRowProps["onQuote"];
+}) {
+  const { t } = useTranslation();
+  // The button can clear the selection before onPress, so capture it before focus moves.
+  const captured = useRef<{ selection: string | null } | null>(null);
+  const readSelection = useCallback(
+    () =>
+      isWeb ? extractScopedWebSelection(bodyRef.current as unknown as HTMLElement | null) : null,
+    [bodyRef],
+  );
+  const handlePointerDown = useCallback(() => {
+    captured.current = { selection: readSelection() };
+  }, [readSelection]);
+  const clearCapture = useCallback(() => {
+    captured.current = null;
+  }, []);
+  const handleKeyDown = useCallback(() => {
+    clearCapture();
+  }, [clearCapture]);
+  const handlePress = useCallback(() => {
+    const selection = captured.current ? captured.current.selection : readSelection();
+    clearCapture();
+    const quote = selection ?? extractReplyQuoteSummary(text, { sourceTitle });
+    if (quote) onQuote?.({ quote, label: sourceTitle });
+  }, [clearCapture, onQuote, readSelection, sourceTitle, text]);
+
+  if (!onQuote || !text.trim()) return null;
+
+  return (
+    <View
+      onPointerDown={isWeb ? handlePointerDown : undefined}
+      onPointerCancel={isWeb ? clearCapture : undefined}
+      {...(isWeb ? { onKeyDown: handleKeyDown } : undefined)}
+    >
+      <ToolbarButton
+        compact
+        label={quoteLabel ?? t("message.actions.quoteReply")}
+        onPress={handlePress}
+        testID={`topic-reply-quote-${id}`}
+      >
+        <ThemedQuote size={13} />
+      </ToolbarButton>
+    </View>
+  );
+}
+
+function TopicReportBody({
+  bodyRef,
+  text,
+  isCollapsed,
+  isStreaming,
+}: {
+  bodyRef: React.RefObject<View | null>;
+  text: string;
+  isCollapsed: boolean;
+  isStreaming?: boolean;
+}) {
+  return (
+    <View ref={bodyRef}>
+      {isCollapsed ? (
+        <Text style={styles.bodyText} selectable>
+          {extractSubagentPreviewText(text, COLLAPSE_THRESHOLD_CHARS)}
+        </Text>
+      ) : (
+        <MarkdownRenderer text={text} compact streaming={isStreaming} />
+      )}
+    </View>
+  );
 }
 
 const NewRepliesDivider = memo(function NewRepliesDivider({ count }: { count: number }) {
@@ -133,6 +279,9 @@ const SubagentReportRow = memo(function SubagentReportRow({
   reply,
   showActions,
   isRetrying,
+  isStreaming,
+  quoteLabel,
+  onQuote,
   onHoverChange,
   onConvertToTodo,
   onOpenBeside,
@@ -142,12 +291,16 @@ const SubagentReportRow = memo(function SubagentReportRow({
   reply: Extract<TopicReplyItem, { kind: "subagent_report" }>;
   showActions: boolean;
   isRetrying: boolean;
+  isStreaming?: boolean;
+  quoteLabel?: string;
+  onQuote?: TopicReplyRowProps["onQuote"];
   onHoverChange: (hovered: boolean) => void;
   onConvertToTodo: () => void;
   onOpenBeside: () => void;
   onRetry?: () => void;
 }) {
   const { t } = useTranslation();
+  const bodyRef = useRef<View>(null);
   const hold = useDisclosureHold();
   const [localExpanded, setLocalExpanded] = useState(false);
   const storeExpanded = useTopicStreamViewStore((state) =>
@@ -169,8 +322,6 @@ const SubagentReportRow = memo(function SubagentReportRow({
   }, [disclosureKey, expanded, hold, setHistoryExpanded]);
 
   const isLong = reply.text.length > COLLAPSE_THRESHOLD_CHARS;
-  const displayText =
-    isLong && !expanded ? `${reply.text.slice(0, COLLAPSE_THRESHOLD_CHARS)}…` : reply.text;
   const canRetry = Boolean(onRetry && (reply.status === "error" || reply.status === "closed"));
 
   return (
@@ -196,6 +347,14 @@ const SubagentReportRow = memo(function SubagentReportRow({
             ]}
             pointerEvents={showActions ? "auto" : "none"}
           >
+            <TopicReplyQuoteButton
+              id={reply.id}
+              text={reply.text}
+              sourceTitle={reply.senderTitle}
+              bodyRef={bodyRef}
+              quoteLabel={quoteLabel}
+              onQuote={onQuote}
+            />
             <ToolbarButton
               compact
               label={t("topicWorkbench.topicStream.convertToTodo")}
@@ -214,7 +373,12 @@ const SubagentReportRow = memo(function SubagentReportRow({
             </ToolbarButton>
           </View>
         </View>
-        <Text style={styles.bodyText}>{displayText}</Text>
+        <TopicReportBody
+          bodyRef={bodyRef}
+          text={reply.text}
+          isCollapsed={isLong && !expanded}
+          isStreaming={isStreaming}
+        />
         <View style={styles.rowFooter}>
           {isLong ? (
             <PressHighlight
@@ -307,11 +471,13 @@ function resolveThreadAuthorLabel(
 const ThreadEntryActions = memo(function ThreadEntryActions({
   entry,
   showActions,
+  children,
   onConvertToTodo,
   onOpenBeside,
 }: {
   entry: ThreadEntryValue;
   showActions: boolean;
+  children?: React.ReactNode;
   onConvertToTodo: () => void;
   onOpenBeside: () => void;
 }) {
@@ -324,6 +490,7 @@ const ThreadEntryActions = memo(function ThreadEntryActions({
       style={[styles.actionsGroup, showActions ? styles.actionsVisible : styles.actionsHidden]}
       pointerEvents={showActions ? "auto" : "none"}
     >
+      {children}
       {!isUserFollowup && !isSystemNote ? (
         <ToolbarButton
           compact
@@ -406,23 +573,32 @@ const ThreadEntryFooter = memo(function ThreadEntryFooter({
 const ThreadEntryRow = memo(function ThreadEntryRow({
   disclosureKey,
   reply,
+  imageReader,
   showActions,
   isRetrying,
+  isStreaming,
+  quoteLabel,
+  onQuote,
   onHoverChange,
   onConvertToTodo,
   onOpenBeside,
   onRetry,
 }: {
   disclosureKey: string | null;
+  imageReader?: MessageImageReader;
   reply: Extract<TopicReplyItem, { kind: "thread_entry" }>;
   showActions: boolean;
   isRetrying: boolean;
+  isStreaming?: boolean;
+  quoteLabel?: string;
+  onQuote?: TopicReplyRowProps["onQuote"];
   onHoverChange: (hovered: boolean) => void;
   onConvertToTodo: () => void;
   onOpenBeside: () => void;
   onRetry?: () => void;
 }) {
   const { t } = useTranslation();
+  const bodyRef = useRef<View>(null);
   const hold = useDisclosureHold();
   const [localExpanded, setLocalExpanded] = useState(false);
   const storeExpanded = useTopicStreamViewStore((state) =>
@@ -449,9 +625,35 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   const reportStatus = resolveThreadReportStatus(entry);
   const authorLabel = resolveThreadAuthorLabel(entry, t);
   const isLong = isSilentReport && entry.text.length > COLLAPSE_THRESHOLD_CHARS;
-  const displayText =
-    isLong && !expanded ? `${entry.text.slice(0, COLLAPSE_THRESHOLD_CHARS)}…` : entry.text;
+  const hasMarkdownBody =
+    !isUserFollowup &&
+    entry.role !== "system_note" &&
+    (isSilentReport || entry.role === "agent_reply");
   const canRetry = Boolean(onRetry && entry.retryable === true);
+
+  if (isUserFollowup && entry.origin !== "butler_dispatch") {
+    return (
+      <View testID={`topic-reply-thread-${entry.entryId}`}>
+        <TopicUserMessage
+          text={entry.text}
+          images={reply.images}
+          imageAttachments={entry.imageAttachments}
+          imageReader={imageReader}
+        >
+          {entry.status === "completed" ? null : <ThreadEntryStatusBadge status={entry.status} />}
+          <ThreadEntryFooter
+            entryId={entry.entryId}
+            isLong={false}
+            expanded={false}
+            canRetry={canRetry}
+            isRetrying={isRetrying}
+            onToggleExpand={toggleExpand}
+            onRetry={onRetry}
+          />
+        </TopicUserMessage>
+      </View>
+    );
+  }
 
   return (
     <HoverEnvelope
@@ -484,9 +686,29 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
             showActions={showActions}
             onConvertToTodo={onConvertToTodo}
             onOpenBeside={onOpenBeside}
-          />
+          >
+            {hasMarkdownBody && onQuote ? (
+              <TopicReplyQuoteButton
+                id={entry.entryId}
+                text={entry.text}
+                sourceTitle={authorLabel}
+                bodyRef={bodyRef}
+                quoteLabel={quoteLabel}
+                onQuote={onQuote}
+              />
+            ) : null}
+          </ThreadEntryActions>
         </View>
-        <Text style={styles.bodyText}>{displayText}</Text>
+        {hasMarkdownBody ? (
+          <TopicReportBody
+            bodyRef={bodyRef}
+            text={entry.text}
+            isCollapsed={isLong && !expanded}
+            isStreaming={isStreaming}
+          />
+        ) : (
+          <Text style={styles.bodyText}>{entry.text}</Text>
+        )}
         <ThreadEntryFooter
           entryId={entry.entryId}
           isLong={isLong}
@@ -501,18 +723,115 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   );
 });
 
+function MainReplyRow({
+  reply,
+  showNewDivider,
+  unreadCountForDivider,
+  isStreaming,
+  quoteLabel,
+  onQuote,
+  onHoverChange,
+  showActions,
+  onConvertToTodo,
+}: Pick<
+  TopicReplyRowProps,
+  "showNewDivider" | "unreadCountForDivider" | "isStreaming" | "quoteLabel" | "onQuote"
+> & {
+  reply: Extract<TopicReplyItem, { kind: "main_conclusion" | "main_progress" }>;
+  onHoverChange: (hovered: boolean) => void;
+  showActions: boolean;
+  onConvertToTodo: () => void;
+}) {
+  const { t } = useTranslation();
+  const bodyRef = useRef<View>(null);
+  const isProgress = reply.kind === "main_progress";
+  let sourceTitle = t("topicWorkbench.topicStream.mainConclusionLabel");
+  if (isProgress) {
+    sourceTitle = t(
+      reply.dispatched
+        ? "topicWorkbench.topicStream.mainDispatchedLabel"
+        : "topicWorkbench.topicStream.mainProgressLabel",
+    );
+  }
+  return (
+    <View>
+      {showNewDivider && !isProgress ? (
+        <NewRepliesDivider count={unreadCountForDivider ?? 0} />
+      ) : null}
+      <HoverEnvelope
+        style={styles.rowHoverEnvelope}
+        onHoverChange={onHoverChange}
+        testID={`topic-reply-${isProgress ? "progress" : "conclusion"}-${reply.id}`}
+      >
+        <View
+          style={[
+            isProgress ? styles.progressRow : styles.conclusionRow,
+            !isProgress && reply.isUnread && styles.rowUnreadSurface,
+          ]}
+        >
+          <View style={styles.rowHeader}>
+            {isProgress && reply.isUnread ? (
+              <View style={styles.progressUnreadDot} testID="topic-progress-unread" />
+            ) : null}
+            {!isProgress ? <ThemedSparkles size={13} /> : null}
+            <Text
+              style={[styles.conclusionLabel, isProgress && styles.progressLabel]}
+              numberOfLines={1}
+            >
+              {sourceTitle}
+            </Text>
+            <View
+              style={[
+                styles.actionsGroup,
+                showActions ? styles.actionsVisible : styles.actionsHidden,
+              ]}
+              pointerEvents={showActions ? "auto" : "none"}
+            >
+              <TopicReplyQuoteButton
+                id={reply.id}
+                text={reply.text}
+                sourceTitle={sourceTitle}
+                bodyRef={bodyRef}
+                quoteLabel={quoteLabel}
+                onQuote={onQuote}
+              />
+              <ToolbarButton
+                compact
+                label={t("topicWorkbench.topicStream.convertToTodo")}
+                onPress={onConvertToTodo}
+                testID={`topic-conclusion-todo-${reply.id}`}
+              >
+                <ThemedCheckSquare size={13} />
+              </ToolbarButton>
+            </View>
+          </View>
+          <TopicReportBody
+            bodyRef={bodyRef}
+            text={reply.text}
+            isCollapsed={false}
+            isStreaming={isStreaming}
+          />
+        </View>
+      </HoverEnvelope>
+    </View>
+  );
+}
+
 export const TopicReplyRow = memo(function TopicReplyRow({
   agentKey,
   topicKey,
   reply,
+  imageReader,
   showNewDivider = false,
   unreadCountForDivider = 0,
   isRetrying = false,
+  isStreaming,
+  quoteLabel,
+  onQuote,
   onOpenAgentBeside,
   onConvertToTodo,
   onRetryReply,
 }: TopicReplyRowProps) {
-  const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const [isHovered, setIsHovered] = useState(false);
 
@@ -553,6 +872,9 @@ export const TopicReplyRow = memo(function TopicReplyRow({
           reply={reply}
           showActions={showActions}
           isRetrying={isRetrying}
+          isStreaming={isStreaming}
+          quoteLabel={quoteLabel}
+          onQuote={onQuote}
           onHoverChange={setIsHovered}
           onConvertToTodo={handleConvertToTodo}
           onOpenBeside={handleOpenBeside}
@@ -562,42 +884,19 @@ export const TopicReplyRow = memo(function TopicReplyRow({
     );
   }
 
-  if (reply.kind === "main_conclusion") {
+  if (reply.kind === "main_conclusion" || reply.kind === "main_progress") {
     return (
-      <View>
-        {showNewDivider ? <NewRepliesDivider count={unreadCountForDivider} /> : null}
-        <HoverEnvelope
-          style={styles.rowHoverEnvelope}
-          onHoverChange={setIsHovered}
-          testID={`topic-reply-conclusion-${reply.id}`}
-        >
-          <View style={[styles.conclusionRow, reply.isUnread && styles.rowUnreadSurface]}>
-            <View style={styles.rowHeader}>
-              <ThemedSparkles size={13} />
-              <Text style={styles.conclusionLabel} numberOfLines={1}>
-                {t("topicWorkbench.topicStream.mainConclusionLabel")}
-              </Text>
-              <View
-                style={[
-                  styles.actionsGroup,
-                  showActions ? styles.actionsVisible : styles.actionsHidden,
-                ]}
-                pointerEvents={showActions ? "auto" : "none"}
-              >
-                <ToolbarButton
-                  compact
-                  label={t("topicWorkbench.topicStream.convertToTodo")}
-                  onPress={handleConvertToTodo}
-                  testID={`topic-conclusion-todo-${reply.id}`}
-                >
-                  <ThemedCheckSquare size={13} />
-                </ToolbarButton>
-              </View>
-            </View>
-            <Text style={styles.conclusionBody}>{reply.text}</Text>
-          </View>
-        </HoverEnvelope>
-      </View>
+      <MainReplyRow
+        reply={reply}
+        showNewDivider={showNewDivider}
+        unreadCountForDivider={unreadCountForDivider}
+        isStreaming={isStreaming}
+        quoteLabel={quoteLabel}
+        onQuote={onQuote}
+        onHoverChange={setIsHovered}
+        showActions={showActions}
+        onConvertToTodo={handleConvertToTodo}
+      />
     );
   }
 
@@ -612,8 +911,12 @@ export const TopicReplyRow = memo(function TopicReplyRow({
       <ThreadEntryRow
         disclosureKey={threadDisclosureKey}
         reply={reply}
+        imageReader={imageReader}
         showActions={showActions}
         isRetrying={isRetrying}
+        isStreaming={isStreaming}
+        quoteLabel={quoteLabel}
+        onQuote={onQuote}
         onHoverChange={setIsHovered}
         onConvertToTodo={handleConvertToTodo}
         onOpenBeside={handleOpenBeside}
@@ -644,6 +947,50 @@ const styles = StyleSheet.create((theme) => ({
     borderWidth: theme.borderWidth[1],
     borderColor: theme.colors.border,
     gap: theme.spacing[1],
+  },
+  progressRow: {
+    paddingVertical: theme.spacing[2],
+    paddingHorizontal: theme.spacing[3],
+    borderRadius: theme.borderRadius.md,
+    backgroundColor: theme.colors.surface0,
+    borderLeftWidth: 2,
+    borderLeftColor: theme.colors.border,
+    gap: theme.spacing[1],
+  },
+  progressLabel: {
+    color: theme.colors.foregroundMuted,
+  },
+  progressUnreadDot: {
+    width: 5,
+    height: 5,
+    borderRadius: theme.borderRadius.full,
+    backgroundColor: theme.colors.foregroundMuted,
+  },
+  userBubble: {
+    maxWidth: "85%",
+    minWidth: 0,
+    gap: theme.spacing[1],
+    backgroundColor: theme.colors.surface3,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.borderAccent,
+    borderLeftColor: theme.colors.accentBright,
+    borderLeftWidth: 3,
+    borderRadius: theme.borderRadius.xl,
+    paddingVertical: theme.spacing[2],
+    paddingHorizontal: theme.spacing[3],
+  },
+  userBubbleLeft: {
+    alignSelf: "flex-start",
+    borderTopLeftRadius: theme.borderRadius.sm,
+  },
+  userBubbleRight: {
+    alignSelf: "flex-end",
+    borderTopRightRadius: theme.borderRadius.sm,
+  },
+  userLabel: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
   },
   followupRow: {
     paddingVertical: theme.spacing[1.5],
@@ -679,11 +1026,7 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foreground,
     fontSize: theme.fontSize.base,
     lineHeight: theme.lineHeight.content,
-  },
-  conclusionBody: {
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
-    lineHeight: theme.lineHeight.content,
+    ...(isWeb ? { overflowWrap: "anywhere" as const } : {}),
   },
   actionsGroup: {
     flexDirection: "row",

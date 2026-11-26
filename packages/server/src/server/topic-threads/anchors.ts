@@ -80,6 +80,7 @@ function refreshBoundAnchors(
   const refreshed = bound.map((anchor) => ({
     ...anchor,
     rootPromptText: input.rootPromptText || anchor.rootPromptText,
+    imageAttachments: input.imageAttachments ?? anchor.imageAttachments,
     updatedAt: now,
   }));
   return {
@@ -94,8 +95,8 @@ function findBoundRoot(inScope: TopicAnchorSummary[], rootMessageId: string | un
   return inScope.find(
     (anchor) =>
       anchor.rootMessageId === rootMessageId &&
-      anchor.rootPromptText &&
-      anchor.rootPromptText !== anchor.title,
+      (anchor.imageAttachments?.length ||
+        (anchor.rootPromptText && anchor.rootPromptText !== anchor.title)),
   );
 }
 
@@ -112,6 +113,8 @@ function buildAnchor(
     taskId: parsed.taskId,
     rootMessageId: existing?.rootMessageId ?? parsed.rootMessageId,
     rootPromptText,
+    imageAttachments:
+      firstMessage?.imageAttachments ?? parsed.imageAttachments ?? existing?.imageAttachments,
     title: parsed.title ?? existing?.title,
     leadAgentId: parsed.leadAgentId ?? existing?.leadAgentId,
     leadServerId: parsed.leadServerId ?? existing?.leadServerId,
@@ -140,6 +143,7 @@ export function topicAnchorInput(
   address: TopicAddress,
   task?: Pick<TopicAnchorInput, "title" | "leadAgentId" | "leadServerId">,
   rootPromptPreview?: string,
+  imageAttachments?: TopicAnchorInput["imageAttachments"],
 ): TopicAnchorInput {
   return {
     workspaceId: address.workspaceId,
@@ -148,6 +152,7 @@ export function topicAnchorInput(
     taskId: address.taskId,
     rootMessageId: address.rootMessageId,
     rootPromptText: rootPromptPreview?.trim() || task?.title || "",
+    ...(imageAttachments?.length ? { imageAttachments } : {}),
     title: task?.title,
     leadAgentId: task?.leadAgentId,
     leadServerId: task?.leadServerId,
@@ -158,16 +163,23 @@ function indexVisibleQuestions(
   rows: readonly AgentTimelineRow[],
   followupMessageIds: ReadonlySet<string>,
 ) {
-  const questions = new Map<string, string>();
+  const questions = new Map<
+    string,
+    Pick<Extract<AgentTimelineRow["item"], { type: "user_message" }>, "text" | "imageAttachments">
+  >();
   const questionRootsByAlias = new Map<string, string>();
   for (const row of rows) {
     if (row.item.type !== "user_message") continue;
     for (const item of projectAgentMessages(row.item)) {
-      if (item.type !== "user_message" || (!item.text.trim() && !item.forkContext)) continue;
+      if (
+        item.type !== "user_message" ||
+        (!item.text.trim() && !item.forkContext && !item.imageAttachments?.length)
+      )
+        continue;
       const ids = [item.messageId, item.clientMessageId, row.providerMessageId];
       if (ids.some((id) => id && followupMessageIds.has(id))) continue;
       const root = item.messageId || item.clientMessageId || legacyQuestionId(row);
-      if (!questions.has(root)) questions.set(root, item.text);
+      if (!questions.has(root)) questions.set(root, item);
       for (const id of ids) {
         if (id && !questionRootsByAlias.has(id)) questionRootsByAlias.set(id, root);
       }
@@ -201,10 +213,13 @@ export function topicAnchorsBeforeReset(
       continue;
     if (visibleRoot) boundRoots.add(visibleRoot);
     const address = { ...scope, topicKey: `task:${taskId}`, taskId, rootMessageId };
-    const text = visibleRoot ? questions.get(visibleRoot) : undefined;
-    required.set(address.topicKey, topicAnchorInput(address, task, text));
+    const question = visibleRoot ? questions.get(visibleRoot) : undefined;
+    required.set(
+      address.topicKey,
+      topicAnchorInput(address, task, question?.text, question?.imageAttachments),
+    );
   }
-  for (const [rootMessageId, text] of questions) {
+  for (const [rootMessageId, { text, imageAttachments }] of questions) {
     if (boundRoots.has(rootMessageId)) continue;
     const bound = existing.filter(
       (anchor) => anchor.taskId && anchor.rootMessageId === rootMessageId,
@@ -213,13 +228,13 @@ export function topicAnchorsBeforeReset(
       for (const anchor of bound) {
         required.set(
           anchor.topicKey,
-          topicAnchorInput(anchor, anchor, text || anchor.rootPromptText),
+          topicAnchorInput(anchor, anchor, text || anchor.rootPromptText, imageAttachments),
         );
       }
       continue;
     }
     const address = { ...scope, topicKey: `msg:${rootMessageId}`, rootMessageId };
-    required.set(address.topicKey, topicAnchorInput(address, undefined, text));
+    required.set(address.topicKey, topicAnchorInput(address, undefined, text, imageAttachments));
   }
   return [...required.values()];
 }

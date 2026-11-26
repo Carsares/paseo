@@ -1,5 +1,5 @@
 import {
-  TopicStreamModeControl,
+  TopicStreamWorkspaceMenuItems,
   TopicStreamModeHeaderProvider,
 } from "@/agent-stream/topic-card/topic-stream-mode-control";
 import { WorkspaceBackToMain, WorkspaceSheetBackToMain } from "./workspace-tab-presentation";
@@ -60,6 +60,7 @@ import {
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { useIsFocused } from "expo-router/react-navigation";
 import { BackHandler, Text, View } from "react-native";
+import { Gesture } from "react-native-gesture-handler";
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter, type Href } from "expo-router";
 import * as Clipboard from "expo-clipboard";
@@ -69,11 +70,13 @@ import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { Theme } from "@/styles/theme";
 import { SidebarMenuToggle } from "@/components/headers/sidebar-menu-toggle";
 import { ScreenHeader } from "@/components/headers/screen-header";
+import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { FloatingHeaderLayout } from "@/components/floating-header";
 import { StreamTopOverlayProvider, supportsStreamTopOverlay } from "@/agent-stream/top-overlay";
 import {
   CompactWorkspaceHeader,
+  WorkspaceTopicHeaderLeading,
   MobileWorkspaceTabSwitcher,
   TopicWorkspaceExplorerActions,
 } from "@/screens/workspace/compact-workspace-header";
@@ -84,6 +87,11 @@ import {
   FloatingPanelPortalHostNameProvider,
 } from "@/components/ui/floating-panel-portal";
 import { SplitContainer } from "@/components/split-container";
+import { SidebarResizeHandle } from "@/components/sidebar-resize-handle";
+import {
+  SIDEBAR_RESIZE_ACTIVATION_OFFSET,
+  SIDEBAR_RESIZE_FAIL_OFFSET,
+} from "@/components/sidebar-resize-handle-layout";
 import { RetainedPanel } from "@/components/retained-panel";
 import { WorkspaceActions } from "@/git/workspace-actions";
 import { WorkspaceOpenInEditorButton } from "@/workspace/open-in-editor/button";
@@ -118,6 +126,7 @@ import {
   canDismissPaneInLayout,
   collectAllTabs,
   DEFAULT_PANE_ID,
+  collectAllPanes,
   findPaneById,
   findPaneContainingTab,
   getFocusedBrowserId,
@@ -232,11 +241,7 @@ import {
 } from "@/screens/workspace/workspace-pane-content";
 import { useMountedTabSet } from "@/screens/workspace/use-mounted-tab-set";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
-import {
-  SheetPaneHostProvider,
-  useWorkspaceSheetPages,
-  type SheetPaneHost,
-} from "@/screens/workspace/sheet-pane";
+import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane";
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import type { PaneHost } from "@/panels/panel-manifest";
 import { WorkspaceFocusProvider } from "@/workspace/focus";
@@ -272,8 +277,17 @@ import {
   type TeamDirectoryMemberNode,
   type TeamMessageJumpStore,
 } from "@/subagents/team-directory";
-import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
-import { useContainerWidthBelow } from "@/hooks/use-container-width";
+import {
+  TeamDirectorySheetProvider,
+  useTeamDirectoryShell,
+} from "@/subagents/team-directory/shell-context";
+import {
+  TEAM_DIRECTORY_DEFAULT_WIDTH,
+  TEAM_DIRECTORY_MAX_WIDTH,
+  TEAM_DIRECTORY_MIN_WIDTH,
+  useTeamDirectoryViewStore,
+} from "@/stores/team-directory-view-store";
+import { useContainerWidth, useContainerWidthBelow } from "@/hooks/use-container-width";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
@@ -554,7 +568,7 @@ function useCloseTabs(): UseCloseTabsResult {
   return { closingTabIds, closeTab };
 }
 
-function WorkspaceHeaderTitleBar({
+export function WorkspaceHeaderTitleBar({
   isLoading,
   title,
   subtitle,
@@ -602,9 +616,6 @@ function useWorkspaceTopicNavigation({
   activeTabDescriptor,
   isSpecialistTab,
   onBackToMain,
-  hasShellTeamWorkbench,
-  isTeamDirectoryVisible,
-  toggleTeamDirectory,
 }: {
   normalizedServerId: string;
   normalizedWorkspaceId: string;
@@ -617,9 +628,6 @@ function useWorkspaceTopicNavigation({
   activeTabDescriptor: WorkspaceTabDescriptor | null;
   isSpecialistTab: (tab: WorkspaceTabDescriptor | null) => boolean;
   onBackToMain: () => void;
-  hasShellTeamWorkbench: boolean;
-  isTeamDirectoryVisible: boolean;
-  toggleTeamDirectory: () => void;
 }) {
   const directoryAgents = useSessionStore((state) => state.sessions[normalizedServerId]?.agents);
   const pendingArchiveIds = usePendingArchiveAgentKeys();
@@ -698,39 +706,8 @@ function useWorkspaceTopicNavigation({
       ) : null,
     [normalizedServerId, normalizedWorkspaceId, onBackToMain, specialistTab],
   );
-  const desktopTeamAction = useMemo(
-    () =>
-      hasShellTeamWorkbench ? (
-        <TopicDirectoryToggle visible={isTeamDirectoryVisible} onToggle={toggleTeamDirectory} />
-      ) : null,
-    [hasShellTeamWorkbench, isTeamDirectoryVisible, toggleTeamDirectory],
-  );
   const modeAgentId = activeMainCanSwitchMode ? mainAgentId : null;
-  const mode = useMemo(
-    () =>
-      modeAgentId
-        ? {
-            desktop: (
-              <TopicStreamModeControl
-                serverId={normalizedServerId}
-                agentId={modeAgentId}
-                workspaceId={normalizedWorkspaceId}
-                compact={false}
-              />
-            ),
-            compact: (
-              <TopicStreamModeControl
-                serverId={normalizedServerId}
-                agentId={modeAgentId}
-                workspaceId={normalizedWorkspaceId}
-                compact
-              />
-            ),
-          }
-        : null,
-    [modeAgentId, normalizedServerId, normalizedWorkspaceId],
-  );
-  return { modeAgentId, mode, specialistTitle, desktopTeamAction, isConversationInDirectory };
+  return { modeAgentId, specialistTitle, isConversationInDirectory };
 }
 
 type PaneDirection = "left" | "right" | "up" | "down";
@@ -768,49 +745,12 @@ function useWorkspaceTeamDirectoryState(input: {
     enabled: input.isRouteFocused && input.isConnected && Boolean(input.workspaceId),
   });
   const isTopicWorkspace = Boolean(topicWorkspace?.topic);
-  const { isBelow: isNarrowDesktopCenter, onLayout: onCenterColumnLayout } = useContainerWidthBelow(
-    780,
-    { initialIsBelow: false },
-  );
-  const [wideTeamDirectoryOpen, setWideTeamDirectoryOpen] = useState(true);
-  const [overlayTeamDirectoryOpen, setOverlayTeamDirectoryOpen] = useState(false);
   const hasDirectory = isTopicWorkspace || Boolean(input.mainAgentId);
   const hasShellTeamWorkbench = !input.isMobile && hasDirectory;
-  const isTeamDirectoryOverlay = isNarrowDesktopCenter;
-  const isTeamDirectoryVisible =
-    hasShellTeamWorkbench &&
-    !input.desktopFocusModeEnabled &&
-    (isTeamDirectoryOverlay ? overlayTeamDirectoryOpen : wideTeamDirectoryOpen);
-  const toggleTeamDirectory = useCallback(() => {
-    if (isTeamDirectoryOverlay) {
-      setOverlayTeamDirectoryOpen((current) => !current);
-    } else {
-      setWideTeamDirectoryOpen((current) => !current);
-    }
-  }, [isTeamDirectoryOverlay]);
-  const hideTeamDirectory = useCallback(() => {
-    if (isTeamDirectoryOverlay) {
-      setOverlayTeamDirectoryOpen(false);
-    } else {
-      setWideTeamDirectoryOpen(false);
-    }
-  }, [isTeamDirectoryOverlay]);
-  const showTeamDirectory = useCallback(() => {
-    if (isTeamDirectoryOverlay) {
-      setOverlayTeamDirectoryOpen(true);
-    } else {
-      setWideTeamDirectoryOpen(true);
-    }
-  }, [isTeamDirectoryOverlay]);
-  const teamDirectoryShellValue = useMemo(
-    () => ({
-      isOwnedByWorkspaceShell: hasShellTeamWorkbench,
-      isDirectoryVisible: isTeamDirectoryVisible,
-      toggleDirectory: toggleTeamDirectory,
-      openDirectory: hasShellTeamWorkbench ? showTeamDirectory : undefined,
-    }),
-    [hasShellTeamWorkbench, isTeamDirectoryVisible, showTeamDirectory, toggleTeamDirectory],
-  );
+  const desktopDirectory = useDesktopTeamDirectory({
+    enabled: hasShellTeamWorkbench,
+    focused: input.desktopFocusModeEnabled,
+  });
   const serverAgentsMap = useSessionStore((state) => state.sessions[input.serverId]?.agents);
   const teamSummary = useMemo(
     () =>
@@ -826,15 +766,125 @@ function useWorkspaceTeamDirectoryState(input: {
   return {
     topicWorkspace,
     isTopicWorkspace,
-    onCenterColumnLayout,
     hasShellTeamWorkbench,
     isTopicWorkspaceHeader: isTopicWorkspace || hasShellTeamWorkbench,
-    isTeamDirectoryOverlay,
-    isTeamDirectoryVisible,
-    toggleTeamDirectory,
+    ...desktopDirectory,
+    teamSummary,
+  };
+}
+
+export function useDesktopTeamDirectory({
+  enabled,
+  focused,
+}: {
+  enabled: boolean;
+  focused: boolean;
+}) {
+  const { isBelow: narrow, onLayout: onCenterColumnLayout } = useContainerWidthBelow(
+    TEAM_DIRECTORY_DOCK_MIN_CENTER_WIDTH,
+    { initialIsBelow: false },
+  );
+  const [open, setOpen] = useState({ dock: true, overlay: false, focus: false });
+  const normalPlacement = narrow ? "overlay" : "dock";
+  const placement = focused ? "focus" : normalPlacement;
+  const visible = enabled && open[placement];
+  const toggleDirectory = useCallback(() => {
+    setOpen((current) => ({ ...current, [placement]: !current[placement] }));
+  }, [placement]);
+  const openDirectory = useCallback(() => {
+    setOpen((current) => (current[placement] ? current : { ...current, [placement]: true }));
+  }, [placement]);
+  const hideTeamDirectory = useCallback(() => {
+    setOpen((current) => (current[placement] ? { ...current, [placement]: false } : current));
+  }, [placement]);
+  const teamDirectoryShellValue = useMemo(
+    () => ({
+      isOwnedByWorkspaceShell: enabled,
+      isDirectoryVisible: visible,
+      toggleDirectory,
+      openDirectory: enabled ? openDirectory : undefined,
+    }),
+    [enabled, openDirectory, toggleDirectory, visible],
+  );
+  return {
+    onCenterColumnLayout,
+    isTeamDirectoryOverlay: placement !== "dock",
     hideTeamDirectory,
     teamDirectoryShellValue,
-    teamSummary,
+  };
+}
+
+const TEAM_DIRECTORY_DOCK_MIN_CENTER_WIDTH = 780;
+const WORKSPACE_MAIN_MIN_WIDTH = 400;
+
+function constrainDirectoryWidth(width: number, centerWidth: number) {
+  const maxWidth = Math.min(TEAM_DIRECTORY_MAX_WIDTH, centerWidth - WORKSPACE_MAIN_MIN_WIDTH);
+  return Math.min(Math.max(width, TEAM_DIRECTORY_MIN_WIDTH), maxWidth);
+}
+
+function useDockedDirectoryResize(visible: boolean) {
+  // This row spans centerContent, already excluding the shared Explorer.
+  const { width: centerWidth, onLayout } = useContainerWidth();
+  const preferredWidth = useTeamDirectoryViewStore((state) => state.dockWidth);
+  const enabled = visible && centerWidth >= TEAM_DIRECTORY_DOCK_MIN_CENTER_WIDTH;
+  const [previewWidth, setPreviewWidth] = useState<number | null>(null);
+  const dragStart = useRef<{ x: number; width: number } | null>(null);
+  const clearPreview = useCallback(() => {
+    dragStart.current = null;
+    setPreviewWidth(null);
+  }, []);
+
+  useLayoutEffect(clearPreview, [clearPreview, enabled, centerWidth]);
+  const gesture = useMemo(() => {
+    const pan = Gesture.Pan()
+      .runOnJS(true)
+      .activeOffsetX([-SIDEBAR_RESIZE_ACTIVATION_OFFSET, SIDEBAR_RESIZE_ACTIVATION_OFFSET])
+      .failOffsetY([-SIDEBAR_RESIZE_FAIL_OFFSET, SIDEBAR_RESIZE_FAIL_OFFSET])
+      .onBegin(({ absoluteX }) => {
+        const width = useTeamDirectoryViewStore.getState().dockWidth;
+        dragStart.current = { x: absoluteX, width: constrainDirectoryWidth(width, centerWidth) };
+      })
+      .onStart(({ absoluteX }) => preview(absoluteX))
+      .onUpdate(({ absoluteX }) => preview(absoluteX))
+      .onEnd(({ absoluteX }, success) => {
+        const start = dragStart.current;
+        if (!success || start === null) return;
+        const width = constrainDirectoryWidth(start.width + absoluteX - start.x, centerWidth);
+        if (width !== start.width) useTeamDirectoryViewStore.getState().setDockWidth(width);
+      })
+      .onFinalize(clearPreview);
+    const reset = Gesture.Tap()
+      .runOnJS(true)
+      .numberOfTaps(2)
+      .maxDistance(SIDEBAR_RESIZE_ACTIVATION_OFFSET)
+      .onEnd((_event, success) => {
+        if (success)
+          useTeamDirectoryViewStore.getState().setDockWidth(TEAM_DIRECTORY_DEFAULT_WIDTH);
+      });
+    return Gesture.Exclusive(pan, reset);
+
+    function preview(absoluteX: number) {
+      const start = dragStart.current;
+      if (start) {
+        setPreviewWidth(constrainDirectoryWidth(start.width + absoluteX - start.x, centerWidth));
+      }
+    }
+  }, [centerWidth, clearPreview]);
+
+  return {
+    onLayout: isWeb ? onLayout : undefined,
+    width: enabled
+      ? constrainDirectoryWidth(previewWidth ?? preferredWidth, centerWidth)
+      : undefined,
+    handle: enabled ? (
+      <SidebarResizeHandle
+        edge="right"
+        gesture={gesture}
+        pressed={previewWidth !== null}
+        testID="team-directory-resize-handle"
+        highlightWhilePressed
+      />
+    ) : null,
   };
 }
 
@@ -1047,24 +1097,17 @@ function WorkspaceTeamDirectoryShellBridge({
   compactTeamDirectory?: (close: () => void) => ReactNode;
   children: ReactNode;
 }) {
-  const { t } = useTranslation();
-  const stack = useWorkspaceSheetPages();
-  const teamTitle = t("topicWorkbench.directory.title");
-  const renderTeam = useStableEvent((close: () => void) => compactTeamDirectory?.(close));
-  const openCompactTeam = useStableEvent(() => {
-    if (!compactTeamDirectory) return;
-    stack?.push({ key: "team", title: teamTitle, render: renderTeam });
-  });
-  const value = useMemo(() => {
-    if (baseValue.openDirectory || !compactTeamDirectory || !stack) {
-      return baseValue;
-    }
-    return {
-      ...baseValue,
-      openDirectory: openCompactTeam,
-    };
-  }, [baseValue, compactTeamDirectory, openCompactTeam, stack]);
-  return <TeamDirectoryShellProvider value={value}>{children}</TeamDirectoryShellProvider>;
+  return (
+    <TeamDirectoryShellProvider value={baseValue}>
+      {compactTeamDirectory ? (
+        <TeamDirectorySheetProvider renderDirectory={compactTeamDirectory}>
+          {children}
+        </TeamDirectorySheetProvider>
+      ) : (
+        children
+      )}
+    </TeamDirectoryShellProvider>
+  );
 }
 
 function WorkspaceShellProviders({
@@ -1128,8 +1171,8 @@ function WorkspaceShellProviders({
   );
 }
 
-function WorkspaceDesktopBody({
-  isTeamDirectoryVisible,
+export function WorkspaceDesktopBody({
+  focusModeEnabled,
   isTeamDirectoryOverlay,
   hideLabel,
   serverId,
@@ -1147,7 +1190,7 @@ function WorkspaceDesktopBody({
   topicEmptyContent,
   desktopContent,
 }: {
-  isTeamDirectoryVisible: boolean;
+  focusModeEnabled: boolean;
   isTeamDirectoryOverlay: boolean;
   hideLabel: string;
   serverId: string;
@@ -1165,39 +1208,52 @@ function WorkspaceDesktopBody({
   topicEmptyContent: ReactNode;
   desktopContent: ReactNode;
 }) {
+  const { isDirectoryVisible, openDirectory } = useTeamDirectoryShell();
+  const showFocusToggle = focusModeEnabled && Boolean(openDirectory);
+  const directoryResize = useDockedDirectoryResize(
+    isWeb && isDirectoryVisible && !isTeamDirectoryOverlay && !focusModeEnabled,
+  );
   return (
-    <View style={styles.workspaceBodyRow}>
-      {isTeamDirectoryVisible && isTeamDirectoryOverlay ? (
-        <PressHighlight
-          style={styles.teamDirectoryOverlayBackdrop}
-          accessibilityRole="button"
-          accessibilityLabel={hideLabel}
-          onPress={onHideDirectory}
-        />
+    <>
+      {showFocusToggle ? (
+        <PaneContentToolbar style={styles.focusDirectoryToolbar}>
+          <TopicDirectoryToggle />
+        </PaneContentToolbar>
       ) : null}
-      {isTeamDirectoryVisible ? (
-        <WorkspaceTeamDirectory
-          serverId={serverId}
-          workspaceId={workspaceId}
-          mainAgentId={mainAgentId}
-          isTopicWorkspace={isTopicWorkspace}
-          focusedAgentId={focusedAgentId}
-          focusedProviderSubagentId={focusedProviderSubagentId}
-          overlay={isTeamDirectoryOverlay}
-          onHide={onHideDirectory}
-          onOpenAgent={onOpenAgent}
-          onOpenAgentBeside={onOpenAgentBeside}
-          onOpenProviderSubrun={onOpenProviderSubrun}
-          onAskFirstQuestion={isTopicWorkspace ? onAskFirstQuestion : undefined}
-          onCreateConversation={onCreateConversation}
-        />
-      ) : null}
-      <View style={styles.workspaceMainArea}>
-        <TopicEmptyContentContext value={topicEmptyContent}>
-          {desktopContent}
-        </TopicEmptyContentContext>
+      <View style={styles.workspaceBodyRow} onLayout={directoryResize.onLayout}>
+        {isDirectoryVisible && isTeamDirectoryOverlay ? (
+          <PressHighlight
+            style={styles.teamDirectoryOverlayBackdrop}
+            accessibilityRole="button"
+            accessibilityLabel={hideLabel}
+            onPress={onHideDirectory}
+          />
+        ) : null}
+        {isDirectoryVisible ? (
+          <WorkspaceTeamDirectory
+            serverId={serverId}
+            workspaceId={workspaceId}
+            mainAgentId={mainAgentId}
+            isTopicWorkspace={isTopicWorkspace}
+            focusedAgentId={focusedAgentId}
+            focusedProviderSubagentId={focusedProviderSubagentId}
+            overlay={isTeamDirectoryOverlay}
+            dockWidth={directoryResize.width}
+            resizeHandle={directoryResize.handle}
+            onOpenAgent={onOpenAgent}
+            onOpenAgentBeside={onOpenAgentBeside}
+            onOpenProviderSubrun={onOpenProviderSubrun}
+            onAskFirstQuestion={isTopicWorkspace ? onAskFirstQuestion : undefined}
+            onCreateConversation={onCreateConversation}
+          />
+        ) : null}
+        <View style={styles.workspaceMainArea}>
+          <TopicEmptyContentContext value={topicEmptyContent}>
+            {desktopContent}
+          </TopicEmptyContentContext>
+        </View>
       </View>
-    </View>
+    </>
   );
 }
 
@@ -1225,7 +1281,7 @@ function CompactWorkspaceTeamDirectory({
   onAskFirstQuestion,
   onCreateConversation,
   ...directory
-}: Omit<Parameters<typeof WorkspaceTeamDirectory>[0], "inSheet" | "onHide" | "overlay"> & {
+}: Omit<Parameters<typeof WorkspaceTeamDirectory>[0], "inSheet" | "overlay"> & {
   close: () => void;
 }) {
   const openAgent = useCallback(
@@ -1261,7 +1317,6 @@ function CompactWorkspaceTeamDirectory({
     <WorkspaceTeamDirectory
       {...directory}
       inSheet
-      onHide={close}
       onOpenAgent={openAgent}
       onOpenAgentBeside={openAgentBeside}
       onOpenProviderSubrun={openProviderSubrun}
@@ -1665,8 +1720,33 @@ function resolveCompactHeaderLayout(input: {
   return { header: input.header, floating: floatsHeaderOverContent(input.activeTab) };
 }
 
-function resolveWorkspaceHeaderModeAgent(agentId: string | null, showsHeader: boolean) {
-  return showsHeader ? agentId : null;
+function selectMainToolbarFallback(input: {
+  mainAgentId: string | null;
+  layout: WorkspaceLayout | null;
+  tabs: WorkspaceTab[];
+  focusedPaneOnly: boolean;
+  explorerPaneId: string | null;
+  explorerVisible: boolean;
+}) {
+  const { mainAgentId, layout, tabs } = input;
+  if (!mainAgentId || !layout) return undefined;
+  const mainTabs = tabs.filter(
+    ({ target }) => target.kind === "agent" && target.agentId === mainAgentId,
+  );
+  if (mainTabs.length < 2) return undefined;
+  const panes = collectAllPanes(layout.root).filter((pane) => {
+    if (pane.hidden) return false;
+    if (pane.id === input.explorerPaneId) return input.explorerVisible;
+    return !input.focusedPaneOnly || pane.id === layout.focusedPaneId;
+  });
+  const visibleMainTabs = panes.flatMap((pane) => {
+    const tab = deriveWorkspacePaneState({ pane, tabs }).activeTab?.descriptor;
+    if (!tab || !mainTabs.some(({ tabId }) => tabId === tab.tabId)) return [];
+    return [{ paneId: pane.id, tabId: tab.tabId }];
+  });
+  const owner =
+    visibleMainTabs.find(({ paneId }) => paneId === layout.focusedPaneId) ?? visibleMainTabs[0];
+  return owner ? { agentId: mainAgentId, tabId: owner.tabId } : undefined;
 }
 
 function shouldShowWorkspaceScreenHeader(input: {
@@ -2171,8 +2251,6 @@ function WorkspaceScreenContent({
     hasShellTeamWorkbench,
     isTopicWorkspaceHeader,
     isTeamDirectoryOverlay,
-    isTeamDirectoryVisible,
-    toggleTeamDirectory,
     hideTeamDirectory,
     teamDirectoryShellValue,
     teamSummary,
@@ -4460,11 +4538,23 @@ function WorkspaceScreenContent({
     expanded: isExplorerSidebarShowing,
     onToggle: handleToggleExplorerSidebar,
   });
+  const workspaceHeaderAboveSplit = useMemo(
+    () => hasShellTeamWorkbench && !desktopFocusModeEnabled,
+    [desktopFocusModeEnabled, hasShellTeamWorkbench],
+  );
+  const showInlineWorkspaceScripts = useMemo(
+    () => !workspaceHeaderAboveSplit || !isTeamDirectoryOverlay,
+    [isTeamDirectoryOverlay, workspaceHeaderAboveSplit],
+  );
   const headerRight = useMemo(
     () => (
       <View style={styles.headerRight}>
-        <PluginHeaderButtons serverId={normalizedServerId} workspaceId={normalizedWorkspaceId} />
-        {workspaceDescriptor && workspaceDescriptor.scripts.length > 0 ? (
+        {workspaceHeaderAboveSplit ? null : (
+          <PluginHeaderButtons serverId={normalizedServerId} workspaceId={normalizedWorkspaceId} />
+        )}
+        {showInlineWorkspaceScripts &&
+        workspaceDescriptor &&
+        workspaceDescriptor.scripts.length > 0 ? (
           <WorkspaceScriptsButton
             actions={scriptActions}
             scripts={workspaceDescriptor.scripts}
@@ -4485,7 +4575,9 @@ function WorkspaceScreenContent({
         ) : null}
         {workspaceDirectory ? (
           <>
-            <WorkspaceActions serverId={normalizedServerId} cwd={workspaceDirectory} />
+            {workspaceHeaderAboveSplit ? null : (
+              <WorkspaceActions serverId={normalizedServerId} cwd={workspaceDirectory} />
+            )}
             {workspaceActionsInBar ? null : explorerControls.headerAction}
           </>
         ) : null}
@@ -4503,6 +4595,8 @@ function WorkspaceScreenContent({
       handleOpenUrlInBrowserTab,
       explorerControls.headerAction,
       workspaceActionsInBar,
+      showInlineWorkspaceScripts,
+      workspaceHeaderAboveSplit,
     ],
   );
 
@@ -4539,23 +4633,38 @@ function WorkspaceScreenContent({
       `${WORKSPACE_FLOATING_PANEL_PORTAL_HOST_PREFIX}:${normalizedServerId}:${normalizedWorkspaceId}`,
     [normalizedServerId, normalizedWorkspaceId],
   );
-  const { modeAgentId, mode, specialistTitle, desktopTeamAction, isConversationInDirectory } =
-    useWorkspaceTopicNavigation({
-      normalizedServerId,
-      normalizedWorkspaceId,
-      uiTabs,
-      isTopicWorkspace,
-      supportsTopicWorkbench,
-      mainAgentId,
-      desktopFocusModeEnabled,
-      focusedPaneAgentId,
-      activeTabDescriptor,
-      isSpecialistTab,
-      onBackToMain,
-      hasShellTeamWorkbench,
-      isTeamDirectoryVisible,
-      toggleTeamDirectory,
-    });
+  const { modeAgentId, specialistTitle, isConversationInDirectory } = useWorkspaceTopicNavigation({
+    normalizedServerId,
+    normalizedWorkspaceId,
+    uiTabs,
+    isTopicWorkspace,
+    supportsTopicWorkbench,
+    mainAgentId,
+    desktopFocusModeEnabled,
+    focusedPaneAgentId,
+    activeTabDescriptor,
+    isSpecialistTab,
+    onBackToMain,
+  });
+  const headerModeAgentId = useMemo(
+    () => (desktopFocusModeEnabled ? null : modeAgentId),
+    [desktopFocusModeEnabled, modeAgentId],
+  );
+  const modeTarget = useMemo(
+    () =>
+      headerModeAgentId
+        ? {
+            serverId: normalizedServerId,
+            workspaceId: normalizedWorkspaceId,
+            agentId: headerModeAgentId,
+          }
+        : undefined,
+    [headerModeAgentId, normalizedServerId, normalizedWorkspaceId],
+  );
+  const topicModeMenuItems = useMemo(
+    () => (modeTarget ? <TopicStreamWorkspaceMenuItems {...modeTarget} /> : null),
+    [modeTarget],
+  );
   const topicStatus = useTopicHeaderMenuStatus({
     enabled: isTopicWorkspaceHeader,
     compact: isMobile,
@@ -4602,73 +4711,6 @@ function WorkspaceScreenContent({
   const createTabFromHeader = useStableEvent((paneId?: string) =>
     handleCreateNewTab({ paneId: paneId ?? focusedPaneIdOrUndefined }),
   );
-  const renderWorkspaceScreenHeader = useCallback(
-    (pane?: WorkspaceCompactHeaderActions["pane"]) => {
-      if (!showScreenHeader) return null;
-      const menu = (
-        <WorkspaceHeaderMenuDesktop
-          {...headerMenuActions}
-          topicStatus={topicStatus}
-          pane={isTopicWorkspace ? pane : undefined}
-          onCreateTab={
-            isTopicWorkspace && (pane || !canRenderDesktopPaneSplits || topicWithoutTab)
-              ? createTabFromHeader
-              : undefined
-          }
-        />
-      );
-      const left = (
-        <>
-          <SidebarMenuToggle />
-          {specialistTitle ?? (
-            <WorkspaceHeaderTitleBar
-              isLoading={isWorkspaceHeaderLoading}
-              title={workspaceHeaderTitle}
-              subtitle={workspaceHeaderSubtitle}
-              isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
-              normalizedServerId={normalizedServerId}
-              menu={!hasShellTeamWorkbench && !workspaceActionsInBar ? menu : null}
-            />
-          )}
-        </>
-      );
-      const right = (
-        <>
-          {headerRight}
-          {desktopTeamAction}
-          {mode?.desktop}
-          {hasShellTeamWorkbench ? menu : null}
-        </>
-      );
-      return (
-        <ScreenHeader
-          testID={isTopicWorkspace ? "workspace-topic-header" : undefined}
-          left={left}
-          right={right}
-        />
-      );
-    },
-    [
-      canRenderDesktopPaneSplits,
-      createTabFromHeader,
-      desktopTeamAction,
-      hasShellTeamWorkbench,
-      headerMenuActions,
-      headerRight,
-      isTopicWorkspace,
-      isWorkspaceHeaderLoading,
-      isWorkspaceHeaderSubtitleDistinct,
-      mode,
-      normalizedServerId,
-      showScreenHeader,
-      specialistTitle,
-      topicStatus,
-      topicWithoutTab,
-      workspaceActionsInBar,
-      workspaceHeaderSubtitle,
-      workspaceHeaderTitle,
-    ],
-  );
   const compactHeaderScripts = useMemo(
     () => ({
       actions: scriptActions,
@@ -4683,6 +4725,104 @@ function WorkspaceScreenContent({
       scriptActions,
       handleViewScriptTerminal,
       handleOpenUrlInBrowserTab,
+    ],
+  );
+  const desktopMenuScope = useMemo(
+    () =>
+      workspaceHeaderAboveSplit
+        ? {
+            serverId: normalizedServerId,
+            workspaceId: normalizedWorkspaceId,
+            cwd: workspaceDirectory,
+            scripts: showInlineWorkspaceScripts
+              ? { ...compactHeaderScripts, scripts: getWorkspaceScripts(null) }
+              : compactHeaderScripts,
+          }
+        : undefined,
+    [
+      compactHeaderScripts,
+      normalizedServerId,
+      normalizedWorkspaceId,
+      workspaceDirectory,
+      showInlineWorkspaceScripts,
+      workspaceHeaderAboveSplit,
+    ],
+  );
+  const renderWorkspaceScreenHeader = useCallback(
+    (pane?: WorkspaceCompactHeaderActions["pane"]) => {
+      if (!showScreenHeader) return null;
+      const menu = (
+        <WorkspaceHeaderMenuDesktop
+          {...headerMenuActions}
+          topicStatus={topicStatus}
+          topicModeItems={topicModeMenuItems}
+          foldout={desktopMenuScope}
+          pane={isTopicWorkspace ? pane : undefined}
+          onCreateTab={
+            isTopicWorkspace &&
+            (workspaceHeaderAboveSplit || pane || !canRenderDesktopPaneSplits || topicWithoutTab)
+              ? createTabFromHeader
+              : undefined
+          }
+        />
+      );
+      const title = specialistTitle ?? (
+        <WorkspaceHeaderTitleBar
+          isLoading={isWorkspaceHeaderLoading}
+          title={workspaceHeaderTitle}
+          subtitle={workspaceHeaderSubtitle}
+          isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
+          normalizedServerId={normalizedServerId}
+          menu={!hasShellTeamWorkbench && !workspaceActionsInBar ? menu : null}
+        />
+      );
+      const left = (
+        <>
+          <SidebarMenuToggle />
+          {hasShellTeamWorkbench ? (
+            <WorkspaceTopicHeaderLeading modeTarget={modeTarget}>
+              {title}
+            </WorkspaceTopicHeaderLeading>
+          ) : (
+            title
+          )}
+        </>
+      );
+      const right = (
+        <>
+          {headerRight}
+          {hasShellTeamWorkbench ? menu : null}
+        </>
+      );
+      return (
+        <ScreenHeader
+          testID={isTopicWorkspace ? "workspace-topic-header" : undefined}
+          left={left}
+          right={right}
+        />
+      );
+    },
+    [
+      canRenderDesktopPaneSplits,
+      desktopMenuScope,
+      createTabFromHeader,
+      hasShellTeamWorkbench,
+      headerMenuActions,
+      headerRight,
+      isTopicWorkspace,
+      isWorkspaceHeaderLoading,
+      isWorkspaceHeaderSubtitleDistinct,
+      modeTarget,
+      normalizedServerId,
+      showScreenHeader,
+      specialistTitle,
+      topicModeMenuItems,
+      topicStatus,
+      topicWithoutTab,
+      workspaceActionsInBar,
+      workspaceHeaderSubtitle,
+      workspaceHeaderTitle,
+      workspaceHeaderAboveSplit,
     ],
   );
   const renderWorkspaceTabSwitcher = useCallback(
@@ -4836,17 +4976,17 @@ function WorkspaceScreenContent({
           subtitle={workspaceHeaderSubtitle}
           isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
           serverId={normalizedServerId}
-          compactTeamDirectory={compactTeamDirectory}
           compactConflictAction={isTopicWorkspaceHeader ? null : compactConflictAction}
           topicHeader={isTopicWorkspaceHeader}
+          showDirectoryToggle={!desktopFocusModeEnabled}
           titleContent={specialistTitle}
-          desktopTeamAction={desktopTeamAction}
-          modeControl={mode?.compact}
+          modeTarget={modeTarget}
         >
           <WorkspaceHeaderMenuMobile
             {...headerMenuActions}
             pane={paneTabs?.actions.pane}
             topicStatus={isTopicWorkspaceHeader ? topicStatus : undefined}
+            topicModeItems={topicModeMenuItems}
             tabs={topicMenuTabs}
             activeTabKey={paneTabs?.activeTabKey}
             onSelectTab={handleSelectSwitcherTab}
@@ -4867,10 +5007,9 @@ function WorkspaceScreenContent({
     [
       compactConflictAction,
       compactHeaderScripts,
-      compactTeamDirectory,
       createTabFromHeader,
       createTerminalDisabled,
-      desktopTeamAction,
+      desktopFocusModeEnabled,
       explorerControls.compactAction,
       explorerControls.inDesktopTitlebar,
       handleCreateBrowserTab,
@@ -4885,7 +5024,7 @@ function WorkspaceScreenContent({
       isTopicWorkspaceHeader,
       isWorkspaceHeaderLoading,
       isWorkspaceHeaderSubtitleDistinct,
-      mode,
+      modeTarget,
       normalizedServerId,
       normalizedWorkspaceId,
       renderWorkspaceTabSwitcher,
@@ -4893,6 +5032,7 @@ function WorkspaceScreenContent({
       specialistTitle,
       toggleFocusMode,
       topicHeaderTabMenuActions,
+      topicModeMenuItems,
       topicStatus,
       workspaceHeaderSubtitle,
       workspaceHeaderTitle,
@@ -4931,6 +5071,7 @@ function WorkspaceScreenContent({
     return (
       <SplitContainer
         layout={workspaceLayout}
+        workspaceHeaderAboveSplit={workspaceHeaderAboveSplit}
         renderMainHeader={renderWorkspaceScreenHeader}
         renderCompactHeader={renderCompactWorkspaceHeader}
         isTabInTeamDirectory={isConversationInDirectory}
@@ -4971,6 +5112,7 @@ function WorkspaceScreenContent({
     canRenderDesktopPaneSplits,
     workspaceLayout,
     renderWorkspaceScreenHeader,
+    workspaceHeaderAboveSplit,
     renderCompactWorkspaceHeader,
     isConversationInDirectory,
     persistenceKey,
@@ -5073,6 +5215,36 @@ function WorkspaceScreenContent({
     />
   );
 
+  const standaloneHeaderPane = useMemo<WorkspaceCompactHeaderActions["pane"]>(() => {
+    if (!workspaceHeaderAboveSplit || !canRenderDesktopPaneSplits || !focusedPaneId)
+      return undefined;
+    return {
+      id: focusedPaneId,
+      maximized: false,
+      splitRight: () => handleCreateEmptySplit({ targetPaneId: focusedPaneId, position: "right" }),
+      splitDown: () => handleCreateEmptySplit({ targetPaneId: focusedPaneId, position: "bottom" }),
+    };
+  }, [
+    canRenderDesktopPaneSplits,
+    focusedPaneId,
+    handleCreateEmptySplit,
+    workspaceHeaderAboveSplit,
+  ]);
+  const desktopHeaderPlacement = useMemo(
+    () => ({
+      standalone: workspaceHeaderAboveSplit
+        ? renderWorkspaceScreenHeader(standaloneHeaderPane)
+        : null,
+      full: workspaceHeaderAboveSplit ? null : renderWorkspaceScreenHeader(),
+      compact: workspaceHeaderAboveSplit ? null : centerColumnCompactHeader,
+    }),
+    [
+      centerColumnCompactHeader,
+      renderWorkspaceScreenHeader,
+      standaloneHeaderPane,
+      workspaceHeaderAboveSplit,
+    ],
+  );
   // Compact sheets escape to the app overlay host, above both sidebars.
   const workspaceCenterColumn = isMobile ? (
     <View style={styles.centerColumn}>
@@ -5098,10 +5270,11 @@ function WorkspaceScreenContent({
       explorerOpen={isExplorerSidebarShowing}
       focusModeEnabled={desktopFocusModeEnabled}
     >
+      {desktopHeaderPlacement.standalone}
       {rendersDesktopSplitContent ? null : (
-        <AdaptiveWorkspaceChrome compactHeader={centerColumnCompactHeader}>
+        <AdaptiveWorkspaceChrome compactHeader={desktopHeaderPlacement.compact}>
           {fullWorkspaceActions}
-          {renderWorkspaceScreenHeader()}
+          {desktopHeaderPlacement.full}
 
           {shouldShowFallbackRail ? (
             <NewTabLauncherProvider value={newTabLauncher}>
@@ -5136,7 +5309,7 @@ function WorkspaceScreenContent({
       <View style={styles.centerContent} onLayout={onCenterColumnLayout}>
         {topicQuestionResume}
         <WorkspaceDesktopBody
-          isTeamDirectoryVisible={isTeamDirectoryVisible}
+          focusModeEnabled={desktopFocusModeEnabled}
           isTeamDirectoryOverlay={isTeamDirectoryOverlay}
           hideLabel={t("topicWorkbench.directory.hide")}
           serverId={normalizedServerId}
@@ -5335,16 +5508,37 @@ function WorkspaceScreenContent({
     </RenderProfile>
   );
 
-  const headerModeAgentId = useMemo(
+  const renderedHeaderModeAgentId = useMemo(
+    () => (isMobile && !compactHeaderLayout.header ? null : headerModeAgentId),
+    [compactHeaderLayout.header, headerModeAgentId, isMobile],
+  );
+  const mainToolbarFallback = useMemo(
     () =>
-      resolveWorkspaceHeaderModeAgent(
-        modeAgentId,
-        isMobile ? compactHeaderLayout.header !== null : showScreenHeader,
-      ),
-    [compactHeaderLayout.header, isMobile, modeAgentId, showScreenHeader],
+      selectMainToolbarFallback({
+        mainAgentId,
+        layout: workspaceLayout,
+        tabs: uiTabs,
+        focusedPaneOnly: syncFocusedPaneOnly,
+        explorerPaneId: explorerSidebarPaneId,
+        explorerVisible: isExplorerSidebarShowing && !desktopFocusModeEnabled,
+      }),
+    [
+      desktopFocusModeEnabled,
+      explorerSidebarPaneId,
+      isExplorerSidebarShowing,
+      mainAgentId,
+      syncFocusedPaneOnly,
+      uiTabs,
+      workspaceLayout,
+    ],
   );
   const workspaceWithHeaderMode = (
-    <TopicStreamModeHeaderProvider serverId={normalizedServerId} agentId={headerModeAgentId}>
+    <TopicStreamModeHeaderProvider
+      serverId={normalizedServerId}
+      workspaceId={normalizedWorkspaceId}
+      agentId={renderedHeaderModeAgentId}
+      paneFallback={mainToolbarFallback}
+    >
       {renderedWorkspaceScreen}
     </TopicStreamModeHeaderProvider>
   );
@@ -5471,6 +5665,7 @@ const styles = StyleSheet.create((theme) => ({
   compactHeaderMenuCluster: {
     flexDirection: "row",
     alignItems: "center",
+    flexShrink: 0,
     gap: {
       xs: 0,
       md: theme.spacing[2],
@@ -5536,6 +5731,11 @@ const styles = StyleSheet.create((theme) => ({
   centerContent: {
     flex: 1,
     minHeight: 0,
+  },
+  focusDirectoryToolbar: {
+    alignItems: "flex-start",
+    justifyContent: "center",
+    paddingHorizontal: theme.spacing[2],
   },
   workspaceBodyRow: {
     flex: 1,

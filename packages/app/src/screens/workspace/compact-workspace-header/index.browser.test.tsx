@@ -1,6 +1,6 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { Dimensions } from "react-native";
+import { Dimensions, Text, View } from "react-native";
 import { PortalProvider } from "@gorhom/portal";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -8,8 +8,17 @@ import type { CheckoutGitRepo } from "@getpaseo/protocol/messages";
 import { CompactWorkspaceRebaseConflictAction } from "@/screens/workspace/topic-header/compact-rebase-conflict-action";
 import { createGitGraphNavigationIntentStore } from "@/screens/workspace/topic-header/git-graph-intent";
 import { useSessionStore } from "@/stores/session-store";
+import {
+  WorkspaceDesktopBody,
+  WorkspaceHeaderTitleBar,
+  useDesktopTeamDirectory,
+} from "../workspace-screen";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { page } from "vitest/browser";
+import { cdp, page } from "vitest/browser";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
+import { ExplorerFrame } from "../explorer-sidebar/frame";
+import { MobilePanelsProvider } from "@/mobile-panels/provider";
 import {
   WorkspaceSheetStackProvider,
   useWorkspaceSheetPages,
@@ -17,7 +26,18 @@ import {
 import { WindowLayoutContext } from "@/window-layout/context";
 import { WindowLayoutActionsHost } from "@/window-layout";
 import { usePanelStore } from "@/stores/panel-store";
-import { CompactWorkspaceHeader, TopicWorkspaceExplorerActions } from ".";
+import {
+  CompactWorkspaceHeader,
+  TopicWorkspaceExplorerActions,
+  WorkspaceTopicHeaderLeading,
+} from ".";
+import {
+  TeamDirectorySheetProvider,
+  TeamDirectoryShellProvider,
+} from "@/subagents/team-directory/shell-context";
+import { TopicStreamWorkspaceMenuItems } from "@/agent-stream/topic-card/topic-stream-mode-control";
+import { ScreenHeader } from "@/components/headers/screen-header";
+import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 import { i18n } from "@/i18n/i18next";
 import type { WindowLayout } from "@/window-layout";
 import { SplitContainer } from "@/components/split-container";
@@ -26,8 +46,8 @@ import { useWorkspaceExplorerControls } from "../workspace-explorer-toggle";
 import { ToastProvider } from "@/contexts/toast-context";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
 import { NewTabLauncherProvider, type NewTabLauncher } from "@/workspace-tabs/launcher";
-import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import {
+  WorkspaceHeaderMenuDesktop,
   WorkspaceHeaderMenuMobile,
   type WorkspaceHeaderMenuMobileProps,
 } from "../workspace-header-menu";
@@ -68,11 +88,7 @@ const noPaneContent = () => {
   throw new Error("No tabs in this split");
 };
 const renderNoHeader = () => null;
-const modeAction = (
-  <ToolbarButton compact label="Topics" onPress={noop}>
-    <span>T</span>
-  </ToolbarButton>
-);
+const modeTarget = { serverId: "test", workspaceId: "workspace", agentId: "main" };
 const noScripts: WorkspaceHeaderMenuMobileProps["scripts"] = {
   scripts: [],
   liveTerminalIds: [],
@@ -185,22 +201,18 @@ const mockExplorerToggle = (
   </button>
 );
 
-it("keeps desktopTeamAction, topicStatus, and tabSwitcher aligned for a non-topic workspace with Main", async () => {
+it("keeps the Team toggle, topic status, and tab switcher aligned for a non-topic workspace with Main", async () => {
   const onToggleTeam = vi.fn();
   const onOpenPending = vi.fn(() => false);
   const queryClient = new QueryClient();
   function Harness() {
-    const desktopTeam = React.useMemo(
-      () => (
-        <ToolbarButton
-          compact
-          label="Team"
-          onPress={onToggleTeam}
-          testID="topic-header-toggle-directory"
-        >
-          <span>Team</span>
-        </ToolbarButton>
-      ),
+    const directory = React.useMemo(
+      () => ({
+        isOwnedByWorkspaceShell: true,
+        isDirectoryVisible: false,
+        toggleDirectory: onToggleTeam,
+        openDirectory: onToggleTeam,
+      }),
       [],
     );
     const status = React.useMemo<WorkspaceHeaderMenuMobileProps["topicStatus"]>(
@@ -217,7 +229,7 @@ it("keeps desktopTeamAction, topicStatus, and tabSwitcher aligned for a non-topi
       [],
     );
     return (
-      <>
+      <TeamDirectoryShellProvider value={directory}>
         <CompactWorkspaceHeader
           topicHeader
           isRouteFocused
@@ -230,7 +242,6 @@ it("keeps desktopTeamAction, topicStatus, and tabSwitcher aligned for a non-topi
           explorerAction={mockExplorerToggle}
           inDesktopTitlebar={false}
           tabSwitcher={mockTabSwitcher}
-          desktopTeamAction={desktopTeam}
           headerVariant="compact"
         >
           <WorkspaceHeaderMenuMobile
@@ -258,7 +269,7 @@ it("keeps desktopTeamAction, topicStatus, and tabSwitcher aligned for a non-topi
           isCompact={false}
           explorerAction={mockExplorerToggle}
         />
-      </>
+      </TeamDirectoryShellProvider>
     );
   }
   await act(async () =>
@@ -286,6 +297,8 @@ it("keeps desktopTeamAction, topicStatus, and tabSwitcher aligned for a non-topi
   expect(onToggleTeam).toHaveBeenCalledOnce();
   await act(async () => header.getByTestId("workspace-header-menu-trigger").click());
   await expect.element(page.getByText("2 members")).toBeVisible();
+  await act(async () => page.getByTestId("workspace-header-team-directory").click());
+  expect(onToggleTeam).toHaveBeenCalledTimes(2);
 });
 
 it("keeps the topic title width when a terminal can be selected from Workspace tabs", async () => {
@@ -315,8 +328,7 @@ it("keeps the topic title width when a terminal can be selected from Workspace t
         inDesktopTitlebar={false}
         tabSwitcher={null}
         headerVariant="compact"
-        compactTeamDirectory={renderDirectory}
-        modeControl={modeAction}
+        modeTarget={modeTarget}
       >
         <WorkspaceHeaderMenuMobile
           currentBranchName={null}
@@ -412,8 +424,7 @@ it("acts on an unselected background terminal from Workspace tabs without select
                   inDesktopTitlebar={false}
                   tabSwitcher={null}
                   headerVariant="compact"
-                  compactTeamDirectory={renderDirectory}
-                  modeControl={modeAction}
+                  modeTarget={modeTarget}
                 >
                   <WorkspaceHeaderMenuMobile
                     currentBranchName={null}
@@ -639,50 +650,505 @@ function renderDirectory() {
   return <div>Team directory</div>;
 }
 
-it("opens Team from compact workspace actions in the shared sheet stack", async () => {
+it("toggles Team from the leading button in the shared compact sheet stack", async () => {
+  const queryClient = new QueryClient();
   let stack: ReturnType<typeof useWorkspaceSheetPages>;
-  function Harness({ compact }: { compact: boolean }) {
+  function Harness() {
     stack = useWorkspaceSheetPages();
     return (
-      <CompactWorkspaceHeader
-        isRouteFocused
-        isCompact={compact}
-        serverId="test"
-        isLoading={false}
-        title="Workspace"
-        subtitle="Project"
-        isSubtitleDistinct
-        explorerAction={null}
-        inDesktopTitlebar={false}
-        tabSwitcher={null}
-        compactTeamDirectory={renderDirectory}
-        headerVariant="full"
-      >
-        {null}
-      </CompactWorkspaceHeader>
+      <TeamDirectorySheetProvider renderDirectory={renderDirectory}>
+        <CompactWorkspaceHeader
+          topicHeader
+          isRouteFocused
+          isCompact
+          serverId="test"
+          isLoading={false}
+          title="Workspace"
+          subtitle="Project"
+          isSubtitleDistinct
+          explorerAction={null}
+          inDesktopTitlebar={false}
+          tabSwitcher={null}
+          headerVariant="compact"
+        >
+          {null}
+        </CompactWorkspaceHeader>
+      </TeamDirectorySheetProvider>
     );
   }
-  async function render(compact: boolean) {
-    await act(async () =>
-      root.render(
+  await act(async () =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
         <PortalProvider>
           <WorkspaceSheetStackProvider workspaceKey="test:compact-team">
-            <WindowLayoutContext.Provider value={geometry}>
-              <WindowLayoutActionsHost />
-              <Harness compact={compact} />
-            </WindowLayoutContext.Provider>
+            <Harness />
           </WorkspaceSheetStackProvider>
-        </PortalProvider>,
-      ),
-    );
-  }
-  await act(async () => usePanelStore.getState().showMobileAgent());
-  await render(false);
-  const team = page.getByTestId("workspace-header-team");
-  await expect.element(team).not.toBeInTheDocument();
-  await render(true);
+        </PortalProvider>
+      </QueryClientProvider>,
+    ),
+  );
+  const team = page.getByTestId("topic-header-toggle-directory");
+  await expect.element(team).toHaveAccessibleName("Show team directory");
   await act(async () => team.click());
   expect(stack!.getSnapshot().map(({ key }) => key)).toEqual(["page:team"]);
+  await expect.element(team).toHaveAccessibleName("Hide team directory");
+  await act(async () => team.click());
+  expect(stack!.getSnapshot()).toEqual([]);
+  await expect.element(team).toHaveAccessibleName("Show team directory");
+});
+
+const insets = { top: 0, bottom: 0, left: 0, right: 0 };
+const leftRail = { width: 52 };
+const rightRail = { width: 84 };
+const dock = { width: 256 };
+const topicModeItems = <TopicStreamWorkspaceMenuItems {...modeTarget} />;
+const reservedRight = (
+  <View style={rightRail} testID="measured-reserved-right">
+    <WorkspaceHeaderMenuDesktop
+      currentBranchName={null}
+      showWorkspaceSetup={false}
+      importAgentDisabled
+      copyPathDisabled
+      onOpenImportSheet={noop}
+      onCopyWorkspacePath={noop}
+      onCopyBranchName={noop}
+      onOpenSetupTab={noop}
+      topicModeItems={topicModeItems}
+    />
+  </View>
+);
+
+const directoryWorkspace = <Text>Focused workspace content</Text>;
+const directoryViewport = { height: 520, width: 450 };
+
+function DirectoryWorkspaceHarness({ focused }: { focused: boolean }) {
+  const {
+    teamDirectoryShellValue,
+    isTeamDirectoryOverlay,
+    hideTeamDirectory,
+    onCenterColumnLayout,
+  } = useDesktopTeamDirectory({ enabled: true, focused });
+  return (
+    <TeamDirectoryShellProvider value={teamDirectoryShellValue}>
+      <View style={directoryViewport} onLayout={onCenterColumnLayout}>
+        <CompactWorkspaceHeader
+          serverId="test"
+          title="Workspace"
+          subtitle=""
+          isLoading={false}
+          isSubtitleDistinct={false}
+          explorerAction={null}
+          tabSwitcher={null}
+          inDesktopTitlebar={false}
+          headerVariant="compact"
+          isRouteFocused
+          isCompact={false}
+          topicHeader
+          showDirectoryToggle={!focused}
+        >
+          <WorkspaceHeaderMenuDesktop
+            currentBranchName={null}
+            showWorkspaceSetup={false}
+            importAgentDisabled
+            copyPathDisabled
+            onOpenImportSheet={noop}
+            onCopyWorkspacePath={noop}
+            onCopyBranchName={noop}
+            onOpenSetupTab={noop}
+          />
+        </CompactWorkspaceHeader>
+        <WorkspaceDesktopBody
+          focusModeEnabled={focused}
+          isTeamDirectoryOverlay={isTeamDirectoryOverlay}
+          hideLabel="Hide team directory"
+          serverId="test"
+          workspaceId="workspace"
+          mainAgentId={null}
+          isTopicWorkspace
+          focusedAgentId={null}
+          focusedProviderSubagentId={null}
+          onHideDirectory={hideTeamDirectory}
+          onOpenAgent={noop}
+          onOpenAgentBeside={noop}
+          onOpenProviderSubrun={noop}
+          topicEmptyContent={null}
+          desktopContent={directoryWorkspace}
+        />
+      </View>
+    </TeamDirectoryShellProvider>
+  );
+}
+
+it("opens the team directory in desktop focus mode and keeps one leading button in normal mode", async () => {
+  const queryClient = new QueryClient();
+  const render = (focused: boolean) =>
+    act(async () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PortalProvider>
+            <ToastProvider>
+              <DirectoryWorkspaceHarness focused={focused} />
+            </ToastProvider>
+          </PortalProvider>
+        </QueryClientProvider>,
+      ),
+    );
+  const toggle = page.getByTestId("topic-header-toggle-directory");
+  const directory = page.getByTestId("workspace-team-directory");
+
+  await render(false);
+  await expect.element(toggle).toHaveAccessibleName("Show team directory");
+  expect(container.querySelectorAll('[data-testid="topic-header-toggle-directory"]')).toHaveLength(
+    1,
+  );
+  await expect.element(directory).not.toBeInTheDocument();
+
+  await render(true);
+  expect(container.querySelectorAll('[data-testid="topic-header-toggle-directory"]')).toHaveLength(
+    1,
+  );
+  await act(async () => toggle.click());
+  await expect.element(directory).toBeVisible();
+  await expect.element(directory.getByTestId("team-directory-tab-agents")).toBeVisible();
+  await expect.element(toggle).toHaveAccessibleName("Hide team directory");
+  await act(async () => toggle.click());
+  await expect.element(directory).not.toBeInTheDocument();
+
+  await act(async () => page.getByTestId("workspace-header-menu-trigger").click());
+  await act(async () => page.getByTestId("workspace-header-team-directory").click());
+  await expect.element(directory).toBeVisible();
+
+  await render(false);
+  await expect.element(directory).not.toBeInTheDocument();
+  await expect.element(toggle).toHaveAccessibleName("Show team directory");
+  expect(container.querySelectorAll('[data-testid="topic-header-toggle-directory"]')).toHaveLength(
+    1,
+  );
+});
+
+const longWorkspaceName = "这是一个需要在顶栏截断的超长中文工作区标题".repeat(6);
+const longProjectName = "这是同一个工作区所属的超长中文项目名称".repeat(4);
+
+it("truncates the actual title and project while keeping the mode and menu available", async () => {
+  function Harness({ width }: { width: number }) {
+    const [visible, setVisible] = React.useState(true);
+    const toggle = React.useCallback(() => setVisible((current) => !current), []);
+    const directory = React.useMemo(
+      () => ({
+        isOwnedByWorkspaceShell: true,
+        isDirectoryVisible: visible,
+        toggleDirectory: toggle,
+        openDirectory: toggle,
+      }),
+      [visible, toggle],
+    );
+    const frame = React.useMemo(() => ({ width }), [width]);
+    return (
+      <SafeAreaInsetsContext.Provider value={insets}>
+        <TeamDirectoryShellProvider value={directory}>
+          <View style={frame}>
+            <ScreenHeader
+              left={
+                <>
+                  <View style={leftRail} />
+                  <WorkspaceTopicHeaderLeading modeTarget={modeTarget}>
+                    <WorkspaceHeaderTitleBar
+                      title={longWorkspaceName}
+                      subtitle={longProjectName}
+                      isSubtitleDistinct
+                      isLoading={false}
+                      normalizedServerId="test"
+                    />
+                  </WorkspaceTopicHeaderLeading>
+                </>
+              }
+              right={reservedRight}
+            />
+            {visible ? <View style={dock} testID="test-team-dock" /> : null}
+          </View>
+        </TeamDirectoryShellProvider>
+      </SafeAreaInsetsContext.Provider>
+    );
+  }
+  const queryClient = new QueryClient();
+  await i18n.changeLanguage("zh-CN");
+  const render = (width: number) =>
+    act(async () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PortalProvider>
+            <Harness width={width} />
+          </PortalProvider>
+        </QueryClientProvider>,
+      ),
+    );
+  try {
+    await render(780);
+    const team = page.getByTestId("topic-header-toggle-directory");
+    await expect.element(team).toHaveAccessibleName("隐藏团队目录");
+    const left = team.element().getBoundingClientRect().left;
+    expect(page.getByTestId("test-team-dock").element().getBoundingClientRect().width).toBe(256);
+    await expect.element(page.getByTestId("topic-stream-mode-topics")).toBeVisible();
+    await expect.element(page.getByTestId("topic-stream-actions")).not.toBeInTheDocument();
+    const menu = page.getByTestId("workspace-header-menu-trigger");
+    await expect.element(menu).toBeVisible();
+    await act(async () => team.click());
+    await expect.element(team).toHaveAccessibleName("显示团队目录");
+    expect(team.element().getBoundingClientRect().left).toBe(left);
+    await render(330);
+    const mode = page.getByTestId("topic-stream-mode-switch");
+    await expect.element(mode).toHaveAccessibleName("任务话题流");
+    const modeRect = mode.element().getBoundingClientRect();
+    const endRect = page.getByTestId("measured-reserved-right").element().getBoundingClientRect();
+    for (const name of ["title", "subtitle"]) {
+      const label = page.getByTestId(`workspace-header-${name}`).element();
+      const rect = label.getBoundingClientRect();
+      expect(rect.width).toBeGreaterThan(0);
+      expect(rect.right).toBeLessThanOrEqual(modeRect.left);
+      expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
+      expect(getComputedStyle(label).textOverflow).toBe("ellipsis");
+    }
+    expect(modeRect.right).toBeLessThanOrEqual(endRect.left);
+    await act(async () => mode.click());
+    await expect.element(page.getByTestId("topic-stream-mode-timeline")).toBeVisible();
+    await act(async () => page.getByTestId("topic-stream-mode-topics").click());
+    await act(async () => menu.click());
+    await expect.element(page.getByTestId("topic-stream-unread-only")).toBeVisible();
+    await expect.element(page.getByTestId("topic-stream-mark-all-read")).toBeVisible();
+    await expect.element(page.getByTestId("topic-stream-add-todo")).toBeVisible();
+  } finally {
+    await i18n.changeLanguage("en");
+  }
+});
+
+const resizeRow = { height: 520, flexDirection: "row" } as const;
+const resizeCenter = { flex: 1, minWidth: 0 };
+const mainArea = { flex: 1 };
+const resizeMainContent = <View style={mainArea} testID="resize-main-area" />;
+const resizeHeaderLeading = (
+  <WorkspaceTopicHeaderLeading modeTarget={modeTarget}>
+    <WorkspaceHeaderTitleBar
+      title={longWorkspaceName}
+      subtitle={longProjectName}
+      isSubtitleDistinct
+      isLoading={false}
+      normalizedServerId="test"
+    />
+  </WorkspaceTopicHeaderLeading>
+);
+
+function ResizableDirectoryHarness({ width }: { width: number }) {
+  const [explorerOpen, setExplorerOpen] = React.useState(false);
+  const toggleExplorer = React.useCallback(() => setExplorerOpen((open) => !open), []);
+  const explorer = useWorkspaceExplorerControls({
+    hasWorkspace: true,
+    compact: false,
+    focusMode: false,
+    expanded: explorerOpen,
+    onToggle: toggleExplorer,
+  });
+  const {
+    teamDirectoryShellValue,
+    isTeamDirectoryOverlay,
+    hideTeamDirectory,
+    onCenterColumnLayout,
+  } = useDesktopTeamDirectory({ enabled: true, focused: false });
+  return (
+    <TeamDirectoryShellProvider value={teamDirectoryShellValue}>
+      <View style={[resizeRow, { width }]}>
+        <View style={resizeCenter} onLayout={onCenterColumnLayout}>
+          <ScreenHeader
+            left={resizeHeaderLeading}
+            right={
+              <>
+                {explorer.compactAction}
+                {reservedRight}
+              </>
+            }
+          />
+          <WorkspaceDesktopBody
+            focusModeEnabled={false}
+            isTeamDirectoryOverlay={isTeamDirectoryOverlay}
+            hideLabel="Hide team directory"
+            serverId="test"
+            workspaceId="resize-workspace"
+            mainAgentId={null}
+            isTopicWorkspace
+            focusedAgentId={null}
+            focusedProviderSubagentId={null}
+            onHideDirectory={hideTeamDirectory}
+            onOpenAgent={noop}
+            onOpenAgentBeside={noop}
+            onOpenProviderSubrun={noop}
+            topicEmptyContent={null}
+            desktopContent={resizeMainContent}
+          />
+        </View>
+        <ExplorerFrame
+          presentation="dock"
+          isOpen={explorerOpen}
+          isWorkspaceActive
+          persistenceKey="test:team-directory-resize"
+        >
+          <Text testID="resize-explorer">Explorer</Text>
+        </ExplorerFrame>
+      </View>
+    </TeamDirectoryShellProvider>
+  );
+}
+
+it("previews, commits, cancels and resets resize from the dock divider", async () => {
+  const queryClient = new QueryClient();
+  const store = useTeamDirectoryViewStore.getState();
+  const initialWidth = store.dockWidth;
+  const handle = page.getByTestId("team-directory-resize-handle");
+  const directory = page.getByTestId("workspace-team-directory");
+  const explorer = page.getByTestId("workspace-explorer-toggle");
+  const widthOf = (target: typeof directory) => target.element().getBoundingClientRect().width;
+  const preferred = () => useTeamDirectoryViewStore.getState().dockWidth;
+  const session = cdp();
+  const { innerWidth, innerHeight } = window;
+  const render = (width: number) =>
+    act(async () =>
+      root.render(
+        <GestureHandlerRootView>
+          <QueryClientProvider client={queryClient}>
+            <PortalProvider>
+              <ToastProvider>
+                <SafeAreaInsetsContext.Provider value={insets}>
+                  <MobilePanelsProvider>
+                    <ResizableDirectoryHarness width={width} />
+                  </MobilePanelsProvider>
+                </SafeAreaInsetsContext.Provider>
+              </ToastProvider>
+            </PortalProvider>
+          </QueryClientProvider>
+        </GestureHandlerRootView>,
+      ),
+    );
+
+  async function drag(delta: number) {
+    const element = handle.element();
+    const bounds = element.getBoundingClientRect();
+    const iframe = window.frameElement?.getBoundingClientRect();
+    // CDP uses the outer viewport, while Vitest scales the test iframe to fit its own UI.
+    const scaleX = iframe ? iframe.width / window.innerWidth : 1;
+    const scaleY = iframe ? iframe.height / window.innerHeight : 1;
+    const x = (bounds.x + bounds.width / 2) * scaleX + (iframe?.x ?? 0);
+    const y = (bounds.y + bounds.height / 2) * scaleY + (iframe?.y ?? 0);
+    const endX = x + delta * scaleX;
+    const finish = () =>
+      session.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: endX,
+        y,
+        button: "left",
+        buttons: 0,
+        clickCount: 1,
+      });
+    await act(async () => {
+      await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x,
+        y,
+        button: "left",
+        buttons: 1,
+        clickCount: 1,
+      });
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: x + Math.sign(delta) * 12 * scaleX,
+        y,
+        button: "left",
+        buttons: 1,
+      });
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: endX,
+        y,
+        button: "left",
+        buttons: 1,
+      });
+    });
+    return {
+      finish: () => act(finish),
+      cancel: async () => {
+        await act(async () => {
+          element.dispatchEvent(
+            new PointerEvent("pointercancel", {
+              bubbles: true,
+              pointerId: 1,
+              pointerType: "mouse",
+            }),
+          );
+          await finish();
+        });
+      },
+    };
+  }
+
+  await act(async () => store.setDockWidth(256));
+  try {
+    await page.viewport(1280, 720);
+    await render(1100);
+    await expect.element(handle).toBeVisible();
+    expect(widthOf(directory)).toBe(256);
+
+    const grow = await drag(170);
+    await expect.poll(() => widthOf(directory)).toBe(400);
+    const divider = page.getByTestId("team-directory-resize-handle-highlight").element();
+    expect(divider.getBoundingClientRect().right).toBe(
+      directory.element().getBoundingClientRect().right,
+    );
+    expect(preferred()).toBe(256);
+    await grow.finish();
+    expect(preferred()).toBe(400);
+
+    await act(async () => explorer.click());
+    await expect.element(page.getByTestId("resize-explorer")).toBeVisible();
+    await expect.poll(() => widthOf(directory)).toBe(380);
+    const title = page.getByTestId("workspace-header-title").element();
+    const modes = page.getByTestId("topic-stream-mode-topics").element();
+    const menu = page.getByTestId("workspace-header-menu-trigger");
+    await expect.element(menu).toBeVisible();
+    expect(title.scrollWidth).toBeGreaterThan(title.clientWidth);
+    expect(title.getBoundingClientRect().right).toBeLessThanOrEqual(
+      modes.getBoundingClientRect().left,
+    );
+    expect(modes.getBoundingClientRect().right).toBeLessThanOrEqual(
+      explorer.element().getBoundingClientRect().left,
+    );
+    expect(widthOf(page.getByTestId("resize-main-area"))).toBe(400);
+    expect(preferred()).toBe(400);
+    const capped = await drag(45);
+    await capped.finish();
+    expect(preferred()).toBe(400);
+
+    const shrink = await drag(-250);
+    await expect.poll(() => widthOf(directory)).toBe(200);
+    await shrink.cancel();
+    await expect.poll(() => widthOf(directory)).toBe(380);
+    expect(preferred()).toBe(400);
+
+    await render(1099);
+    await expect.element(handle).not.toBeInTheDocument();
+    await act(async () => page.getByTestId("topic-header-toggle-directory").click());
+    await expect.element(directory).toBeVisible();
+    await expect.element(handle).not.toBeInTheDocument();
+    expect(widthOf(directory)).toBe(256);
+    await render(1100);
+    await expect.element(handle).toBeVisible();
+    await act(async () => explorer.click());
+    await expect.poll(() => widthOf(directory)).toBe(400);
+
+    await act(async () => handle.dblClick());
+    await expect.poll(preferred).toBe(256);
+    expect(widthOf(directory)).toBe(256);
+  } finally {
+    await act(async () => store.setDockWidth(initialWidth));
+    await page.viewport(innerWidth, innerHeight);
+  }
 });
 
 function createConflictClient(cwd: string, linked: CheckoutGitRepo) {

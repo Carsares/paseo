@@ -1,3 +1,6 @@
+import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { MessageReceipts } from "../message-receipts/index.js";
+import type { PaseoToolCatalog } from "./tools/types.js";
 import {
   getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
@@ -37,6 +40,7 @@ import type {
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
 import { AgentStorage } from "./agent-storage.js";
+import { createJsonFinishSubscriptionStore } from "./finish-subscriptions/index.js";
 import { TopicMainArchiveError } from "./hierarchy-policy.js";
 import { archiveAgentCommand } from "./lifecycle-command.js";
 import { mergeProviderOptions } from "./provider-options.js";
@@ -1620,3 +1624,487 @@ test("a team conclusion receipt only clears the matching main attention", async 
   expect((await storage.get(main.id))?.requiresAttention).toBe(false);
   expect((await storage.get(child.id))?.requiresAttention).toBe(true);
 });
+
+test("cold topic reads distinguish two dispatches to one specialist and route its explicit report", async () => {
+  const holdMainA = deferred();
+  const holdMainB = deferred();
+  const holdChild = deferred();
+  const holdBoundChild = deferred();
+  const catalogs = new Map<string, PaseoToolCatalog>();
+  const fake = createTestAgentClient("codex", {
+    beforeTurnComplete(prompt) {
+      const text = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
+      if (text.includes("Delegate the first topic")) return holdMainA.promise;
+      if (text.includes("Delegate the second topic")) return holdMainB.promise;
+      if (text.includes("Run second specialist turn")) return holdChild.promise;
+      if (text.includes("Run bound specialist turn")) return holdBoundChild.promise;
+      return Promise.resolve();
+    },
+  });
+  fake.capabilities = { ...fake.capabilities, supportsNativePaseoTools: true };
+  const create = fake.createSession.bind(fake);
+  fake.createSession = (config, context, options) => {
+    if (context?.agentId && context.paseoTools) catalogs.set(context.agentId, context.paseoTools);
+    return create(config, context, options);
+  };
+  const daemon = await createTestPaseoDaemon({ agentClients: { codex: fake } });
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    capabilities: { [CLIENT_CAPS.workspaceButlerV1]: true },
+  });
+  const manager = daemon.daemon.agentManager;
+  try {
+    await client.connect();
+    const pushes: { messageId: string; status: string }[] = [];
+    expect(client.getLastServerInfoMessage()?.features?.workspaceTopicAnchorEvents).toBe(true);
+    const events = client.observeEvents(["workspace.topic.anchor.updated"]);
+    events.subscribe({
+      snapshot: () => {},
+      update: (message) => {
+        if (message.type !== "workspace.topic.anchor.updated") return;
+        for (const dispatch of message.payload.anchor.delegations ?? []) pushes.push(dispatch);
+      },
+    });
+    await events.ready;
+    const { workspace, mainAgent } = await client.createWorkspace({
+      source: { kind: "directory", path: daemon.staticDir },
+      title: "Cold delegation",
+      topic: { hideFromModel: true },
+      mainAgent: {
+        config: { provider: "codex", cwd: daemon.staticDir, modeId: "bypassPermissions" },
+      },
+    });
+    if (!workspace || !mainAgent) throw new Error("Missing topic");
+    const list = async () =>
+      (
+        await client.listWorkspaceTopicEntries({
+          workspaceId: workspace.id,
+          mainAgentId: mainAgent.id,
+        })
+      ).anchors?.flatMap((anchor) =>
+        (anchor.delegations ?? []).map((dispatch) =>
+          Object.assign({}, dispatch, {
+            rootMessageId: anchor.rootMessageId,
+            rootPromptText: anchor.rootPromptText,
+          }),
+        ),
+      ) ?? [];
+    await client.sendMessage(mainAgent.id, "Delegate the first topic", { waitForDispatch: true });
+    const main = catalogs.get(mainAgent.id);
+    if (!main) throw new Error("Missing main tool catalog");
+    const created = await main.executeTool("create_agent", {
+      provider: "codex/gpt-5.4",
+      title: "Specialist",
+      initialPrompt: "Run first specialist turn",
+      notifyOnFinish: false,
+    });
+    const first = created.structuredContent as {
+      agentId: string;
+      topicDelegation: { messageId: string; rootMessageId: string };
+    };
+    expect(created.isError, JSON.stringify(created.content)).toBeFalsy();
+    await vi.waitFor(async () => {
+      expect(await list()).toMatchObject([
+        {
+          ...first.topicDelegation,
+          status: "ended",
+          agentId: first.agentId,
+          title: "Specialist",
+          rootPromptText: "Delegate the first topic",
+        },
+      ]);
+    });
+    holdMainA.resolve();
+    await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgent.id)).toBe(false));
+    await client.sendMessage(mainAgent.id, "Delegate the second topic", { waitForDispatch: true });
+    const sent = await main.executeTool("send_agent_prompt", {
+      agentId: first.agentId,
+      prompt: "Run second specialist turn",
+      notifyOnFinish: false,
+    });
+    const second = sent.structuredContent as {
+      topicDelegation: { messageId: string; rootMessageId: string };
+    };
+    expect(sent.isError).toBeFalsy();
+    expect(second.topicDelegation.rootMessageId).not.toBe(first.topicDelegation.rootMessageId);
+    expect(await list()).toMatchObject([
+      { ...first.topicDelegation, status: "ended" },
+      { ...second.topicDelegation, status: "queued" },
+    ]);
+    await vi.waitFor(
+      async () => {
+        expect(await list()).toMatchObject([
+          { ...first.topicDelegation, status: "ended" },
+          { ...second.topicDelegation, status: "running" },
+        ]);
+      },
+      { timeout: 8000 },
+    );
+    const child = catalogs.get(first.agentId);
+    if (!child) throw new Error("Missing child tool catalog");
+    const report = await child.executeTool("report_to_parent", {
+      status: "completed",
+      summary: "Second done",
+    });
+    expect(report.isError).toBeFalsy();
+    expect(await list()).toMatchObject([
+      { ...first.topicDelegation, status: "ended" },
+      { ...second.topicDelegation, status: "completed", reportIds: [expect.any(String)] },
+    ]);
+    await vi.waitFor(() => {
+      expect(pushes).toContainEqual(
+        expect.objectContaining({
+          messageId: second.topicDelegation.messageId,
+          status: "completed",
+        }),
+      );
+    });
+    holdChild.resolve();
+    await vi.waitFor(() => expect(manager.hasInFlightRun(first.agentId)).toBe(false));
+    expect(await list()).toMatchObject([
+      { ...first.topicDelegation, status: "ended" },
+      { ...second.topicDelegation, status: "completed" },
+    ]);
+    const bound = await main.executeTool("send_agent_prompt", {
+      agentId: first.agentId,
+      prompt: "Run bound specialist turn",
+      notifyOnFinish: false,
+      taskBinding: { taskId: "bound-review", title: "Bound review" },
+    });
+    expect(bound.isError, JSON.stringify(bound.content)).toBeFalsy();
+    expect(bound.structuredContent).toMatchObject({
+      taskId: "bound-review",
+      deliveryStatus: "dispatched",
+    });
+    const boundReport = await child.executeTool("report_to_parent", {
+      status: "completed",
+      summary: "Bound review done",
+    });
+    expect(boundReport.isError, JSON.stringify(boundReport.content)).toBeFalsy();
+    const { anchors } = await client.listWorkspaceTopicEntries({
+      workspaceId: workspace.id,
+      mainAgentId: mainAgent.id,
+      topicKey: "task:bound-review",
+    });
+    expect(anchors).toEqual([
+      expect.objectContaining({
+        taskId: "bound-review",
+        delegations: expect.arrayContaining([
+          expect.objectContaining({
+            taskId: "bound-review",
+            status: "completed",
+            reportIds: [expect.any(String)],
+          }),
+        ]),
+      }),
+    ]);
+  } finally {
+    holdBoundChild.resolve();
+    holdChild.resolve();
+    holdMainA.resolve();
+    holdMainB.resolve();
+    await client.close();
+    await daemon.close();
+  }
+}, 30_000);
+
+test("daemon startup recovers a topic dispatch from its queued receipt without a child subscription", async () => {
+  const root = await mkdtemp(join(tmpdir(), "paseo-delegation-restart-"));
+  const staticDir = join(root, "work");
+  await mkdir(staticDir);
+  const options = {
+    paseoHomeRoot: root,
+    staticDir,
+    cleanup: false,
+    mcpEnabled: false,
+    resumeOnStartup: false,
+  };
+  const before = await createTestPaseoDaemon(options);
+  const setup = new DaemonClient({ url: `ws://127.0.0.1:${before.port}/ws` });
+  try {
+    await setup.connect();
+    const { workspace, mainAgent } = await setup.createWorkspace({
+      source: { kind: "directory", path: staticDir },
+      title: "Recover delegation",
+      topic: { hideFromModel: true },
+      mainAgent: { config: { provider: "codex", cwd: staticDir } },
+    });
+    if (!workspace || !mainAgent) throw new Error("Missing topic");
+    const child = await before.daemon.agentManager.createAgent(
+      {
+        provider: "codex",
+        cwd: staticDir,
+        title: "Recovered specialist",
+        modeId: "bypassPermissions",
+      },
+      undefined,
+      {
+        workspaceId: workspace.id,
+        labels: { [PARENT_AGENT_ID_LABEL]: mainAgent.id },
+      },
+    );
+    await setup.close();
+    await before.close();
+    const receipts = new MessageReceipts(join(before.paseoHome, "agent-requests"));
+    const message = {
+      messageId: "recovered-dispatch",
+      prompt: "Recover this work",
+      source: { agentId: mainAgent.id },
+      topicDelegation: {
+        workspaceId: workspace.id,
+        mainAgentId: mainAgent.id,
+        rootMessageId: "recovered-root",
+        rootPromptText: "Original human prompt",
+      },
+      activeTurnBehavior: "queue" as const,
+      unarchive: false,
+    };
+    await expect(
+      receipts.sendQueued({
+        agentId: child.id,
+        message,
+        request: message,
+        enqueue: async () => ({
+          dispatched: Promise.reject(new Error("interrupted before handoff")),
+        }),
+        retainOnError: () => true,
+      }),
+    ).rejects.toThrow("interrupted before handoff");
+    expect((await receipts.queuedMessages())[0]?.queued.message).toEqual(message);
+    const after = await createTestPaseoDaemon(options);
+    const reader = new DaemonClient({ url: `ws://127.0.0.1:${after.port}/ws` });
+    try {
+      await reader.connect();
+      await vi.waitFor(
+        async () => {
+          const result = await reader.listWorkspaceTopicEntries({
+            workspaceId: workspace.id,
+            mainAgentId: mainAgent.id,
+          });
+          expect(result.anchors).toMatchObject([
+            {
+              rootMessageId: "recovered-root",
+              rootPromptText: "Original human prompt",
+              delegations: [
+                {
+                  messageId: message.messageId,
+                  agentId: child.id,
+                  title: "Recovered specialist",
+                  turnId: expect.any(String),
+                  status: "ended",
+                },
+              ],
+            },
+          ]);
+        },
+        { timeout: 8000 },
+      );
+      expect(await receipts.queuedMessages()).toHaveLength(0);
+    } finally {
+      await reader.close();
+      await after.close();
+    }
+  } finally {
+    await setup.close();
+    await before.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("daemon startup resumes an accepted delegation and reports only to its original topic", async () => {
+  const root = await mkdtemp(join(tmpdir(), "paseo-accepted-delegation-"));
+  const staticDir = join(root, "work");
+  await mkdir(staticDir);
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const held = new Map([
+    ["First topic request", deferred()],
+    ["Second topic request", deferred()],
+    ["Keep the second dispatch running", deferred()],
+    ["Continue the interrupted work.", deferred()],
+  ]);
+  const catalogs = new Map<string, PaseoToolCatalog>();
+  const sentPrompts: string[] = [];
+  const promptText = (prompt: AgentPromptInput) =>
+    typeof prompt === "string" ? prompt : JSON.stringify(prompt);
+  const fake = createTestAgentClient("codex", {
+    onStartTurn(prompt) {
+      sentPrompts.push(promptText(prompt));
+    },
+    beforeTurnComplete(prompt) {
+      const text = promptText(prompt);
+      return (
+        [...held].find(([fragment]) => text.includes(fragment))?.[1].promise ?? Promise.resolve()
+      );
+    },
+  });
+  fake.capabilities = { ...fake.capabilities, supportsNativePaseoTools: true };
+  const create = fake.createSession.bind(fake);
+  fake.createSession = (config, context, options) => {
+    if (context?.agentId && context.paseoTools) catalogs.set(context.agentId, context.paseoTools);
+    return create(config, context, options);
+  };
+  const resume = fake.resumeSession.bind(fake);
+  fake.resumeSession = (handle, overrides, context) => {
+    if (context?.agentId && context.paseoTools) catalogs.set(context.agentId, context.paseoTools);
+    return resume(handle, overrides, context);
+  };
+  const options = {
+    paseoHomeRoot: root,
+    staticDir,
+    cleanup: false,
+    resumeOnStartup: true,
+    resumePrompt: "Continue the interrupted work.",
+    agentClients: { codex: fake },
+  };
+  const before = await createTestPaseoDaemon(options);
+  const setup = new DaemonClient({ url: `ws://127.0.0.1:${before.port}/ws` });
+  try {
+    await setup.connect();
+    const { workspace, mainAgent } = await setup.createWorkspace({
+      source: { kind: "directory", path: staticDir },
+      title: "Recover accepted delegation",
+      topic: { hideFromModel: true },
+      mainAgent: { config: { provider: "codex", cwd: staticDir, modeId: "bypassPermissions" } },
+    });
+    if (!workspace || !mainAgent) throw new Error("Missing topic");
+    const scope = { workspaceId: workspace.id, mainAgentId: mainAgent.id };
+    const list = (client: DaemonClient) => client.listWorkspaceTopicEntries(scope);
+    await setup.sendMessage(mainAgent.id, "First topic request", { waitForDispatch: true });
+    const main = catalogs.get(mainAgent.id);
+    if (!main) throw new Error("Missing main tool catalog");
+    const created = await main.executeTool("create_agent", {
+      provider: "codex/gpt-5.4",
+      title: "Specialist",
+      initialPrompt: "Finish the first dispatch",
+      notifyOnFinish: false,
+    });
+    expect(created.isError, JSON.stringify(created.content)).toBeFalsy();
+    const { agentId, topicDelegation: first } = created.structuredContent as {
+      agentId: string;
+      topicDelegation: { messageId: string; rootMessageId: string };
+    };
+    await vi.waitFor(async () => {
+      expect((await list(setup)).anchors).toMatchObject([
+        {
+          rootMessageId: first.rootMessageId,
+          delegations: [{ messageId: first.messageId, status: "ended" }],
+        },
+      ]);
+    });
+    held.get("First topic request")!.resolve();
+    await vi.waitFor(() =>
+      expect(before.daemon.agentManager.hasInFlightRun(mainAgent.id)).toBe(false),
+    );
+    await setup.sendMessage(mainAgent.id, "Second topic request", { waitForDispatch: true });
+    const sent = await main.executeTool("send_agent_prompt", {
+      agentId,
+      prompt: "Keep the second dispatch running",
+      notifyOnFinish: false,
+    });
+    expect(sent.isError, JSON.stringify(sent.content)).toBeFalsy();
+    const { topicDelegation: second } = sent.structuredContent as {
+      topicDelegation: { messageId: string; rootMessageId: string };
+    };
+    await vi.waitFor(
+      async () => {
+        expect((await list(setup)).anchors).toMatchObject([
+          {
+            rootMessageId: first.rootMessageId,
+            delegations: [{ messageId: first.messageId, status: "ended", turnId: "fake-turn-0" }],
+          },
+          {
+            rootMessageId: second.rootMessageId,
+            delegations: [
+              { messageId: second.messageId, status: "running", turnId: "fake-turn-1" },
+            ],
+          },
+        ]);
+      },
+      { timeout: 8000 },
+    );
+    expect(
+      await new MessageReceipts(join(before.paseoHome, "agent-requests")).queuedMessages(),
+    ).toEqual([]);
+    await setup.close();
+    await before.close();
+    const stored = new AgentStorage(join(before.paseoHome, "agents"), createTestLogger());
+    expect(await stored.get(agentId)).toMatchObject({
+      resumeOnStartup: true,
+      restartTopicDelegation: {
+        agentId,
+        serverId: before.daemon.getServerId(),
+        workspaceId: workspace.id,
+        messageId: second.messageId,
+        turnId: "fake-turn-1",
+      },
+    });
+
+    sentPrompts.length = 0;
+    catalogs.clear();
+    const after = await createTestPaseoDaemon(options);
+    const reader = new DaemonClient({ url: `ws://127.0.0.1:${after.port}/ws` });
+    try {
+      await reader.connect();
+      await vi.waitFor(
+        async () => {
+          expect(sentPrompts).toEqual([
+            expect.stringContaining(options.resumePrompt),
+            expect.stringContaining(options.resumePrompt),
+          ]);
+          expect((await list(reader)).anchors).toMatchObject([
+            {
+              rootMessageId: first.rootMessageId,
+              delegations: [{ messageId: first.messageId, status: "ended", turnId: "fake-turn-0" }],
+            },
+            {
+              rootMessageId: second.rootMessageId,
+              delegations: [
+                { messageId: second.messageId, status: "running", turnId: "fake-turn-0" },
+              ],
+            },
+          ]);
+        },
+        { timeout: 8000 },
+      );
+      const child = catalogs.get(agentId);
+      if (!child) throw new Error("Missing recovered child tool catalog");
+      const report = await child.executeTool("report_to_parent", {
+        status: "completed",
+        summary: "Finished the interrupted dispatch",
+      });
+      expect(report.isError, JSON.stringify(report.content)).toBeFalsy();
+      const { anchors } = await list(reader);
+      expect(anchors).toMatchObject([
+        {
+          rootMessageId: first.rootMessageId,
+          delegations: [{ messageId: first.messageId, status: "ended" }],
+        },
+        {
+          rootMessageId: second.rootMessageId,
+          delegations: [
+            { messageId: second.messageId, status: "completed", reportIds: [expect.any(String)] },
+          ],
+        },
+      ]);
+      const reports = createJsonFinishSubscriptionStore(
+        after.paseoHome,
+        "finish-followup-reports.json",
+      );
+      expect(await reports.list()).toMatchObject([
+        {
+          rootMessageId: second.rootMessageId,
+          childAgentId: agentId,
+          reportTurnId: "fake-turn-0",
+          report: { parentReportStatus: "completed" },
+        },
+      ]);
+    } finally {
+      await reader.close();
+      await after.close();
+    }
+  } finally {
+    for (const gate of held.values()) gate.resolve();
+    await setup.close();
+    await before.close();
+  }
+}, 30_000);

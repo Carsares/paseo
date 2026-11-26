@@ -36,6 +36,11 @@ import {
 } from "../../file-explorer/service.js";
 import { workspaceFileObserver, type FileObserver } from "../../file-explorer/observer.js";
 import { getProjectIcon } from "../../../utils/project-icon.js";
+import {
+  decodeMessageImage,
+  MESSAGE_IMAGE_PATH_PREFIX,
+  readMessageImage,
+} from "../../topic-threads/uploaded-attachments.js";
 
 /**
  * What a workspace file-access request reaches outside its own domain: the
@@ -55,6 +60,13 @@ export interface WorkspaceFilesSessionOptions {
   paseoHome: string;
   logger: pino.Logger;
   fileObserver?: FileObserver;
+}
+
+function* imageChunks(bytes: Uint8Array) {
+  const chunkSize = 64 * 1024;
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    yield bytes.subarray(offset, offset + chunkSize);
+  }
 }
 
 /**
@@ -244,7 +256,11 @@ export class WorkspaceFilesSession {
     });
   }
 
-  async handleFileExplorerRequest(request: FileExplorerRequest, source?: object): Promise<void> {
+  async handleFileExplorerRequest(
+    request: FileExplorerRequest,
+    source?: object,
+    owner?: string,
+  ): Promise<void> {
     const { cwd: workspaceCwd, path: requestedPath = ".", mode, requestId } = request;
     const cwd = workspaceCwd.trim();
     if (!cwd) {
@@ -267,7 +283,49 @@ export class WorkspaceFilesSession {
     }
 
     try {
-      if (mode === "list") {
+      if (mode === "file" && requestedPath.startsWith(MESSAGE_IMAGE_PATH_PREFIX)) {
+        if (!owner) throw new Error("Image attachment is unavailable.");
+        const image = await readMessageImage(
+          this.getUploadAccess(owner),
+          requestedPath.slice(MESSAGE_IMAGE_PATH_PREFIX.length),
+          request.maxBytes,
+        ).catch(() => {
+          throw new Error("Image attachment is unavailable.");
+        });
+        const { bytes, mimeType, modifiedAt } = image;
+        const size = bytes.byteLength;
+        if (request.acceptBinary && this.host.hasBinaryChannel()) {
+          await this.streamFileResponse(
+            requestId,
+            { mimeType, size, encoding: "binary", modifiedAt, chunks: imageChunks(bytes) },
+            source,
+          );
+        } else {
+          this.host.emit(
+            {
+              type: "file_explorer_response",
+              payload: {
+                cwd,
+                path: requestedPath,
+                mode,
+                directory: null,
+                file: {
+                  path: requestedPath,
+                  kind: "image",
+                  encoding: "base64",
+                  content: bytes.toString("base64"),
+                  mimeType,
+                  size,
+                  modifiedAt,
+                },
+                error: null,
+                requestId,
+              },
+            },
+            source,
+          );
+        }
+      } else if (mode === "list") {
         const directory = await listDirectoryEntries({
           root: cwd,
           relativePath: requestedPath,
@@ -296,39 +354,9 @@ export class WorkspaceFilesSession {
           }
         }
         if (request.acceptBinary && this.host.hasBinaryChannel()) {
-          await streamExplorerFile({ root: cwd, relativePath: requestedPath }, async (file) => {
-            await this.host.emitBinary(
-              encodeFileTransferFrame({
-                opcode: FileTransferOpcode.FileBegin,
-                requestId,
-                metadata: {
-                  mime: file.mimeType,
-                  size: file.size,
-                  encoding: file.encoding,
-                  modifiedAt: file.modifiedAt,
-                  revision: file.revision,
-                },
-              }),
-              source,
-            );
-            for await (const chunk of file.chunks) {
-              await this.host.emitBinary(
-                encodeFileTransferFrame({
-                  opcode: FileTransferOpcode.FileChunk,
-                  requestId,
-                  payload: chunk,
-                }),
-                source,
-              );
-            }
-            await this.host.emitBinary(
-              encodeFileTransferFrame({
-                opcode: FileTransferOpcode.FileEnd,
-                requestId,
-              }),
-              source,
-            );
-          });
+          await streamExplorerFile({ root: cwd, relativePath: requestedPath }, (file) =>
+            this.streamFileResponse(requestId, file, source),
+          );
         } else {
           const file = await readExplorerFile({
             root: cwd,
@@ -375,19 +403,76 @@ export class WorkspaceFilesSession {
     }
   }
 
-  handleFileUploadRequest(request: FileUploadRequest, ownership: SessionDelivery): void {
+  private async streamFileResponse(
+    requestId: string,
+    file: {
+      mimeType: string;
+      size: number;
+      encoding: "utf-8" | "binary";
+      modifiedAt: string;
+      revision?: string;
+      chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>;
+    },
+    source?: object,
+  ) {
+    const emit = (frame: Parameters<typeof encodeFileTransferFrame>[0]) =>
+      this.host.emitBinary(encodeFileTransferFrame(frame), source);
+    await emit({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId,
+      metadata: {
+        mime: file.mimeType,
+        size: file.size,
+        encoding: file.encoding,
+        modifiedAt: file.modifiedAt,
+        revision: file.revision,
+      },
+    });
+    for await (const payload of file.chunks) {
+      await emit({ opcode: FileTransferOpcode.FileChunk, requestId, payload });
+    }
+    await emit({ opcode: FileTransferOpcode.FileEnd, requestId });
+  }
+
+  getUploadAccess(owner: string) {
+    return this.fileUploads.getUploadAccess(owner);
+  }
+
+  async persistMessageImages(
+    owner: string,
+    images: readonly { data: string; mimeType: string }[] | undefined,
+  ) {
+    const references = [];
+    for (const image of images ?? []) {
+      const decoded = decodeMessageImage(image);
+      if (decoded)
+        references.push(await this.fileUploads.persistMessageImage({ ...decoded, owner }));
+    }
+    return references.length ? references : undefined;
+  }
+
+  handleFileUploadRequest(
+    request: FileUploadRequest,
+    ownership: SessionDelivery,
+    owner?: string,
+  ): void {
     let cancel: (() => Promise<void>) | undefined;
     const operation = ownership.operation(
       (message) =>
         message.type === "file.upload.response" && message.payload.requestId === request.requestId,
       () => cancel?.(),
     );
-    cancel = this.fileUploads.beginUpload(request, operation.source, (response) => {
-      if (response) operation.emit(response);
-      void operation
-        .release()
-        .catch((error) => this.logger.error({ err: error }, "Upload cleanup failed"));
-    });
+    cancel = this.fileUploads.beginUpload(
+      request,
+      operation.source,
+      (response) => {
+        if (response) operation.emit(response);
+        void operation
+          .release()
+          .catch((error) => this.logger.error({ err: error }, "Upload cleanup failed"));
+      },
+      owner,
+    );
   }
 
   async handleFileTransferFrame(frame: FileTransferFrame, source: object): Promise<void> {

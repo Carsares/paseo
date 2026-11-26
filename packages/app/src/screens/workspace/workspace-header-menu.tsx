@@ -62,6 +62,8 @@ import {
 import { TerminalProfileIcon } from "@/components/terminal-profile-icon";
 import { useActiveWorkspaceArchive } from "@/hooks/use-active-workspace-archive";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
+import { useAppSettings } from "@/hooks/use-settings";
+import { getUserMessageAlignmentCopy } from "@/i18n/domains/settings";
 import {
   getTerminalProfileIcon,
   resolveTerminalProfiles,
@@ -73,6 +75,11 @@ import {
   type UseWorkspaceScriptsMenuPagesInput,
 } from "@/screens/workspace/scripts";
 import { usePluginWorkspaceMenu } from "@/plugins";
+import { GIT_ACTION_ICONS } from "@/git/action-icons";
+import { actionsWithoutPrimary, type GitAction, type GitActions } from "@/git/policy";
+import { Shortcut } from "@/components/ui/shortcut";
+import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
+import { useGitActions, useGitActionRunner } from "@/git/use-actions";
 
 const ThemedEllipsis = withUnistyles(Ellipsis);
 const ThemedArchive = withUnistyles(Archive);
@@ -122,6 +129,7 @@ const COMPACT_HEADER_BUTTON_HIT_SLOP = { top: 8, bottom: 8 } as const;
  */
 export interface WorkspaceHeaderWorkspaceActions {
   topicStatus?: TopicHeaderMenuStatus;
+  topicModeItems?: ReactNode;
   onCreateTab?: (paneId?: string) => void;
   currentBranchName: string | null;
   showWorkspaceSetup: boolean;
@@ -227,6 +235,37 @@ function useWorkspaceDirection(direction: string | null | undefined) {
   };
 }
 
+function UserMessageAlignmentMenuItem() {
+  const { i18n } = useTranslation();
+  const { settings, updateSettings, isLoading } = useAppSettings();
+  const copy = getUserMessageAlignmentCopy(i18n.language);
+  const toggleAlignment = useCallback(() => {
+    void updateSettings((current) => ({
+      userMessageAlignment: current.userMessageAlignment === "left" ? "right" : "left",
+    }));
+  }, [updateSettings]);
+  return (
+    <DropdownMenuItem
+      disabled={isLoading}
+      onSelect={toggleAlignment}
+      testID="workspace-header-user-message-alignment"
+    >
+      {settings.userMessageAlignment === "left" ? copy.moveRight : copy.moveLeft}
+    </DropdownMenuItem>
+  );
+}
+
+function WorkspaceDirectoryMenuItem() {
+  const { t } = useTranslation();
+  const { openDirectory, isDirectoryVisible, toggleDirectory } = useTeamDirectoryShell();
+  if (!openDirectory) return null;
+  return (
+    <DropdownMenuItem testID="workspace-header-team-directory" onSelect={toggleDirectory}>
+      {t(isDirectoryVisible ? "topicWorkbench.directory.hide" : "topicWorkbench.directory.show")}
+    </DropdownMenuItem>
+  );
+}
+
 function WorkspaceTopicStatusItems({
   status,
   directionItem,
@@ -319,15 +358,148 @@ function workspaceHeaderMenuButtonStyle({
   return iconButtonChromeStyle({ size: "large", state: { hovered, pressed, open } });
 }
 
+interface DesktopWorkspaceMenuScope {
+  serverId: string;
+  workspaceId: string;
+  cwd: string | null;
+  scripts: UseWorkspaceScriptsMenuPagesInput;
+}
+
+function WorkspaceHeaderGitItems({
+  gitActions,
+  run,
+}: {
+  gitActions: GitActions;
+  run: (action: GitAction) => void;
+}) {
+  const actions = actionsWithoutPrimary(gitActions);
+  if (gitActions.primary) actions.unshift(gitActions.primary);
+  return actions.map((action, index) => (
+    <WorkspaceHeaderGitItem
+      key={action.id}
+      action={action}
+      run={run}
+      showSeparator={index > 0 && action.startsGroup}
+    />
+  ));
+}
+
+function WorkspaceHeaderGitItem({
+  action,
+  run,
+  showSeparator,
+}: {
+  action: GitAction;
+  run: (action: GitAction) => void;
+  showSeparator: boolean;
+}) {
+  const select = useCallback(() => run(action), [action, run]);
+  const archiveShortcut = useShortcutKeys("archive-workspace");
+  const shortcut = useMemo(
+    () =>
+      action.id === "archive-workspace" && archiveShortcut ? (
+        <Shortcut chord={archiveShortcut} />
+      ) : undefined,
+    [action.id, archiveShortcut],
+  );
+  return (
+    <>
+      {showSeparator ? <DropdownMenuSeparator /> : null}
+      <DropdownMenuItem
+        testID={
+          action.id === "archive-workspace"
+            ? "workspace-archive-action"
+            : `changes-menu-${action.id}`
+        }
+        leading={action.icon}
+        trailing={shortcut}
+        disabled={action.disabled}
+        muted={Boolean(action.unavailableMessage)}
+        status={action.status}
+        pendingLabel={action.pendingLabel}
+        successLabel={action.successLabel}
+        closeOnSelect={
+          action.status === "idle" &&
+          action.id === "pr" &&
+          action.label === action.pendingLabel &&
+          action.label === action.successLabel
+        }
+        onSelect={select}
+      >
+        {action.label}
+      </DropdownMenuItem>
+    </>
+  );
+}
+
+function WorkspaceHeaderMenuWithGit({
+  serverId,
+  cwd,
+  ...props
+}: DesktopWorkspaceHeaderMenuSurfaceProps & { serverId: string; cwd: string }) {
+  const { gitActions } = useGitActions({ serverId, cwd, icons: GIT_ACTION_ICONS });
+  const run = useGitActionRunner();
+  return (
+    <WorkspaceHeaderMenuDesktopSurface {...props} gitActions={gitActions} runGitAction={run} />
+  );
+}
+
+function WorkspaceHeaderMenuWithConditionalActions({
+  scope,
+  ...props
+}: DesktopWorkspaceHeaderMenuProps & { scope: DesktopWorkspaceMenuScope }) {
+  const plugins = usePluginWorkspaceMenu(scope.serverId, scope.workspaceId);
+  const scripts = useWorkspaceScriptsMenuPages(scope.scripts);
+  const surface = {
+    ...props,
+    pages: [...scripts.pages, ...plugins.pages],
+    conditionalItems: (
+      <>
+        {scripts.trigger}
+        {plugins.rows}
+      </>
+    ),
+    needsAttention: scripts.needsAttention,
+  };
+  if (scope.cwd) {
+    return <WorkspaceHeaderMenuWithGit {...surface} serverId={scope.serverId} cwd={scope.cwd} />;
+  }
+  return <WorkspaceHeaderMenuDesktopSurface {...surface} />;
+}
+
+interface DesktopWorkspaceHeaderMenuProps extends WorkspaceHeaderWorkspaceActions {
+  pane?: WorkspaceCompactHeaderActions["pane"];
+  foldout?: DesktopWorkspaceMenuScope;
+}
+
+interface DesktopWorkspaceHeaderMenuSurfaceProps extends DesktopWorkspaceHeaderMenuProps {
+  pages?: MenuPageDefinition[];
+  needsAttention?: boolean;
+  conditionalItems?: ReactNode;
+  gitActions?: GitActions;
+  runGitAction?: (action: GitAction) => void;
+}
+
 /**
  * When the directory replaces the tab strip, this menu also carries the pane's launcher and split actions.
  */
-export function WorkspaceHeaderMenuDesktop({
+export function WorkspaceHeaderMenuDesktop({ foldout, ...props }: DesktopWorkspaceHeaderMenuProps) {
+  if (foldout) return <WorkspaceHeaderMenuWithConditionalActions scope={foldout} {...props} />;
+  return <WorkspaceHeaderMenuDesktopSurface {...props} />;
+}
+
+function WorkspaceHeaderMenuDesktopSurface({
   pane,
   topicStatus,
+  topicModeItems,
   onCreateTab,
+  pages,
+  needsAttention,
+  conditionalItems,
+  gitActions,
+  runGitAction,
   ...props
-}: WorkspaceHeaderWorkspaceActions & { pane?: WorkspaceCompactHeaderActions["pane"] }) {
+}: DesktopWorkspaceHeaderMenuSurfaceProps) {
   const { t } = useTranslation();
   const { item, dialog } = useWorkspaceDirection(topicStatus?.direction);
   const { openDirectory } = useTeamDirectoryShell();
@@ -340,7 +512,7 @@ export function WorkspaceHeaderMenuDesktop({
           accessibilityRole="button"
           accessibilityLabel={t("workspace.header.actions.workspaceActions")}
         >
-          {topicStatus?.needsAttention ? (
+          {needsAttention || topicStatus?.needsAttention ? (
             <WorkspaceHeaderMenuAttentionTriggerIcon />
           ) : (
             <WorkspaceHeaderMenuTriggerIcon />
@@ -350,6 +522,7 @@ export function WorkspaceHeaderMenuDesktop({
           align={topicStatus ? "end" : "start"}
           width={220}
           testID="workspace-header-menu"
+          pages={pages}
         >
           {topicStatus ? (
             <WorkspaceTopicStatusItems
@@ -358,6 +531,13 @@ export function WorkspaceHeaderMenuDesktop({
               onShowDirectory={openDirectory}
               onOpenSetup={props.showWorkspaceSetup ? props.onOpenSetupTab : undefined}
             />
+          ) : null}
+          {topicModeItems}
+          <WorkspaceDirectoryMenuItem />
+          <UserMessageAlignmentMenuItem />
+          {conditionalItems}
+          {gitActions && runGitAction ? (
+            <WorkspaceHeaderGitItems gitActions={gitActions} run={runGitAction} />
           ) : null}
           <WorkspacePaneActionItems pane={pane} onCreateTab={onCreateTab} />
           <WorkspaceHeaderWorkspaceActionItems
@@ -599,6 +779,7 @@ export function WorkspaceHeaderMenuMobile({
   tabMenuActions,
   onExitFocusMode,
   topicStatus,
+  topicModeItems,
   onCreateTab,
   ...workspaceActions
 }: WorkspaceHeaderMenuMobileProps) {
@@ -788,6 +969,9 @@ export function WorkspaceHeaderMenuMobile({
               }
             />
           ) : null}
+          {topicModeItems}
+          <WorkspaceDirectoryMenuItem />
+          <UserMessageAlignmentMenuItem />
           <WorkspacePaneActionItems pane={pane} onCreateTab={onCreateTab} />
           {tabs?.length ? (
             <DropdownMenuSubTrigger id={WORKSPACE_TABS_PAGE_ID} testID="workspace-header-tabs">

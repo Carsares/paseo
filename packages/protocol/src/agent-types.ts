@@ -414,6 +414,13 @@ export interface UserMessageForkContext {
   boundaryMessageId?: string;
 }
 
+export interface MessageImageAttachment {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+}
+
 export type AgentTimelineItem =
   | {
       type: "user_message";
@@ -421,6 +428,7 @@ export type AgentTimelineItem =
       messageId?: string;
       clientMessageId?: string;
       forkContext?: UserMessageForkContext;
+      imageAttachments?: MessageImageAttachment[];
     }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }

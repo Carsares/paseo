@@ -1,3 +1,4 @@
+import type { TopicDelegationScope } from "./topic-delegation.js";
 import { describeAgentMessage } from "../agent-messages/guidance.js";
 import {
   WorkspaceTopicDecideRequestSchema,
@@ -3578,6 +3579,7 @@ function createToolCatalog(
 
     return {
       workspaceId,
+      rootMessageId,
       run<T>(operation: () => T, messageId?: string) {
         admission.messageId = messageId;
         return runWithTaskDispatchAdmission(admission, operation);
@@ -4128,7 +4130,7 @@ function createToolCatalog(
   const agentToAgentSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
     activeTurnBehavior: AgentActiveTurnBehaviorSchema.optional().describe(
-      'Leave this out unless the message cannot wait. Default "queue": the message waits until the agent\'s running turn ends. "steer": the message joins the running turn; a provider that cannot steer interrupts the turn instead. "interrupt": the running turn stops and a new turn starts with the message. A steer or interrupt carries the messages you queued before it, in order.',
+      'Leave this out unless the message cannot wait. Default "queue": the message waits until the agent\'s running turn ends. "steer": the message joins the running turn; a provider that cannot steer interrupts the turn instead. "interrupt": the running turn stops and a new turn starts with the message. A steer or interrupt carries the messages you queued before it, in order. Topic delegations that request steer wait for their own turn.',
     ),
     notifyOnFinish: z
       .boolean()
@@ -4763,6 +4765,134 @@ function createToolCatalog(
     return { topicKey: `msg:${rootMessageId}`, rootMessageId };
   }
 
+  const topicDelegationSchema = z.object({
+    rootMessageId: z.string(),
+    agentId: z.string(),
+    serverId: z.string(),
+    messageId: z.string(),
+    taskId: z.string().optional(),
+  });
+
+  async function readDelegationScope(
+    binding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
+  ): Promise<TopicDelegationScope | undefined> {
+    if (!callerAgentId || callerAgentId !== options.verifiedCallerAgentId || !options.serverId)
+      return;
+    const main = agentManager.getAgent(callerAgentId);
+    const turnId = main?.activeForegroundTurnId ?? main?.activeTurnId;
+    if (!main?.workspaceId || !isMainControlAgentLabels(main.labels) || !turnId) return;
+    if (getActivePeerTurnContext(callerAgentId)) return;
+    const workspaceId = main.workspaceId;
+    const topic = binding?.rootMessageId
+      ? { rootMessageId: binding.rootMessageId, taskId: undefined }
+      : await readDurableItemTopic(callerAgentId, workspaceId, turnId).catch((err) => {
+          childLogger.warn({ err, callerAgentId, turnId }, "Failed to read delegation topic");
+          return undefined;
+        });
+    if (!topic?.rootMessageId) return;
+    const { rootMessageId } = topic;
+    const rootPromptText = await readDelegationRootText(callerAgentId, rootMessageId).catch(
+      (err) => {
+        childLogger.warn(
+          { err, callerAgentId, rootMessageId },
+          "Failed to read delegation topic text",
+        );
+        return "";
+      },
+    );
+    if (!isCurrentDelegatingTurn(callerAgentId, workspaceId, turnId)) return;
+    return {
+      workspaceId,
+      mainAgentId: callerAgentId,
+      rootMessageId,
+      rootPromptText,
+      taskId: binding ? undefined : topic.taskId,
+    };
+  }
+
+  function isCurrentDelegatingTurn(agentId: string, workspaceId: string, turnId: string) {
+    const current = agentManager.getAgent(agentId);
+    return (
+      current?.workspaceId === workspaceId &&
+      (current.activeForegroundTurnId ?? current.activeTurnId) === turnId
+    );
+  }
+
+  async function readDelegationRootText(agentId: string, rootMessageId: string) {
+    const rows = await agentManager.getTimelineRows(agentId);
+    const root = rows.find(
+      ({ item }) =>
+        item.type === "user_message" &&
+        (item.messageId === rootMessageId || item.clientMessageId === rootMessageId),
+    )?.item;
+    if (root?.type !== "user_message") return "";
+    return parseAgentMessages(root.text)?.find(({ source }) => source === null)?.text ?? root.text;
+  }
+
+  async function bindDelegation(
+    delegationScope: TopicDelegationScope | undefined,
+    agentId: string,
+    messageId: string,
+    taskId?: string,
+  ) {
+    if (!delegationScope || !options.serverId || !taskId) return;
+    await agentManager.topicDelegations
+      ?.bindTask(
+        {
+          workspaceId: delegationScope.workspaceId,
+          serverId: options.serverId,
+          agentId,
+          messageId,
+        },
+        taskId,
+      )
+      .catch((err) =>
+        childLogger.warn(
+          { err, agentId, messageId, taskId },
+          "Could not associate delegation with its task",
+        ),
+      );
+  }
+
+  function topicDelegation(
+    scopeForDispatch: TopicDelegationScope | undefined,
+    agentId: string,
+    messageId: string | undefined,
+  ) {
+    if (!scopeForDispatch || !messageId || !options.serverId) return;
+    const { rootMessageId, taskId } = scopeForDispatch;
+    return {
+      rootMessageId,
+      agentId,
+      serverId: options.serverId,
+      messageId,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
+  function resolveCreateLeadPlaybook(
+    args: ResolvedCreateAgentToolArgs,
+    caller: HierarchyAgent | null,
+  ): ResolvedLeadPlaybookOptions | undefined {
+    if (args.kind !== "agent-scoped") return;
+    const { parsedArgs } = args;
+    try {
+      return resolveLeadPlaybookInput({
+        playbook: parsedArgs.playbook,
+        commitPolicy: parsedArgs.commitPolicy,
+        callerLabels: caller?.labels,
+        resident: Boolean(parsedArgs.resident || parsedArgs.residentRole),
+        parentReporting: parsedArgs.parentReporting,
+        notifyOnFinish: parsedArgs.notifyOnFinish,
+      });
+    } catch (error) {
+      if (error instanceof LeadPlaybookValidationError) {
+        throw new PaseoToolInputError(error.message);
+      }
+      throw error;
+    }
+  }
+
   function registerDurableItemRequestTool() {
     const { durableItems, serverId, verifiedCallerAgentId } = options;
     if (scope !== "agent" || !durableItems || !serverId) return;
@@ -4820,32 +4950,14 @@ function createToolCatalog(
         guidance: z.string().optional(),
         taskId: z.string().optional(),
         taskBindingError: z.string().optional(),
+        topicDelegation: topicDelegationSchema.optional(),
       },
     },
     async (args: { taskBinding?: z.infer<typeof WorkspaceTaskToolInputSchema> }) => {
       const resolvedArgs = await resolveCreateAgentToolArgs(args);
       const { parsedArgs } = resolvedArgs;
       const callerSnapshot = callerAgentId ? await readHierarchyAgent(callerAgentId) : null;
-      let resolvedPlaybook: ResolvedLeadPlaybookOptions | undefined;
-      if (resolvedArgs.kind === "agent-scoped") {
-        try {
-          resolvedPlaybook = resolveLeadPlaybookInput({
-            playbook: resolvedArgs.parsedArgs.playbook,
-            commitPolicy: resolvedArgs.parsedArgs.commitPolicy,
-            callerLabels: callerSnapshot?.labels,
-            resident: Boolean(
-              resolvedArgs.parsedArgs.resident || resolvedArgs.parsedArgs.residentRole,
-            ),
-            parentReporting: resolvedArgs.parsedArgs.parentReporting,
-            notifyOnFinish: resolvedArgs.parsedArgs.notifyOnFinish,
-          });
-        } catch (error) {
-          if (error instanceof LeadPlaybookValidationError) {
-            throw new PaseoToolInputError(error.message);
-          }
-          throw error;
-        }
-      }
+      const resolvedPlaybook = resolveCreateLeadPlaybook(resolvedArgs, callerSnapshot);
       const taskBinding = args.taskBinding ? await prepareTaskBinding(args.taskBinding) : undefined;
       const notifyOnFinish = resolvedPlaybook ? false : parsedArgs.notifyOnFinish;
       let parentReporting: "auto" | "explicit" | undefined;
@@ -4859,7 +4971,22 @@ function createToolCatalog(
       const effectiveProviderSettings = activePeerTurn
         ? await enforcePeerReadOnlyCreateSettings(parsedArgs, baseProviderSettings)
         : baseProviderSettings;
-      const bindingMessageId = taskBinding ? randomUUID() : undefined;
+      const delegationScope = await readDelegationScope(taskBinding);
+      const bindingMessageId = taskBinding || delegationScope ? randomUUID() : undefined;
+      let admittedDelegation:
+        | { workspaceId: string; serverId: string; agentId: string; messageId: string }
+        | undefined;
+      const rejectInitialDelegation = async () => {
+        if (!admittedDelegation) return;
+        await agentManager.topicDelegations
+          ?.reject(admittedDelegation)
+          .catch((err) =>
+            childLogger.warn(
+              { err, agentId: admittedDelegation?.agentId },
+              "Could not reject initial delegation",
+            ),
+          );
+      };
       const { snapshot, initialPromptStarted, bindingResult } = await (async () => {
         let peerChildLockedBeforeStart = false;
         const create = (verifyPeerRecipient?: (agentId: string) => void) =>
@@ -4893,9 +5020,32 @@ function createToolCatalog(
               labels: parsedArgs.labels,
               promptFailure: taskBinding ? "return-error" : "throw",
               validateInitialPromptDispatch:
-                taskBinding || activePeerTurn
+                taskBinding || activePeerTurn || (delegationScope && agentManager.topicDelegations)
                   ? async (createdAgentId) => {
                       await taskBinding?.labelTarget(createdAgentId);
+                      if (
+                        delegationScope &&
+                        options.serverId &&
+                        bindingMessageId &&
+                        agentManager.topicDelegations
+                      ) {
+                        const target = agentManager.getAgent(createdAgentId);
+                        if (target?.workspaceId === delegationScope.workspaceId) {
+                          admittedDelegation = {
+                            workspaceId: delegationScope.workspaceId,
+                            agentId: createdAgentId,
+                            serverId: options.serverId,
+                            messageId: bindingMessageId,
+                          };
+                          await agentManager.topicDelegations.admit({
+                            ...delegationScope,
+                            ...admittedDelegation,
+                            title: target.config.title ?? undefined,
+                            recoverable: false,
+                          });
+                          await agentManager.topicDelegations.submitting(admittedDelegation);
+                        }
+                      }
                       if (activePeerTurn) {
                         const [firstCorrelationId] = activePeerTurn.correlationIds;
                         if (firstCorrelationId) {
@@ -4923,9 +5073,13 @@ function createToolCatalog(
           );
 
         const startCreate = () => (activePeerTurn ? withPeerInitialPrompt(create) : create());
-        const creation = await (taskBinding
-          ? taskBinding.run(startCreate, bindingMessageId)
-          : startCreate());
+        const creation = await (
+          taskBinding ? taskBinding.run(startCreate, bindingMessageId) : startCreate()
+        ).catch(async (error) => {
+          await rejectInitialDelegation();
+          throw error;
+        });
+        if (!creation.initialPromptStarted) await rejectInitialDelegation();
         if (activePeerTurn && !peerChildLockedBeforeStart) {
           const [firstCorrelationId] = activePeerTurn.correlationIds;
           if (firstCorrelationId) {
@@ -4943,8 +5097,18 @@ function createToolCatalog(
                     : "The initial prompt did not start.",
               };
         }
+        if (bindingMessageId)
+          await bindDelegation(
+            delegationScope,
+            creation.snapshot.id,
+            bindingMessageId,
+            recordedBinding && "taskId" in recordedBinding ? recordedBinding.taskId : undefined,
+          );
         return { ...creation, bindingResult: recordedBinding };
       })().finally(() => taskBinding?.close());
+      const delegation = initialPromptStarted
+        ? topicDelegation(delegationScope, snapshot.id, bindingMessageId)
+        : undefined;
       const currentSnapshot = agentManager.getAgent(snapshot.id) ?? snapshot;
       const guidance =
         callerAgentId &&
@@ -4964,6 +5128,7 @@ function createToolCatalog(
           availableModes: currentSnapshot.availableModes,
           guidance,
           ...bindingResult,
+          ...(delegation ? { topicDelegation: delegation } : {}),
         }),
       };
       return response;
@@ -5676,6 +5841,16 @@ function createToolCatalog(
     };
   }
 
+  function resolveLocalDelegationBehavior(
+    behavior: AgentActiveTurnBehavior | undefined,
+    delegationScope: TopicDelegationScope | undefined,
+    peerChild: boolean,
+  ): AgentActiveTurnBehavior {
+    if (peerChild || (delegationScope && agentManager.topicDelegations && behavior === "steer"))
+      return "queue";
+    return behavior ?? "queue";
+  }
+
   async function sendLocalAgentPrompt(
     senderId: string,
     {
@@ -5699,6 +5874,7 @@ function createToolCatalog(
     if (taskBinding && !requireParentOwnership) {
       throw new PaseoToolInputError("Task binding requires a local direct subagent.");
     }
+    const delegationScope = mainControl ? await readDelegationScope(taskBinding) : undefined;
     await taskBinding?.validateDispatch(agentId);
     taskBinding?.prepareRecipient(agentId);
     const notifying = notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels);
@@ -5721,7 +5897,11 @@ function createToolCatalog(
       });
       guardedPrompt = stagedPeerChild.guardedPrompt;
     }
-    const behavior = stagedPeerChild ? "queue" : (activeTurnBehavior ?? "queue");
+    const behavior = resolveLocalDelegationBehavior(
+      activeTurnBehavior,
+      delegationScope,
+      Boolean(stagedPeerChild),
+    );
     const enqueue = () =>
       enqueueLocalAgentPrompt(
         agentId,
@@ -5736,6 +5916,7 @@ function createToolCatalog(
             ? { agentId: senderId, serverId: options.serverId ?? "self" }
             : undefined,
           expectedWorkspaceId: senderWorkspaceId,
+          topicDelegation: delegationScope,
           sessionMode,
           activeTurnBehavior: behavior,
           ...(behavior === "steer" ? { immediateSteer: true } : {}),
@@ -5754,7 +5935,23 @@ function createToolCatalog(
       }
       throw error;
     }
-    if (!taskBinding) return queuedPromptResponse(agentId, messageId, notifying, behavior);
+    const delegation = topicDelegation(delegationScope, agentId, messageId);
+    if (!taskBinding) {
+      const response = queuedPromptResponse(agentId, messageId, notifying, behavior);
+      return delegation
+        ? {
+            ...response,
+            structuredContent: { ...response.structuredContent, topicDelegation: delegation },
+          }
+        : response;
+    }
+    const bindingResult = await taskBinding.record(agentId, messageId);
+    await bindDelegation(
+      delegationScope,
+      agentId,
+      messageId,
+      "taskId" in bindingResult ? bindingResult.taskId : undefined,
+    );
     return {
       content: [],
       structuredContent: {
@@ -5763,7 +5960,8 @@ function createToolCatalog(
         messageId,
         status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
         guidance: notifying ? PROMPTED_AGENT_NOTIFICATION_GUIDANCE : "Dispatch acknowledged.",
-        ...(await taskBinding.record(agentId, messageId)),
+        ...(delegation ? { topicDelegation: delegation } : {}),
+        ...bindingResult,
       },
     };
   }
@@ -5787,6 +5985,7 @@ function createToolCatalog(
         guidance: z.string().optional(),
         taskId: z.string().optional(),
         taskBindingError: z.string().optional(),
+        topicDelegation: topicDelegationSchema.optional(),
       },
     },
     async ({
@@ -7274,6 +7473,85 @@ function createToolCatalog(
     }
   }
 
+  async function findDelegationForReport(input: {
+    verified: boolean;
+    isLocal: boolean;
+    dispatch: ReturnType<AgentManager["captureDelegationReport"]>;
+    caller: HierarchyAgent;
+    localParent: HierarchyAgent | undefined;
+    parentAgentId: string;
+    localServer: string;
+  }) {
+    const { verified, isLocal, dispatch, caller, localParent } = input;
+    if (!verified || !isLocal || !dispatch) return;
+    if (
+      caller.workspaceId !== dispatch.workspaceId ||
+      localParent?.workspaceId !== dispatch.workspaceId
+    )
+      return;
+    const delegation = await agentManager.topicDelegations?.forReport({
+      ...dispatch,
+      mainAgentId: input.parentAgentId,
+      serverId: input.localServer,
+      agentId: caller.id,
+    });
+    if (delegation) return { ...delegation, turnId: dispatch.turnId };
+  }
+
+  function resolveParentReportTopic(
+    caller: HierarchyAgent,
+    localParent: HierarchyAgent | undefined,
+    taskReport: ReturnType<AgentManager["captureTaskReport"]>,
+    verified: boolean,
+    delegation: Awaited<ReturnType<typeof findDelegationForReport>>,
+  ): ReportTopic {
+    const taskTopic = reportTopicForDelivery(caller, localParent, taskReport, verified);
+    if (!delegation) return taskTopic;
+    return {
+      rootMessageId: delegation.rootMessageId,
+      taskId:
+        delegation.taskId ??
+        (taskTopic.rootMessageId === delegation.rootMessageId ? taskTopic.taskId : undefined),
+    };
+  }
+
+  async function recordQueuedParentReport(input: {
+    callerAgentId: string;
+    messageId: string;
+    status: "completed" | "blocked";
+    delegation: Awaited<ReturnType<typeof findDelegationForReport>>;
+    topic: ReportTopic;
+    taskReport: ReturnType<AgentManager["captureTaskReport"]>;
+    updateLocalTask: boolean;
+  }) {
+    const { callerAgentId: childId, messageId, status, delegation, topic, taskReport } = input;
+    if (delegation) {
+      try {
+        await agentManager.topicDelegations?.recordReport(delegation, messageId, status);
+      } catch (err) {
+        childLogger.warn({ err, messageId }, "Could not record the queued delegation report");
+      }
+    }
+    if (!input.updateLocalTask || (!topic.taskId && (delegation || taskReport?.topicTask))) return;
+    await agentManager.recordTaskParentReport(childId, messageId, status, taskReport);
+  }
+
+  function currentParentReportTurnId(
+    agentId: string,
+    taskReport: ReturnType<AgentManager["captureTaskReport"]>,
+  ) {
+    const current = agentManager.getAgent(agentId);
+    if (
+      agentManager.topicDelegations &&
+      options.verifiedCallerAgentId === agentId &&
+      !current?.activeForegroundTurnId &&
+      !current?.activeTurnId
+    ) {
+      return taskReport?.deliveryTurnId;
+    }
+    return taskReport?.deliveryTurnId ?? reportTurnId(agentId);
+  }
+
   registerTool(
     "report_to_parent",
     {
@@ -7296,7 +7574,8 @@ function createToolCatalog(
     async ({ status, summary }) => {
       if (!callerAgentId) throw new PaseoToolInputError("Only subagents can report to a parent.");
       const taskReport = agentManager.captureTaskReport(callerAgentId);
-      const turnId = taskReport?.deliveryTurnId ?? reportTurnId(callerAgentId);
+      const dispatch = agentManager.captureDelegationReport(callerAgentId);
+      const turnId = currentParentReportTurnId(callerAgentId, taskReport);
       const localServer = options.serverId ?? "self";
       const caller = await readHierarchyAgent(callerAgentId);
       const parent = getParentAddressFromLabels(caller?.labels, localServer);
@@ -7312,12 +7591,21 @@ function createToolCatalog(
       const localParent = await requireParentReportTarget(parent, localServer);
       const isLocal = parent.serverId === localServer;
       const verified = options.verifiedCallerAgentId === callerAgentId;
-      const topic = reportTopicForDelivery(caller, localParent, taskReport, verified);
+      const delegation = await findDelegationForReport({
+        verified,
+        isLocal,
+        dispatch,
+        caller,
+        localParent,
+        parentAgentId: parent.agentId,
+        localServer,
+      });
+      const topic = resolveParentReportTopic(caller, localParent, taskReport, verified, delegation);
       const report = {
         status,
         summary: neutralizePeerWorkspacePromptMarker(summary),
         title: resolveReportTitle(callerAgentId, caller.title),
-        turnId,
+        turnId: delegation?.turnId ?? turnId,
         ...topic,
       };
       const messageId = await finishSubscriptions().queueParentReport(
@@ -7328,9 +7616,15 @@ function createToolCatalog(
         },
         report,
       );
-      if (verified && isLocal && (!taskReport?.topicTask || topic.taskId)) {
-        await agentManager.recordTaskParentReport(callerAgentId, messageId, status, taskReport);
-      }
+      await recordQueuedParentReport({
+        callerAgentId,
+        messageId,
+        status,
+        delegation,
+        topic,
+        taskReport,
+        updateLocalTask: verified && isLocal,
+      });
       return {
         content: [],
         structuredContent: { success: true, deliveryStatus: "queued", messageId },

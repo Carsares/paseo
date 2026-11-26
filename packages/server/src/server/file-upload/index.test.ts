@@ -56,6 +56,37 @@ describe("file uploads", () => {
     expect(readFileSync(path, "utf8")).toBe("hello world");
   });
 
+  it("registers only completed owned uploads and can resolve them after reopening the store", async () => {
+    const paseoHome = makePaseoHome();
+    const uploads = new FileUploadStore({ paseoHome });
+    const source = {};
+    uploads.beginUpload(
+      {
+        type: "file.upload.request",
+        fileName: "notes.txt",
+        mimeType: "text/plain",
+        size: 5,
+        modifiedAt: "2026-05-02T00:00:00.000Z",
+        requestId: "owned-upload",
+      },
+      source,
+      undefined,
+      "upload-owner",
+    );
+    await uploads.receiveFrame(uploadBegins("owned-upload"), source);
+    const [id] = readdirSync(join(paseoHome, "uploads"));
+    if (!id) throw new Error("Upload did not create its destination directory");
+    const reopened = new FileUploadStore({ paseoHome });
+    const owned = reopened.getUploadAccess("upload-owner");
+    await expect(owned.lookup(id)).resolves.toBeNull();
+
+    await uploads.receiveFrame(uploadChunk("owned-upload", "hello"), source);
+    const response = await uploads.receiveFrame(uploadEnds("owned-upload"), source);
+    expect(response?.payload.file).toMatchObject({ id, size: 5 });
+    await expect(owned.lookup(id)).resolves.toEqual(response?.payload.file);
+    await expect(reopened.getUploadAccess("other-principal").lookup(id)).resolves.toBeNull();
+  });
+
   it("keeps the original file name for non-ASCII and punctuated names", async () => {
     const uploads = new FileUploadStore({ paseoHome: makePaseoHome() });
 

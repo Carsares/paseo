@@ -1,12 +1,10 @@
 import { Fragment, useMemo, type ReactNode } from "react";
-import { Text } from "react-native";
-import { useTranslation } from "react-i18next";
-import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { Users } from "lucide-react-native";
-import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
-import { HeaderToggleButton } from "@/components/headers/header-toggle-button";
-import { useStableEvent } from "@/hooks/use-stable-event";
-import { useWorkspaceSheetPages } from "@/screens/workspace/sheet-pane";
+import { Text, View } from "react-native";
+import { StyleSheet } from "react-native-unistyles";
+import { TopicStreamModeControl } from "@/agent-stream/topic-card/topic-stream-mode-control";
+import { useContainerWidthBelow } from "@/hooks/use-container-width";
+import { useTeamDirectoryShell } from "@/subagents/team-directory/shell-context";
+import { TopicDirectoryToggle } from "../topic-header";
 import { usePanelStore } from "@/stores/panel-store";
 import { CompactHeader } from "@/components/headers/compact-header";
 import { WorkspaceHeaderProjectRow } from "@/screens/workspace/workspace-header-project-row";
@@ -34,12 +32,11 @@ interface CompactWorkspaceHeaderProps {
   headerVariant: "compact" | "full";
   isRouteFocused: boolean;
   isCompact: boolean;
-  compactTeamDirectory?: (close: () => void) => ReactNode;
   compactConflictAction?: ReactNode;
   topicHeader?: boolean;
+  showDirectoryToggle?: boolean;
   titleContent?: ReactNode;
-  modeControl?: ReactNode;
-  desktopTeamAction?: ReactNode;
+  modeTarget?: WorkspaceModeTarget;
 }
 
 /** The compact header with the workspace's project row and controls. */
@@ -56,21 +53,13 @@ export function CompactWorkspaceHeader({
   headerVariant,
   isRouteFocused,
   isCompact,
-  compactTeamDirectory,
   compactConflictAction,
   topicHeader,
+  showDirectoryToggle = true,
   titleContent,
-  modeControl,
-  desktopTeamAction,
+  modeTarget,
 }: CompactWorkspaceHeaderProps) {
-  const { t } = useTranslation();
-  const stack = useWorkspaceSheetPages();
-  const teamTitle = t("topicWorkbench.directory.title");
-  const renderTeam = useStableEvent((close: () => void) => compactTeamDirectory?.(close));
-  const openTeam = useStableEvent(() => {
-    if (!compactTeamDirectory) return;
-    stack?.push({ key: "team", title: teamTitle, render: renderTeam });
-  });
+  const { openDirectory } = useTeamDirectoryShell();
   const actionsInBar = resolveWorkspaceActionPlacement(useWindowLayout()) === "vertical-bar";
   const projectRow = useMemo(
     () => (
@@ -87,33 +76,46 @@ export function CompactWorkspaceHeader({
     overflow: children,
     explorer: topicHeader && actionsInBar ? null : explorerAction,
   };
-  let teamAction = desktopTeamAction;
-  if (isCompact && stack && compactTeamDirectory) {
-    teamAction = topicHeader ? (
-      <ToolbarButton compact label={teamTitle} onPress={openTeam} testID="workspace-header-team">
-        <ThemedUsers size={16} />
-      </ToolbarButton>
-    ) : (
-      <HeaderToggleButton
-        accessibilityRole="button"
-        accessibilityLabel={teamTitle}
-        onPress={openTeam}
-        testID="workspace-header-team"
-        tooltipLabel={t("topicWorkbench.directory.show")}
-        tooltipKeys={NO_SHORTCUTS}
-        tooltipSide="bottom"
-        style={styles.teamButton}
+  const topicTitle = useMemo(() => {
+    if (!topicHeader && !(showDirectoryToggle && openDirectory)) return titleContent;
+    return (
+      <WorkspaceTopicHeaderLeading
+        compact={isCompact}
+        modeTarget={modeTarget}
+        showDirectoryToggle={showDirectoryToggle}
       >
-        <Text style={styles.teamLabel} numberOfLines={1}>
-          {teamTitle}
-        </Text>
-      </HeaderToggleButton>
+        {titleContent ?? (
+          <>
+            {isLoading ? (
+              <View style={styles.skeleton} />
+            ) : (
+              <Text
+                style={styles.title}
+                numberOfLines={1}
+                ellipsizeMode="tail"
+                testID="workspace-header-title"
+              >
+                {title}
+              </Text>
+            )}
+            {isLoading ? null : projectRow}
+          </>
+        )}
+      </WorkspaceTopicHeaderLeading>
     );
-  }
+  }, [
+    isCompact,
+    isLoading,
+    modeTarget,
+    openDirectory,
+    projectRow,
+    showDirectoryToggle,
+    title,
+    titleContent,
+    topicHeader,
+  ]);
   const actions = (
     <>
-      {teamAction}
-      {modeControl}
       {isCompact ? compactConflictAction : null}
       {resolveWorkspaceBarActions(headerVariant).map((symbol) => (
         <Fragment key={symbol}>{symbols[symbol]}</Fragment>
@@ -130,7 +132,7 @@ export function CompactWorkspaceHeader({
           title={title}
           titleTestID="workspace-header-title"
           testID={topicHeader ? "workspace-topic-header" : undefined}
-          titleContent={titleContent}
+          titleContent={topicTitle}
           subtitle={projectRow}
           loading={isLoading}
           actions={actionsInBar && !topicHeader ? undefined : actions}
@@ -181,11 +183,79 @@ function WorkspaceWindowActions({
   return <WindowLayoutActions active={active}>{children}</WindowLayoutActions>;
 }
 
-const NO_SHORTCUTS: [] = [];
+interface WorkspaceModeTarget {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+}
+
+export function WorkspaceTopicHeaderLeading({
+  compact = false,
+  modeTarget,
+  showDirectoryToggle = true,
+  children,
+}: {
+  compact?: boolean;
+  modeTarget?: WorkspaceModeTarget;
+  showDirectoryToggle?: boolean;
+  children: ReactNode;
+}) {
+  // Measure the space left after navigation, directory and trailing actions. This
+  // leaves room for a short title beside both translated mode labels.
+  const { isBelow: iconOnly, onLayout } = useContainerWidthBelow(288);
+  return (
+    <View style={styles.leading}>
+      {showDirectoryToggle ? <TopicDirectoryToggle compact={compact} /> : null}
+      <View style={styles.heading} onLayout={onLayout}>
+        <View style={styles.titleSlot}>{children}</View>
+        {modeTarget ? (
+          <View style={styles.mode}>
+            <TopicStreamModeControl
+              serverId={modeTarget.serverId}
+              agentId={modeTarget.agentId}
+              compact={compact}
+              iconOnly={iconOnly}
+            />
+          </View>
+        ) : null}
+      </View>
+    </View>
+  );
+}
 
 const styles = StyleSheet.create((theme) => ({
-  teamButton: { width: "auto", minWidth: 44, paddingHorizontal: theme.spacing[2] },
-  teamLabel: { color: theme.colors.foreground, fontSize: theme.fontSize.sm },
+  leading: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+  },
+  heading: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+  },
+  titleSlot: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  mode: { flexShrink: 0 },
+  title: {
+    fontSize: theme.fontSize.base,
+    fontWeight: theme.fontWeight.medium,
+    color: theme.colors.foreground,
+  },
+  skeleton: {
+    width: 140,
+    maxWidth: "100%",
+    height: 22,
+    borderRadius: theme.borderRadius.full,
+    backgroundColor: theme.colors.surface3,
+    opacity: 0.25,
+  },
 }));
-
-const ThemedUsers = withUnistyles(Users, (theme) => ({ color: theme.colors.foregroundMuted }));

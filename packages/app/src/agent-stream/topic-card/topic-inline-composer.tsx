@@ -1,18 +1,22 @@
 import type { TopicReplyRouteMode } from "@getpaseo/protocol/messages";
 import { MessageSquareReply, Paperclip, Send, X } from "lucide-react-native";
-import { memo, useCallback, useRef, useState } from "react";
+import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { AdaptiveTextInput } from "@/components/adaptive-text-input";
+import { AttachmentFrame, AttachmentThumbnail } from "@/components/attachment-pill";
+import type { EditingTextInputHandle } from "@/components/ui/text-input";
 import { Button } from "@/components/ui/button";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import type { Theme } from "@/styles/theme";
 import { persistAttachmentFromBytes } from "@/attachments/service";
 import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
-import type { UserComposerAttachment } from "@/attachments/types";
+import type { AttachmentMetadata, UserComposerAttachment } from "@/attachments/types";
 import { uploadFileAttachments } from "@/composer/actions";
+import { getWebPasteEditor, useWebImagePaste } from "@/composer/input/use-web-image-paste";
+import { ComposerQuoteCardList } from "@/composer/quote-card";
 import { useFilePicker } from "@/hooks/use-file-picker";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import {
@@ -45,7 +49,12 @@ function InlineAttachmentRow({
   const handleRemove = useCallback(() => onRemove(attachment), [attachment, onRemove]);
   return (
     <View style={styles.editorHeader}>
-      <Text style={styles.targetChip} numberOfLines={1}>
+      {attachment.kind === "image" ? (
+        <AttachmentFrame testID="topic-inline-reply-image-preview">
+          <AttachmentThumbnail metadata={attachment.metadata} />
+        </AttachmentFrame>
+      ) : null}
+      <Text style={styles.attachmentName} numberOfLines={1}>
         {name}
       </Text>
       <Button
@@ -71,6 +80,7 @@ export interface TopicInlineComposerProps {
   leadTitle?: string;
   hasLeadAgent: boolean;
   isSubmitting?: boolean;
+  quoteFocusId?: string;
   /** Returns true only when the message was accepted; false/reject preserves the user's draft and clientMessageId. */
   onSubmitDesktopReply: (
     text: string,
@@ -81,26 +91,32 @@ export interface TopicInlineComposerProps {
   onActivateCompactReply: (routeMode: TopicReplyRouteMode) => void;
 }
 
-export const TopicInlineComposer = memo(function TopicInlineComposer({
-  agentKey,
+export const TopicInlineComposer = memo(function TopicInlineComposer(
+  props: TopicInlineComposerProps,
+) {
+  const draftKey = buildTopicReplyDraftKey({
+    serverId: props.serverId ?? "",
+    workspaceId: props.workspaceId ?? "",
+    agentId: props.agentKey,
+    topicKey: props.topicKey,
+  });
+  return <TopicInlineComposerEditor key={draftKey} draftKey={draftKey} {...props} />;
+});
+
+function TopicInlineComposerEditor({
+  draftKey,
   serverId,
-  workspaceId,
   topicKey,
   leadTitle,
   hasLeadAgent,
   isSubmitting = false,
+  quoteFocusId,
   onSubmitDesktopReply,
   onActivateCompactReply,
-}: TopicInlineComposerProps) {
+}: TopicInlineComposerProps & { draftKey: string }) {
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const [expanded, setExpanded] = useState(false);
-  const draftKey = buildTopicReplyDraftKey({
-    serverId: serverId ?? "",
-    workspaceId: workspaceId ?? "",
-    agentId: agentKey,
-    topicKey,
-  });
   const draft = useTopicStreamViewStore(
     (state) => state.inlineReplyDrafts[draftKey] ?? EMPTY_TOPIC_REPLY_DRAFT,
   );
@@ -115,6 +131,45 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   const { pickFiles } = useFilePicker();
   const client = useHostRuntimeClient(serverId ?? "");
   const hasContent = text.trim().length > 0 || attachments.length > 0;
+  const [webPasteEditor, setWebPasteEditor] = useState<HTMLElement | null>(null);
+  const inputRef = useRef<EditingTextInputHandle | null>(null);
+  const assignInput = useCallback((input: EditingTextInputHandle | null) => {
+    inputRef.current = input;
+    setWebPasteEditor(getWebPasteEditor(input));
+  }, []);
+  useLayoutEffect(() => {
+    if (isCompact || !quoteFocusId) return;
+    setExpanded(true);
+    inputRef.current?.focus();
+  }, [isCompact, quoteFocusId]);
+  const handlePastedImages = useCallback(
+    (images: AttachmentMetadata[]) => {
+      setAttachmentError(null);
+      updateDraft(draftKey, (current) => ({
+        ...current,
+        attachments: [
+          ...current.attachments,
+          ...images.map((metadata) => ({ kind: "image" as const, metadata })),
+        ],
+      }));
+    },
+    [draftKey, updateDraft],
+  );
+  const handlePasteError = useCallback(
+    () => setAttachmentError(t("composer.errors.pasteImageFailed")),
+    [t],
+  );
+  const { isPasting, hasPendingPaste } = useWebImagePaste({
+    editor: webPasteEditor,
+    scope: draftKey,
+    enabled: !isCompact && !isEditorLocked,
+    onImages: handlePastedImages,
+    onError: handlePasteError,
+  });
+  const isAttachmentBusy = isPicking || isPasting;
+  const quotes = attachments.flatMap((attachment, attachmentIndex) =>
+    attachment.kind === "quote" ? [{ ...attachment, attachmentIndex }] : [],
+  );
 
   const effectiveTargetLabel =
     routeMode === "main" || !hasLeadAgent
@@ -140,7 +195,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   }, [draftKey, isSubmitting, updateDraft]);
 
   const addAttachments = useCallback(async () => {
-    if (isSubmitting || isPicking || submitting.current) return;
+    if (isSubmitting || isPicking || submitting.current || hasPendingPaste()) return;
     setIsPicking(true);
     setAttachmentError(null);
     try {
@@ -179,7 +234,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
     } finally {
       setIsPicking(false);
     }
-  }, [client, draftKey, isPicking, isSubmitting, pickFiles, t, updateDraft]);
+  }, [client, draftKey, hasPendingPaste, isPicking, isSubmitting, pickFiles, t, updateDraft]);
 
   const handleOpenCompact = useCallback(() => {
     onActivateCompactReply(routeMode);
@@ -190,7 +245,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   }, []);
 
   const handleSend = useCallback(async () => {
-    if (!hasContent || isSubmitting || isPicking || submitting.current) return;
+    if (!hasContent || isSubmitting || isPicking || submitting.current || hasPendingPaste()) return;
     const trimmed = text.trim();
     const explicitMain = trimmed.startsWith("@主控") || trimmed.startsWith("@main");
     const effectiveMode: TopicReplyRouteMode = explicitMain ? "main" : routeMode;
@@ -226,6 +281,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
     draft,
     draftKey,
     hasContent,
+    hasPendingPaste,
     isPicking,
     isSubmitting,
     onSubmitDesktopReply,
@@ -236,7 +292,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
   ]);
 
   const removeAttachment = useCallback(
-    (attachment: InlineReplyAttachment) => {
+    (attachment: UserComposerAttachment) => {
       if (isSubmitting || submitting.current) return;
       const keepAttachment = (item: UserComposerAttachment) => item !== attachment;
       updateDraft(draftKey, (current) => ({
@@ -245,6 +301,14 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
       }));
     },
     [draftKey, isSubmitting, updateDraft],
+  );
+
+  const removeQuote = useCallback(
+    (attachmentIndex: number) => {
+      const attachment = attachments[attachmentIndex];
+      if (attachment?.kind === "quote") removeAttachment(attachment);
+    },
+    [attachments, removeAttachment],
   );
 
   const handleTriggerSend = useCallback(() => {
@@ -311,6 +375,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           </PressHighlight>
         ) : null}
       </View>
+      <ComposerQuoteCardList quotes={quotes} disabled={isEditorLocked} onRemove={removeQuote} />
       {attachments.map((attachment) => {
         if (attachment.kind !== "image" && attachment.kind !== "file") return null;
         const id = attachment.kind === "image" ? attachment.metadata.id : attachment.attachment.id;
@@ -330,6 +395,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
       ) : null}
       <View style={styles.inputRow}>
         <AdaptiveTextInput
+          ref={assignInput}
           initialValue={text}
           resetKey={inputResetKey}
           onChangeText={handleChangeText}
@@ -344,7 +410,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
           size="sm"
           variant="ghost"
           accessibilityLabel={t("composer.attachments.addFile")}
-          disabled={isEditorLocked || isPicking}
+          disabled={isEditorLocked || isAttachmentBusy}
           onPress={addAttachments}
           testID={`topic-inline-reply-attach-${topicKey}`}
         >
@@ -353,7 +419,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
         <Button
           size="sm"
           variant="default"
-          disabled={isEditorLocked || isPicking || !hasContent}
+          disabled={isEditorLocked || isAttachmentBusy || !hasContent}
           onPress={handleTriggerSend}
           testID={`topic-inline-reply-send-${topicKey}`}
         >
@@ -363,7 +429,7 @@ export const TopicInlineComposer = memo(function TopicInlineComposer({
       </View>
     </View>
   );
-});
+}
 
 const styles = StyleSheet.create((theme) => ({
   collapsedRow: {
@@ -393,6 +459,12 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
+  },
+  attachmentName: {
+    flex: 1,
+    minWidth: 0,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
   expandedBox: {
     gap: theme.spacing[1.5],

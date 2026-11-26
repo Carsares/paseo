@@ -131,6 +131,7 @@ const storedEntrySchema = TopicThreadEntrySchema.extend({
   followupSuppressed: z.boolean().optional(),
   delivery: deliverySchema.optional(),
   retryOfEntryId: z.string().optional(),
+  retryAttachments: z.array(AgentAttachmentSchema).optional(),
 });
 type StoredEntry = z.infer<typeof storedEntrySchema>;
 const entriesSchema = z.array(storedEntrySchema);
@@ -270,11 +271,21 @@ function requireDecisionClaim(
 const pendingByFile = new Map<string, Promise<void>>();
 const activeEntries = new Set<string>();
 
+function couldHaveHandedOff(entry: StoredEntry) {
+  // A retry needs a durable marker that rules out a prior handoff. Older first
+  // attempts only wrote the running status after the turn started.
+  return entry.retryOfEntryId
+    ? entry.status !== "queued" || entry.handoffPending !== false
+    : entry.handoffPending === true ||
+        (entry.handoffPending === undefined && entry.status === "running");
+}
+
 function publicEntry({
   handoffPending: _,
   followupSuppressed: _suppressed,
   delivery: _delivery,
   retryOfEntryId: _retry,
+  retryAttachments: _retryAttachments,
   ...entry
 }: StoredEntry): TopicThreadEntry {
   return entry;
@@ -554,7 +565,13 @@ export class TopicThreadStore {
         ({ input }) =>
           sameThreadScope(input, scope) && input.clientMessageId === root.sourceMessageId,
       );
-      return { entry: publicEntry(found), delivery: root.delivery, decision, promoted: !exact };
+      return {
+        entry: publicEntry(found),
+        delivery: root.delivery,
+        retryAttachments: found.retryAttachments,
+        decision,
+        promoted: !exact,
+      };
     });
   }
 
@@ -565,11 +582,13 @@ export class TopicThreadStore {
     delivery?: TopicDelivery,
     retryOfEntryId?: string,
     retryTasks?: readonly TopicTaskBinding[],
+    retryAttachments?: TopicDelivery["attachments"],
   ): Promise<{
     entry: TopicThreadEntry;
     changed: boolean;
     release?: () => void;
     sourceUpdate?: TopicThreadEntry;
+    retryAttachments?: TopicDelivery["attachments"];
   }> {
     return this.run(followup.workspaceId, async (data, file) => {
       const retry = retryOfEntryId
@@ -589,6 +608,7 @@ export class TopicThreadStore {
           wasAccepted,
           assertCurrent,
           selected.retryOfEntryId,
+          retryAttachments,
         );
       }
       const index = entries.findIndex(
@@ -608,6 +628,7 @@ export class TopicThreadStore {
           wasAccepted,
           assertCurrent,
           retryOfEntryId,
+          retryAttachments,
         );
       }
       const entry = this.newEntry(data, { ...followup, role: "user_followup" }, "queued");
@@ -618,6 +639,7 @@ export class TopicThreadStore {
         handoffPending: false,
         delivery: source ? undefined : delivery,
         retryOfEntryId,
+        retryAttachments: source && retryAttachments,
       });
       if (source) {
         source.retryable = false;
@@ -630,6 +652,7 @@ export class TopicThreadStore {
         changed: true,
         release: this.claim(file, entry),
         sourceUpdate: source && publicEntry(source),
+        retryAttachments: source && retryAttachments,
       };
     });
   }
@@ -642,6 +665,7 @@ export class TopicThreadStore {
     wasAccepted: ((entry: TopicThreadEntry) => Promise<boolean>) | undefined,
     assertCurrent: (() => void) | undefined,
     retryOfEntryId: string | undefined,
+    retryAttachments: TopicDelivery["attachments"],
   ) {
     const previous = data.entries[index];
     const now = new Date().toISOString();
@@ -652,16 +676,11 @@ export class TopicThreadStore {
     if (previous.status === "completed" || previous.status === "error" || activeEntries.has(key))
       return { entry: publicEntry(previous), changed: false };
 
-    // A retry attempt is recoverable only with a durable marker that rules out a prior handoff.
-    // For older first attempts, running was only written after the turn started.
-    const couldHaveHandedOff = previous.retryOfEntryId
-      ? previous.status !== "queued" || previous.handoffPending !== false
-      : previous.handoffPending === true ||
-        (previous.handoffPending === undefined && previous.status === "running");
-    const receipt = couldHaveHandedOff ? undefined : await wasAccepted?.(publicEntry(previous));
-    if (previous.retryOfEntryId && !couldHaveHandedOff && receipt === undefined)
+    const possibleHandoff = couldHaveHandedOff(previous);
+    const receipt = possibleHandoff ? undefined : await wasAccepted?.(publicEntry(previous));
+    if (previous.retryOfEntryId && !possibleHandoff && receipt === undefined)
       throw new Error("The original delivery cannot be retried safely.");
-    const handedOff = couldHaveHandedOff || receipt === true;
+    const handedOff = possibleHandoff || receipt === true;
     const entry = publicEntry({
       ...previous,
       ...(handedOff
@@ -669,10 +688,22 @@ export class TopicThreadStore {
         : { status: "queued", routedAgentId: followup.routedAgentId }),
       updatedAt: now,
     });
-    data.entries[index] = { ...previous, ...entry, handoffPending: handedOff ? undefined : false };
+    const savedRetryAttachments =
+      previous.retryAttachments ?? (!handedOff && retryOfEntryId ? retryAttachments : undefined);
+    data.entries[index] = {
+      ...previous,
+      ...entry,
+      handoffPending: handedOff ? undefined : false,
+      retryAttachments: savedRetryAttachments,
+    };
     assertCurrent?.();
     await writeJsonFileAtomic(file, data);
-    return { entry, changed: true, release: handedOff ? undefined : this.claim(file, entry) };
+    return {
+      entry,
+      changed: true,
+      release: handedOff ? undefined : this.claim(file, entry),
+      retryAttachments: savedRetryAttachments,
+    };
   }
 
   private claim(file: string, entry: TopicThreadEntry): () => void {
@@ -692,6 +723,18 @@ export class TopicThreadStore {
     await this.changeQueued(workspaceId, entryId, (entry) => ({
       ...entry,
       handoffPending: pending,
+    }));
+  }
+
+  setImageAttachments(
+    workspaceId: string,
+    entryId: string,
+    imageAttachments: NonNullable<TopicThreadEntry["imageAttachments"]>,
+  ): Promise<TopicThreadEntry> {
+    return this.changeQueued(workspaceId, entryId, (entry) => ({
+      ...entry,
+      imageAttachments,
+      updatedAt: new Date().toISOString(),
     }));
   }
 

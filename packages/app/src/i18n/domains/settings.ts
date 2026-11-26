@@ -176,3 +176,26 @@ export const proxySettingsCopy = {
     saveFailed: "无法确认代理设置是否已保存，请重新测试连接后再保存。",
   },
 } satisfies Record<"en" | "zh-CN", ProxySettingsCopy>;
+
+const userMessageAlignmentCopy = {
+  en: {
+    label: "Your message alignment",
+    description: "Align your messages in topic cards and the full timeline.",
+    left: "Left",
+    right: "Right",
+    moveLeft: "Align my messages left",
+    moveRight: "Align my messages right",
+  },
+  zh: {
+    label: "我的消息对齐方式",
+    description: "调整我的消息在话题卡和完整时间线中的对齐方式。",
+    left: "靠左",
+    right: "靠右",
+    moveLeft: "我的消息靠左",
+    moveRight: "我的消息靠右",
+  },
+};
+
+export function getUserMessageAlignmentCopy(language: string | undefined) {
+  return userMessageAlignmentCopy[language?.startsWith("zh") ? "zh" : "en"];
+}

@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
@@ -8,7 +8,9 @@ import {
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
+import { FileTransferOpcode } from "@getpaseo/protocol/binary-frames/index";
 import type {
+  UploadedFileAttachment,
   WorkspaceTopicReplyRequest,
   WorkspaceTopicThreadUpdatedMessage,
 } from "@getpaseo/protocol/messages";
@@ -18,9 +20,14 @@ import { AgentManager } from "../agent/agent-manager.js";
 import type { AgentSession } from "../agent/agent-sdk-types.js";
 import { AgentStorage } from "../agent/agent-storage.js";
 import { WorkspaceTaskLedgerStore } from "../agent/task-ledger/index.js";
+import { FileUploadStore } from "../file-upload/index.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTopicPromptDispatcher, createTopicReplyRouter } from "./reply-router.js";
 import { TopicThreadStore } from "./store.js";
+import type { TopicUploadAccess } from "./uploaded-attachments.js";
+
+const pngData =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 const request: WorkspaceTopicReplyRequest = {
   type: "workspace.topic.reply.request",
@@ -49,6 +56,49 @@ afterEach(async () => {
   await router?.close();
   await rm(home, { recursive: true, force: true });
 });
+
+async function uploadFile(fileName: string, mimeType: string, bytes: Buffer, owner?: string) {
+  const uploads = new FileUploadStore({ paseoHome: home });
+  const requestId = "upload-request";
+  const size = bytes.byteLength;
+  const modifiedAt = new Date(0).toISOString();
+  uploads.beginUpload(
+    {
+      type: "file.upload.request",
+      requestId,
+      fileName,
+      mimeType,
+      size,
+      modifiedAt,
+    },
+    undefined,
+    undefined,
+    owner,
+  );
+  const empty = new Uint8Array();
+  await uploads.receiveFrame({
+    opcode: FileTransferOpcode.FileBegin,
+    requestId,
+    metadata: { mime: mimeType, fileName, size, modifiedAt, encoding: "binary" },
+    payload: empty,
+  });
+  await uploads.receiveFrame({ opcode: FileTransferOpcode.FileChunk, requestId, payload: bytes });
+  const result = await uploads.receiveFrame({
+    opcode: FileTransferOpcode.FileEnd,
+    requestId,
+    payload: empty,
+  });
+  const file = result?.payload.file;
+  if (!file) throw new Error(result?.payload.error ?? "Upload failed.");
+  return file;
+}
+
+function uploadAccess(...registered: UploadedFileAttachment[]): TopicUploadAccess {
+  return {
+    uploadsRoot: join(home, "uploads"),
+    lookup: async (id) => registered.find((file) => file.id === id) ?? null,
+  };
+}
 
 function setup(
   options: {
@@ -590,7 +640,7 @@ function giveFirstAssistantChunkId(session: AgentSession, messageId: string) {
   );
 }
 
-test("mirrors an accepted turn and does not resend it when recovering a legacy queued entry", async () => {
+test("dispatches the registered image to the agent and does not resend an accepted turn", async () => {
   const logger = createTestLogger();
   const agentStorage = new AgentStorage(join(home, "agents"), logger);
   const onStartTurn = vi.fn();
@@ -640,14 +690,30 @@ test("mirrors an accepted turn and does not resend it when recovering a legacy q
     });
   router = openRouter();
   try {
-    expect((await router.reply(followup)).payload).toMatchObject({
+    const attachment = await uploadFile(
+      "screenshot.png",
+      "image/png",
+      Buffer.from(pngData, "base64"),
+    );
+    const { id, fileName, mimeType, size } = attachment;
+    const imageAttachments = [{ id, fileName, mimeType, size }];
+    expect(
+      (
+        await router.reply(
+          { ...followup, attachments: [attachment] },
+          undefined,
+          true,
+          uploadAccess(attachment),
+        )
+      ).payload,
+    ).toMatchObject({
       error: null,
       targetAgentId: lead.id,
     });
     await vi.waitFor(async () => {
       const entries = await store.list(followup, followup.topicKey);
       expect(entries).toMatchObject([
-        { role: "user_followup", status: "completed" },
+        { role: "user_followup", status: "completed", imageAttachments },
         {
           role: "agent_reply",
           authorAgentId: lead.id,
@@ -660,10 +726,23 @@ test("mirrors an accepted turn and does not resend it when recovering a legacy q
     expect(agentManager.getTimeline(lead.id)).toContainEqual(
       expect.objectContaining({
         type: "user_message",
+        imageAttachments,
         text: expect.stringContaining(
           '<paseo-topic-context task-id="task" root-message-id="root">',
         ),
       }),
+    );
+    expect(onStartTurn).toHaveBeenCalledWith(
+      [
+        {
+          type: "text",
+          text: expect.stringContaining(
+            '<paseo-topic-context task-id="task" root-message-id="root">',
+          ),
+        },
+        { type: "image", mimeType: "image/png", data: pngData },
+      ],
+      expect.anything(),
     );
     await router.close();
     const [accepted] = await store.list(followup);
@@ -857,7 +936,48 @@ test("backfills a historical stand-alone first question from the reply request w
   );
 });
 
-test("retries only a confirmed rejected operation, using its stored attachment and route", async () => {
+test.each([
+  "unregistered",
+  "path mismatch",
+  "symlink",
+  "size mismatch",
+  "oversized image",
+  "wrong contents",
+] as const)("does not dispatch an upload with %s", async (reason) => {
+  const { dispatch } = setup();
+  const bytes = Buffer.from(pngData, "base64");
+  let file = await uploadFile(
+    "picture.png",
+    "image/png",
+    reason === "wrong contents" ? Buffer.from("not an image") : bytes,
+  );
+  const outside = join(home, "not-an-upload.png");
+  await writeFile(outside, bytes);
+  if (reason === "symlink") {
+    const dir = dirname(file.path);
+    const replacement = join(home, "not-an-upload-dir");
+    await mkdir(replacement);
+    await writeFile(join(replacement, file.fileName), bytes);
+    await rm(dir, { recursive: true });
+    await symlink(replacement, dir, "junction");
+  }
+  if (reason === "size mismatch") await truncate(file.path, file.size + 1);
+  if (reason === "oversized image") {
+    file = { ...file, size: 50 * 1024 * 1024 + 1 };
+    await truncate(file.path, file.size);
+  }
+  const claimed = reason === "path mismatch" ? { ...file, path: outside } : file;
+  const access = reason === "unregistered" ? uploadAccess() : uploadAccess(file);
+
+  expect(
+    (await router.reply({ ...request, attachments: [claimed] }, undefined, true, access)).payload
+      .entry,
+  ).toBeTruthy();
+  await vi.waitFor(async () => expect((await store.list(request))[0]?.status).toBe("error"));
+  expect(dispatch).not.toHaveBeenCalled();
+});
+
+test("retries only a confirmed rejected operation, using its stored attachments and route", async () => {
   const { dispatch, broadcast } = setup();
   await ledger.upsert(request.workspaceId, {
     taskId: "task",
@@ -865,25 +985,25 @@ test("retries only a confirmed rejected operation, using its stored attachment a
     rootMessageId: "root",
     leadAgentId: "lead",
   });
-  const attachment = {
-    type: "uploaded_file",
-    id: "upload",
-    path: "/uploads/retained-image.png",
-    fileName: "retained-image.png",
-    size: 5,
-    mimeType: "image/png",
-  } as const;
+  const attachment = await uploadFile("notes.txt", "text/plain", Buffer.from("notes"));
+  const image = await uploadFile("retained-image.png", "image/png", Buffer.from(pngData, "base64"));
+  const access = uploadAccess(attachment, image);
   dispatch.mockImplementationOnce(async ({ onHandoff }) => {
     await onHandoff(true);
     await onHandoff(false);
     throw new Error("Provider declined");
   });
-  const original = await router.reply({
-    ...request,
-    text: "[attachment]",
-    routeMode: "lead",
-    attachments: [attachment],
-  });
+  const original = await router.reply(
+    {
+      ...request,
+      text: "[attachment]",
+      routeMode: "lead",
+      attachments: [attachment, image],
+    },
+    undefined,
+    true,
+    access,
+  );
   const originalId = original.payload.entry?.entryId;
   if (!originalId) throw new Error("Missing original entry");
   await vi.waitFor(async () =>
@@ -900,28 +1020,218 @@ test("retries only a confirmed rejected operation, using its stored attachment a
     taskId: "different",
     attachments: [{ ...attachment, path: "/uploads/other.png" }],
   };
+  const retryReply = (payload: WorkspaceTopicReplyRequest) =>
+    router.reply(payload, undefined, true, access);
   expect(
-    (await router.reply({ ...retry, topicKey: "a-different-topic" })).payload.error,
+    (await retryReply({ ...retry, topicKey: "a-different-topic" })).payload.error,
   ).toBeTruthy();
   restarted.mockRejectedValueOnce(new Error("Could not open the provider"));
-  const [first, repeat] = await Promise.all([router.reply(retry), router.reply(retry)]);
+  const [first, repeat] = await Promise.all([retryReply(retry), retryReply(retry)]);
   expect(first.payload.entry?.entryId).toBeTruthy();
   expect(repeat.payload.entry?.entryId).toBe(first.payload.entry?.entryId);
   await vi.waitFor(async () => expect((await store.list(request))[0]?.retryable).toBe(true));
-  expect((await router.reply({ ...retry, clientMessageId: "retry-two" })).payload.error).toBeNull();
+  expect((await retryReply({ ...retry, clientMessageId: "retry-two" })).payload.error).toBeNull();
   await vi.waitFor(async () => expect((await store.list(request))[2]?.status).toBe("completed"));
   expect(
-    (await router.reply({ ...retry, clientMessageId: "retry-three" })).payload.error,
+    (await retryReply({ ...retry, clientMessageId: "retry-three" })).payload.error,
   ).toBeTruthy();
   expect(restarted).toHaveBeenCalledTimes(2);
   for (const [send] of restarted.mock.calls) {
     expect(send.agentId).toBe("lead");
     expect(send.prompt).toContainEqual(attachment);
+    expect(send.prompt).toContainEqual({ type: "image", mimeType: "image/png", data: pngData });
     expect(JSON.stringify(send.prompt)).not.toContain("Ignore this text");
   }
   expect(JSON.stringify(broadcast.mock.calls)).not.toContain(attachment.path);
   expect(JSON.stringify(await store.list(request))).not.toContain(attachment.path);
 });
+
+test.each(["missing receipt", "other owner"] as const)(
+  "only replaces attachments without a host receipt (%s)",
+  async (scenario) => {
+    const { dispatch } = setup();
+    const png = Buffer.from(pngData, "base64");
+    const legacy = await uploadFile(
+      "picture.png",
+      "image/png",
+      png,
+      scenario === "other owner" ? "other-owner" : undefined,
+    );
+    const kept = await uploadFile("notes.txt", "text/plain", Buffer.from("notes"), "owner");
+    const uploads = new FileUploadStore({ paseoHome: home });
+    const owner = uploads.getUploadAccess("owner");
+    const original = await store.begin(
+      {
+        ...request,
+        sourceMessageId: request.clientMessageId,
+        routedAgentId: "main",
+        origin: "topic_reply",
+      },
+      undefined,
+      undefined,
+      { attachments: [legacy, kept] },
+    );
+    await store.update(request.workspaceId, original.entry.entryId, "error");
+    original.release?.();
+
+    const retry = {
+      ...request,
+      retryOfEntryId: original.entry.entryId,
+      clientMessageId: "retry-upload",
+      text: "Ignore replacement text",
+    };
+    const send = (changes?: Partial<WorkspaceTopicReplyRequest>) =>
+      router.reply({ ...retry, ...changes }, undefined, true, owner);
+    const missing = await send();
+    expect(missing.payload.entry).toBeNull();
+    expect(missing.payload.error).toBe(
+      scenario === "missing receipt"
+        ? 'topic_attachments_reupload_required:["picture.png"]'
+        : "Could not queue topic reply.",
+    );
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await store.list(request)).toHaveLength(1);
+
+    const replacement = await uploadFile("picture.png", "image/png", png, "owner");
+    if (scenario === "other owner") {
+      expect((await send({ attachments: [replacement] })).payload.error).toBeTruthy();
+      expect(dispatch).not.toHaveBeenCalled();
+      return;
+    }
+    expect((await send({ attachments: [replacement, kept] })).payload.error).toBe(
+      missing.payload.error,
+    );
+    expect((await send({ attachments: [kept] })).payload.error).toBe(missing.payload.error);
+    expect(
+      (await send({ attachments: [{ ...replacement, path: legacy.path }] })).payload.error,
+    ).toBeTruthy();
+    const invalid = await uploadFile("picture.png", "image/png", Buffer.alloc(png.length), "owner");
+    expect((await send({ attachments: [invalid] })).payload.entry).toBeNull();
+    expect(await store.list(request)).toHaveLength(1);
+
+    const hold = Promise.withResolvers<void>();
+    dispatch.mockImplementationOnce(async ({ onStarted }) => {
+      await hold.promise;
+      await onStarted();
+      return { touchedFiles: [] };
+    });
+    const [first, duplicate] = await Promise.all([
+      send({ attachments: [replacement] }),
+      send({ attachments: [replacement] }),
+    ]);
+    hold.resolve();
+    expect(first.payload.entry).toMatchObject({
+      text: request.text,
+      rootMessageId: request.rootMessageId,
+    });
+    expect(duplicate.payload.entry?.entryId).toBe(first.payload.entry?.entryId);
+    await vi.waitFor(async () => expect((await store.list(request))[1]?.status).toBe("completed"));
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch.mock.calls[0][0].prompt).toEqual([
+      { type: "text", text: expect.stringContaining(request.text) },
+      { type: "image", mimeType: "image/png", data: pngData },
+      kept,
+    ]);
+    expect((await send()).payload.entry?.entryId).toBe(first.payload.entry?.entryId);
+    expect(dispatch).toHaveBeenCalledOnce();
+  },
+);
+
+test.each(["same request ID", "saved attempt ID"] as const)(
+  "restores a reuploaded attachment from disk after reopening (%s)",
+  async (resumeBy) => {
+    const { dispatch } = setup();
+    const png = Buffer.from(pngData, "base64");
+    const legacy = await uploadFile("picture.png", "image/png", png);
+    const replacement = await uploadFile("picture.png", "image/png", png, "owner");
+    const otherReplacement = await uploadFile("picture.png", "image/png", png, "owner");
+    const kept = await uploadFile("notes.txt", "text/plain", Buffer.from("notes"), "owner");
+    const original = await store.begin(
+      {
+        ...request,
+        sourceMessageId: request.clientMessageId,
+        routedAgentId: "main",
+        origin: "topic_reply",
+      },
+      undefined,
+      undefined,
+      { attachments: [legacy, kept] },
+    );
+    await store.update(request.workspaceId, original.entry.entryId, "error");
+    original.release?.();
+
+    const beforeHandoff = Promise.withResolvers<void>();
+    dispatch.mockImplementationOnce(async ({ signal }) => {
+      beforeHandoff.resolve();
+      if (!signal.aborted)
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      signal.throwIfAborted();
+      return { touchedFiles: [] };
+    });
+    const retryRequest = {
+      ...request,
+      retryOfEntryId: original.entry.entryId,
+      clientMessageId: "recover-upload",
+      text: "Ignore new text",
+    };
+    const first = await router.reply(
+      { ...retryRequest, attachments: [replacement] },
+      undefined,
+      true,
+      new FileUploadStore({ paseoHome: home }).getUploadAccess("owner"),
+    );
+    expect(first.payload.entry).toMatchObject({ status: "queued" });
+    const attempt = first.payload.entry!;
+    await beforeHandoff.promise;
+    await router.close();
+
+    store = new TopicThreadStore(home);
+    ledger = new WorkspaceTaskLedgerStore(home);
+    const { dispatch: restarted, broadcast } = setup();
+    Object.assign(restarted, { wasAccepted: vi.fn(async () => false) });
+    const access = new FileUploadStore({ paseoHome: home }).getUploadAccess("owner");
+    const lookup = vi.spyOn(access, "lookup");
+    const resume =
+      resumeBy === "same request ID"
+        ? retryRequest
+        : {
+            ...retryRequest,
+            retryOfEntryId: attempt.entryId,
+            clientMessageId: "new-click",
+            attachments: [otherReplacement],
+          };
+    expect(restarted).not.toHaveBeenCalled();
+    const results = await Promise.all([
+      router.reply(resume, undefined, true, access),
+      router.reply(resume, undefined, true, access),
+    ]);
+    for (const { payload } of results) {
+      expect(payload.error).toBeNull();
+      expect(payload.entry).toMatchObject({
+        entryId: attempt.entryId,
+        sourceMessageId: "recover-upload",
+        text: request.text,
+      });
+    }
+    await vi.waitFor(async () => expect((await store.list(request))[1]?.status).toBe("completed"));
+    expect(restarted).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        messageId: "recover-upload",
+        prompt: [
+          { type: "text", text: expect.stringContaining('root-message-id="root"') },
+          { type: "image", mimeType: "image/png", data: pngData },
+          kept,
+        ],
+      }),
+    );
+    expect(lookup).toHaveBeenCalledWith(replacement.id);
+    expect(lookup).not.toHaveBeenCalledWith(otherReplacement.id);
+    expect(lookup).not.toHaveBeenCalledWith(legacy.id);
+    expect(JSON.stringify(broadcast.mock.calls)).not.toContain(replacement.path);
+  },
+);
 
 test("reopens an uncertain handoff without offering a new execution", async () => {
   const { dispatch } = setup();
@@ -968,16 +1278,11 @@ test.each([
     const initial = bindsAfterRestart
       ? { ...request, topicKey: "msg:root", taskId: undefined }
       : request;
-    const attachment = {
-      type: "uploaded_file",
-      id: "upload",
-      path: "/uploads/retained.png",
-      fileName: "retained.png",
-      size: 5,
-      mimeType: "image/png",
-    } as const;
+    const attachment = await uploadFile("retained.txt", "text/plain", Buffer.from("notes"));
+    const retryReply = (payload: WorkspaceTopicReplyRequest) =>
+      router.reply(payload, undefined, true, uploadAccess(attachment));
     dispatch.mockRejectedValueOnce(new Error("Provider declined before handoff"));
-    const original = (await router.reply({ ...initial, attachments: [attachment] })).payload.entry!;
+    const original = (await retryReply({ ...initial, attachments: [attachment] })).payload.entry!;
     await vi.waitFor(async () => expect((await store.list(request))[0]?.retryable).toBe(true));
     const paused = Promise.withResolvers<void>();
     dispatch.mockImplementationOnce(async ({ onHandoff, signal }) => {
@@ -993,8 +1298,11 @@ test.each([
       retryOfEntryId: original.entryId,
       clientMessageId: "persisted-retry",
     };
-    const queued = (await router.reply(retryRequest)).payload.entry!;
+    const queued = (await retryReply(retryRequest)).payload.entry!;
     expect(queued).toMatchObject({ status: "queued", sourceMessageId: "persisted-retry" });
+    expect(
+      (await store.getDelivery(initial, { entryId: queued.entryId }))?.retryAttachments,
+    ).toBeUndefined();
     await paused.promise;
     const listRequest = {
       workspaceId: request.workspaceId,
@@ -1036,7 +1344,7 @@ test.each([
     if (canResume) {
       const results = await Promise.all(
         ["new-click", "repeat-click"].map((clientMessageId) =>
-          router.reply({ ...resume, clientMessageId }),
+          retryReply({ ...resume, clientMessageId }),
         ),
       );
       for (const { payload } of results) {
@@ -1055,8 +1363,8 @@ test.each([
       expect(JSON.stringify(send.prompt)).toContain(request.text);
       expect(JSON.stringify(send.prompt)).not.toContain(resume.text);
     } else {
-      await router.reply({ ...resume, clientMessageId: "new-click" });
-      await router.reply(retryRequest);
+      await retryReply({ ...resume, clientMessageId: "new-click" });
+      await retryReply(retryRequest);
       expect(restarted).not.toHaveBeenCalled();
     }
     expect(

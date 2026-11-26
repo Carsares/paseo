@@ -19,16 +19,25 @@ import { PaneProvider, type PaneContextValue } from "@/panels/pane-context";
 import { encodeImages } from "@/utils/encode-images";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { createWorkspaceSheetStack } from "@/screens/workspace/sheet-pane/stack";
+import { useDraftStore } from "@/stores/draft-store";
 import { useSessionStore } from "@/stores/session-store";
 import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
-import { buildTopicAgentKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import {
+  buildTopicAgentKey,
+  buildTopicReplyDraftKey,
+  useTopicStreamViewStore,
+} from "@/stores/topic-stream-view-store";
 import {
   createTeamMessageJumpStore,
   TeamMessageJumpProvider,
 } from "@/subagents/team-directory/message-jump-store";
 import { TeamDirectoryShellProvider } from "@/subagents/team-directory/shell-context";
 import { workspaceTopicReadQueryKey } from "@/topic-read/queries";
-import { applyTopicAnchorToCache, workspaceTopicEntriesQueryKey } from "@/topic-threads/queries";
+import {
+  applyTopicAnchorToCache,
+  workspaceTopicAnchorsQueryKey,
+  workspaceTopicEntriesQueryKey,
+} from "@/topic-threads/queries";
 import type { StreamItem } from "@/types/stream";
 import {
   topicMatchesScrollTarget,
@@ -91,6 +100,7 @@ function seedSession(options: {
   supportsTaskLedger?: boolean;
   supportsDurableItems?: boolean;
   requiresAttention?: boolean;
+  workspaceDirectory?: string;
 }) {
   const agents = new Map([
     [
@@ -132,8 +142,21 @@ function seedSession(options: {
         agentStreamHead: new Map(),
         agentStreamTail: new Map(),
         agentTimelineOlderFetchInFlight: new Map(),
+        queuedMessages: new Map(),
         pendingPermissions: new Map(),
-        workspaces: new Map(),
+        workspaces: new Map(
+          options.workspaceDirectory
+            ? [
+                [
+                  WORKSPACE_ID,
+                  {
+                    workspaceId: WORKSPACE_ID,
+                    workspaceDirectory: options.workspaceDirectory,
+                  },
+                ],
+              ]
+            : [],
+        ),
         serverInfo: {
           features: {
             workspaceTopicThreads: options.supportsTopicThreads,
@@ -231,6 +254,150 @@ describe("TopicStreamList & read-watermark integration", () => {
     cleanup();
     vi.restoreAllMocks();
   });
+
+  it("previews topic images through the host's authenticated file API", async () => {
+    const workspaceDirectory = "/workspace/topic";
+    seedSession({ supportsTopicThreads: true, supportsTopicReadState: false, workspaceDirectory });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const image = {
+      id: "upload_58cc15d3-4380-4726-bf78-603537c9b213",
+      fileName: "example.png",
+      mimeType: "image/png",
+      size: 4,
+    };
+    qc.setQueryData(workspaceTopicAnchorsQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), [
+      {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "msg:m-1",
+        rootMessageId: "m-1",
+        rootPromptText: "Check API latency spike",
+        imageAttachments: [image],
+        createdAt: new Date(1000).toISOString(),
+        updatedAt: new Date(1000).toISOString(),
+      },
+    ]);
+    const readFile = vi.fn().mockResolvedValue({
+      bytes: Uint8Array.of(1, 2, 3, 4),
+      mime: image.mimeType,
+      size: image.size,
+    });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: {
+        readFile,
+        listWorkspaceTopicEntries: vi.fn().mockResolvedValue({ entries: [], error: null }),
+      },
+    } as never);
+    const streamItems = makeStreamItems();
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={streamItems}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    await vi.waitFor(() =>
+      expect(readFile).toHaveBeenCalledExactlyOnceWith(
+        workspaceDirectory,
+        `paseo-attachment:${image.id}`,
+        undefined,
+        image.size,
+      ),
+    );
+    expect(
+      await screen.findByRole("button", { name: "composer.attachments.openImage" }),
+    ).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "quotes only into the selected topic draft (compact=%s)",
+    async (compact) => {
+      mockIsCompactFormFactor = compact;
+      seedSession({ supportsTopicThreads: true, supportsTopicReadState: true });
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const scope = { serverId: SERVER_ID, workspaceId: WORKSPACE_ID };
+      const agentKey = buildTopicAgentKey(SERVER_ID, MAIN_AGENT_ID);
+      const topicKey = "msg:m-1";
+      const compactDraftKey = buildTopicReplyDraftKey({
+        ...scope,
+        agentId: MAIN_AGENT_ID,
+        topicKey,
+      });
+      const desktopDraftKey = buildTopicReplyDraftKey({ ...scope, agentId: agentKey, topicKey });
+      const siblingDraftKey = buildTopicReplyDraftKey({
+        ...scope,
+        agentId: agentKey,
+        topicKey: "msg:m-2",
+      });
+      const focus = vi.fn(() => {
+        expect(
+          useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey]?.topicKey,
+        ).toBe(topicKey);
+      });
+      render(
+        <QueryClientProvider client={qc}>
+          <PaneProvider value={makePaneContextValue()}>
+            <TopicStreamList
+              {...scope}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={[
+                ...makeStreamItems(),
+                {
+                  kind: "user_message",
+                  id: "u-2",
+                  messageId: "m-2",
+                  text: "Another topic",
+                  timestamp: new Date(3_000),
+                  timelineCursor: { epoch: "ep-1", seq: 3 },
+                },
+              ]}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={false}
+              onFocusCompactComposer={focus}
+            />
+          </PaneProvider>
+        </QueryClientProvider>,
+      );
+      fireEvent.click(await screen.findByTestId("topic-reply-quote-a-1"));
+      const attachment = { kind: "quote", text: expect.stringContaining("Investigating now") };
+      try {
+        const topicState = useTopicStreamViewStore.getState();
+        expect(topicState.inlineReplyDrafts[siblingDraftKey]).toBeUndefined();
+        if (compact) {
+          expect(focus).toHaveBeenCalledOnce();
+          expect(topicState.inlineReplyDrafts[desktopDraftKey]).toBeUndefined();
+          expect(useDraftStore.getState().getDraftInput(compactDraftKey)?.attachments).toEqual([
+            expect.objectContaining(attachment),
+          ]);
+        } else {
+          expect(focus).not.toHaveBeenCalled();
+          expect(topicState.activeReplyTopicByAgentKey[agentKey]).toBeUndefined();
+          expect(topicState.inlineReplyDrafts[desktopDraftKey]?.attachments).toEqual([
+            expect.objectContaining(attachment),
+          ]);
+          expect(document.activeElement).toBe(
+            screen.getByTestId(`topic-inline-reply-input-${topicKey}`),
+          );
+        }
+      } finally {
+        if (compact) useDraftStore.getState().clearDraftInput({ draftKey: compactDraftKey });
+      }
+    },
+  );
 
   it("mounts the full TopicStreamList canvas with real Zustand 5 stores without unstable snapshot loops", () => {
     seedSession({ supportsTopicThreads: true, supportsTopicReadState: true });
@@ -458,75 +625,130 @@ describe("TopicStreamList & read-watermark integration", () => {
     expect(markWorkspaceTopicRead.mock.calls[0]?.[0]).not.toHaveProperty("seq");
   });
 
-  it("resends an unacknowledged retry with the same ID and allocates a new ID after definite refusal", async () => {
-    seedSession({ supportsTopicThreads: true, supportsTopicReadState: false });
-    const replyWorkspaceTopic = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("No acknowledgement"))
-      .mockResolvedValueOnce({ error: "Refused", entry: null })
-      .mockResolvedValueOnce({ error: null, entry: null });
-    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
-      connectionStatus: "online",
-      client: { replyWorkspaceTopic },
-    } as never);
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const entry: TopicThreadEntry = {
-      entryId: "safe-entry",
-      workspaceId: WORKSPACE_ID,
-      mainAgentId: MAIN_AGENT_ID,
-      role: "user_followup",
-      topicKey: "msg:m-1",
-      rootMessageId: "m-1",
-      routedAgentId: MAIN_AGENT_ID,
-      text: "[attachment]",
-      status: "error",
-      retryable: true,
-      seq: 1,
-      createdAt: new Date(3000).toISOString(),
-      updatedAt: new Date(3000).toISOString(),
-    };
-    qc.setQueryData(workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), [
-      entry,
-      { ...entry, entryId: "unknown-entry", retryable: false, seq: 2 },
-    ]);
-    const onErrorToast = vi.fn();
-    const list = (
-      <QueryClientProvider client={qc}>
-        <PaneProvider value={makePaneContextValue()}>
-          <TopicStreamList
-            serverId={SERVER_ID}
-            workspaceId={WORKSPACE_ID}
-            mainAgentId={MAIN_AGENT_ID}
-            streamItems={makeStreamItems()}
-            streamHead={[]}
-            pendingPermissions={[]}
-            isTurnActive={false}
-            isPaneFocused={true}
-            onErrorToast={onErrorToast}
-          />
-        </PaneProvider>
-      </QueryClientProvider>
-    );
-    const mounted = render(list);
-    expect(screen.queryByTestId("topic-reply-retry-unknown-entry")).toBeNull();
-    fireEvent.click(screen.getByTestId("topic-reply-retry-safe-entry"));
-    await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("No acknowledgement"));
-    mounted.unmount();
-    render(list);
-    const retry = screen.getByTestId("topic-reply-retry-safe-entry");
-    fireEvent.click(retry);
-    await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("Refused"));
-    fireEvent.click(retry);
-    await vi.waitFor(() => expect(replyWorkspaceTopic).toHaveBeenCalledTimes(3));
-    const [first, resend, newAttempt] = replyWorkspaceTopic.mock.calls.map(([request]) => request);
-    expect(first).toMatchObject({
-      retryOfEntryId: "safe-entry",
-      topicKey: "msg:m-1",
-      text: "[attachment]",
-    });
-    expect(resend.clientMessageId).toBe(first.clientMessageId);
-    expect(newAttempt.clientMessageId).not.toBe(first.clientMessageId);
-  });
+  it.each(["standard", "reupload"] as const)(
+    "handles retry acknowledgement and attachments (%s)",
+    async (scenario) => {
+      seedSession({ supportsTopicThreads: true, supportsTopicReadState: false });
+      const replyWorkspaceTopic = vi.fn();
+      if (scenario === "standard") {
+        replyWorkspaceTopic
+          .mockRejectedValueOnce(new Error("No acknowledgement"))
+          .mockResolvedValueOnce({ error: "Refused", entry: null });
+      } else {
+        replyWorkspaceTopic
+          .mockResolvedValueOnce({
+            error: 'topic_attachments_reupload_required:["old.png"]',
+            entry: null,
+          })
+          .mockRejectedValueOnce(new Error("No acknowledgement"));
+      }
+      replyWorkspaceTopic.mockResolvedValueOnce({ error: null, entry: null });
+      const attachment = {
+        type: "uploaded_file",
+        id: "upload-id",
+        fileName: "old.png",
+        mimeType: "image/png",
+        size: 1,
+        path: "/uploads/old.png",
+      };
+      const uploadFile = vi.fn().mockResolvedValue({ file: attachment, error: null });
+      vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+        connectionStatus: "online",
+        client: { replyWorkspaceTopic, uploadFile },
+      } as never);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const entry: TopicThreadEntry = {
+        entryId: "safe-entry",
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        role: "user_followup",
+        topicKey: "msg:m-1",
+        rootMessageId: "m-1",
+        routedAgentId: MAIN_AGENT_ID,
+        text: "[attachment]",
+        status: "error",
+        retryable: true,
+        seq: 1,
+        createdAt: new Date(3000).toISOString(),
+        updatedAt: new Date(3000).toISOString(),
+      };
+      qc.setQueryData(workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID), [
+        entry,
+        { ...entry, entryId: "unknown-entry", retryable: false, seq: 2 },
+      ]);
+      const onErrorToast = vi.fn();
+      const list = (
+        <QueryClientProvider client={qc}>
+          <PaneProvider value={makePaneContextValue()}>
+            <TopicStreamList
+              serverId={SERVER_ID}
+              workspaceId={WORKSPACE_ID}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={makeStreamItems()}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={true}
+              onErrorToast={onErrorToast}
+            />
+          </PaneProvider>
+        </QueryClientProvider>
+      );
+      const mounted = render(list);
+      expect(screen.queryByTestId("topic-reply-retry-unknown-entry")).toBeNull();
+      if (scenario === "reupload") {
+        const picker = vi
+          .spyOn(HTMLInputElement.prototype, "click")
+          .mockImplementation(function (this: HTMLInputElement) {
+            const file = new File(["x"], "old.png", { type: "image/png" });
+            file.arrayBuffer = async () => Uint8Array.of(120).buffer;
+            Object.defineProperty(this, "files", { value: [file] });
+            this.dispatchEvent(new Event("change"));
+          });
+        fireEvent.click(screen.getByTestId("topic-reply-retry-safe-entry"));
+        const reupload = await screen.findByTestId("topic-reply-reupload-safe-entry");
+        expect(picker).not.toHaveBeenCalled();
+        fireEvent.click(reupload);
+        expect(picker).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("No acknowledgement"));
+        fireEvent.click(reupload);
+        await vi.waitFor(() => expect(replyWorkspaceTopic).toHaveBeenCalledTimes(3));
+        const [first, replacement, resend] = replyWorkspaceTopic.mock.calls.map(
+          ([request]) => request,
+        );
+        expect(first).not.toHaveProperty("attachments");
+        expect(replacement).toMatchObject({
+          retryOfEntryId: "safe-entry",
+          text: "[attachment]",
+          attachments: [attachment],
+        });
+        expect(replacement.clientMessageId).not.toBe(first.clientMessageId);
+        expect(resend).toEqual(replacement);
+        expect(uploadFile).toHaveBeenCalledOnce();
+        expect(picker).toHaveBeenCalledOnce();
+        return;
+      }
+      fireEvent.click(screen.getByTestId("topic-reply-retry-safe-entry"));
+      await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("No acknowledgement"));
+      mounted.unmount();
+      render(list);
+      const retry = screen.getByTestId("topic-reply-retry-safe-entry");
+      fireEvent.click(retry);
+      await vi.waitFor(() => expect(onErrorToast).toHaveBeenCalledWith("Refused"));
+      fireEvent.click(retry);
+      await vi.waitFor(() => expect(replyWorkspaceTopic).toHaveBeenCalledTimes(3));
+      const [first, resend, newAttempt] = replyWorkspaceTopic.mock.calls.map(
+        ([request]) => request,
+      );
+      expect(first).toMatchObject({
+        retryOfEntryId: "safe-entry",
+        topicKey: "msg:m-1",
+        text: "[attachment]",
+      });
+      expect(resend.clientMessageId).toBe(first.clientMessageId);
+      expect(newAttempt.clientMessageId).not.toBe(first.clientMessageId);
+    },
+  );
 
   it.each(["partial", "total", "decision"] as const)(
     "keeps attachments out of an incomplete topic send (%s)",
@@ -839,7 +1061,7 @@ describe("TopicStreamList & read-watermark integration", () => {
           latestSeq: 1,
           latestTimestampMs: 1_000,
           latestEpoch: "ep-1",
-          lifecycleStatus: "settled",
+          lifecycleStatus: "replied",
           retryCandidate: null,
         },
         { topicKey: "msg:m-42" },
@@ -1686,7 +1908,7 @@ describe("TopicStreamList & read-watermark integration", () => {
           latestSeq: 1,
           latestTimestampMs: 1_000,
           latestEpoch: "ep-1",
-          lifecycleStatus: "settled",
+          lifecycleStatus: "replied",
           retryCandidate: null,
         },
         { topicKey: "task:T-B", taskId: "T-B", rootMessageId: "m-multi" },

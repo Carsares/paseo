@@ -7,6 +7,8 @@ import { AgentAttachmentSchema } from "@getpaseo/protocol/messages";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import type { AgentCommandOutcome } from "../agent/agent-sdk-types.js";
 
+import { topicDelegationScopeSchema } from "../agent/tools/topic-delegation.js";
+
 const AddressSchema = z.object({ agentId: z.string().min(1), serverId: z.string().min(1) });
 const QueuedMessageSchema = z.object({
   messageId: z.string().min(1),
@@ -32,6 +34,7 @@ const QueuedMessageSchema = z.object({
   activeTurnBehavior: z.enum(["steer", "interrupt", "queue"]),
   immediateSteer: z.boolean().optional(),
   heldAfterStop: z.boolean().optional(),
+  topicDelegation: topicDelegationScopeSchema.optional(),
   unarchive: z.boolean(),
 });
 export type RecoverableAgentMessage = z.infer<typeof QueuedMessageSchema>;

@@ -785,6 +785,34 @@ export async function enqueueRecoverableAgentMessage(
   validateExtraDispatch?: () => Promise<void>,
 ) {
   const parent = message.directParent;
+  const scope = message.topicDelegation;
+  const delegations = context.agentManager.topicDelegations;
+  const dispatch =
+    scope && context.serverId
+      ? { ...scope, agentId, serverId: context.serverId, messageId: message.messageId }
+      : undefined;
+  const validateTopicDispatch =
+    dispatch && delegations
+      ? async () => {
+          const read = async (id: string) => {
+            const stored = await context.agentStorage.get(id);
+            return stored?.archivedAt ? undefined : (context.agentManager.getAgent(id) ?? stored);
+          };
+          const [main, child] = await Promise.all([read(dispatch.mainAgentId), read(agentId)]);
+          if (
+            main?.workspaceId !== dispatch.workspaceId ||
+            !isMainControlAgentLabels(main.labels) ||
+            child?.workspaceId !== dispatch.workspaceId ||
+            message.source.agentId !== dispatch.mainAgentId
+          )
+            throw new Error("The delegation no longer belongs to this workspace.");
+          return (
+            context.agentManager.getAgent(agentId)?.config.title ??
+            (await context.agentStorage.get(agentId))?.title ??
+            undefined
+          );
+        }
+      : undefined;
   const validateDispatch =
     parent || restoring || validateExtraDispatch
       ? async () => {
@@ -802,15 +830,36 @@ export async function enqueueRecoverableAgentMessage(
           await validateExtraDispatch?.();
         }
       : undefined;
-  // Let delivery settle the authenticated reservation when a restored peer
-  // recipient is gone or archived. Pre-admission rejection only sees the receipt.
-  if (!restoring || !hasMandatoryPeerDispatchMarker(message.prompt)) await validateDispatch?.();
-  const notification = await registerQueuedPromptNotification(
-    context.finishSubscriptions,
-    agentId,
-    message,
-    await usesDefaultParentReporting(context, agentId),
-  );
+  const rejectDelegation = async (error: unknown) => {
+    if (dispatch && delegations && !retainQueuedAgentMessage(error)) {
+      try {
+        await delegations.reject(dispatch);
+      } catch (err) {
+        context.logger.warn({ err, agentId }, "Failed to record rejected delegation");
+      }
+    }
+  };
+  // A peer reservation must be settled by delivery even if the restored recipient disappeared.
+  const notification = await (async () => {
+    try {
+      if (!restoring || !hasMandatoryPeerDispatchMarker(message.prompt)) await validateDispatch?.();
+      const title = await validateTopicDispatch?.();
+      if (dispatch && delegations)
+        await delegations.admit(
+          { ...dispatch, title, recoverable: !handoff.waitForForegroundConfirmation },
+          restoring,
+        );
+      return await registerQueuedPromptNotification(
+        context.finishSubscriptions,
+        agentId,
+        message,
+        await usesDefaultParentReporting(context, agentId),
+      );
+    } catch (error) {
+      await rejectDelegation(error);
+      throw error;
+    }
+  })();
   const rejectNotification = () =>
     notification
       ?.reject()
@@ -824,26 +873,48 @@ export async function enqueueRecoverableAgentMessage(
       prompt: message.prompt,
       source: { kind: "agent-message", ...message.source },
       sessionMode: message.sessionMode,
-      // Receipts written before the three-mode contract stored queue as steer.
+      // Old receipts represented queue as steer. Topic dispatches also need a separate turn.
       activeTurnBehavior:
-        message.immediateSteer || message.activeTurnBehavior !== "steer"
-          ? message.activeTurnBehavior
-          : "queue",
+        message.activeTurnBehavior === "steer" && (dispatch || !message.immediateSteer)
+          ? "queue"
+          : message.activeTurnBehavior,
       unarchive: !restoring && message.unarchive,
       heldAfterStop: message.heldAfterStop,
       waitForProviderOutcome: true,
       validateDispatch,
-      handoff,
+      // A topic delegation needs a turn of its own. This also keeps it out of a
+      // human prompt's batch and the provider's out-of-band command path.
+      beforeProviderDispatch:
+        validateTopicDispatch &&
+        (async () => {
+          await validateTopicDispatch();
+        }),
+      handoff:
+        dispatch && delegations
+          ? {
+              ...handoff,
+              async begin() {
+                await delegations.submitting(dispatch);
+                await handoff.begin();
+              },
+              async declined() {
+                await handoff.declined();
+                await delegations.returnToQueue(dispatch);
+              },
+            }
+          : handoff,
       onDispatch: () => notification?.accept(),
     });
     return {
       ...receipt,
       dispatched: receipt.dispatched.catch(async (error) => {
+        await rejectDelegation(error);
         await rejectNotification();
         throw error;
       }),
     };
   } catch (error) {
+    await rejectDelegation(error);
     await rejectNotification();
     throw error;
   }
@@ -902,13 +973,7 @@ export interface SessionOptions {
   durableItems?: DurableItemStore;
   topicReadState?: TopicReadStateStore;
   todos?: WorkspaceTodoStore;
-  topicReplyRouter?: Pick<TopicReplyRouter, "list"> & {
-    reply(
-      request: Parameters<TopicReplyRouter["reply"]>[0],
-      decision?: Parameters<TopicReplyRouter["reply"]>[1],
-      humanInitiated?: boolean,
-    ): ReturnType<TopicReplyRouter["reply"]>;
-  };
+  topicReplyRouter?: Pick<TopicReplyRouter, "list" | "reply">;
   topicThreadStore?: TopicThreadStore;
   decideWorkspaceTopic?: (
     request: WorkspaceTopicDecideRequest,
@@ -2359,6 +2424,8 @@ export class Session {
     message: SessionOutboundMessage,
   ): void {
     if (!this.authorization.allowsOutbound(message)) return;
+    if (message.type === "workspace.topic.anchor.updated" && this.emitSubscribedEvent(message))
+      return;
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
       if (this.supports(capability)) this.emit(message);
       return;
@@ -3451,7 +3518,12 @@ export class Session {
     if (!this.topicReplyRouter) throw new Error("Workspace topics are unavailable.");
     const response =
       msg.type === "workspace.topic.reply.request"
-        ? this.topicReplyRouter.reply(msg, undefined, this.isDirectHumanPromptIngress())
+        ? this.topicReplyRouter.reply(
+            msg,
+            undefined,
+            this.isDirectHumanPromptIngress(),
+            this.workspaceFilesSession.getUploadAccess(this.hostSourceId),
+          )
         : this.topicReplyRouter.list(msg);
     return response.then((value) => this.emitForSource(value, source));
   }
@@ -4495,7 +4567,7 @@ export class Session {
   ): Promise<void> | undefined {
     switch (msg.type) {
       case "file_explorer_request":
-        return this.workspaceFilesSession.handleFileExplorerRequest(msg, source);
+        return this.workspaceFilesSession.handleFileExplorerRequest(msg, source, this.hostSourceId);
       case "fs.file.subscribe.request":
         return this.workspaceFilesSession.handleFileSubscribeRequest(msg, this.delivery);
       case "fs.file.unsubscribe.request":
@@ -4527,7 +4599,7 @@ export class Session {
       case "file_download_token_request":
         return this.workspaceFilesSession.handleFileDownloadTokenRequest(msg);
       case "file.upload.request":
-        this.workspaceFilesSession.handleFileUploadRequest(msg, this.delivery);
+        this.workspaceFilesSession.handleFileUploadRequest(msg, this.delivery, this.hostSourceId);
         return undefined;
       default:
         return undefined;
@@ -6764,6 +6836,7 @@ export class Session {
           await validateBinding();
           if (this.agentManager.hasInFlightRun(agentId))
             throw new Error("The Main Session is busy.");
+          const imageAttachments = await this.persistTopicPromptImages(request.images);
           let dispatched = false;
           const result = await this.sendHumanPrompt({
             agentId,
@@ -6772,7 +6845,10 @@ export class Session {
             idleOnly: true,
             unarchive: false,
             waitForCommandOutcome: true,
-            runOptions: request.outputSchema ? { outputSchema: request.outputSchema } : undefined,
+            runOptions:
+              request.outputSchema || imageAttachments
+                ? { outputSchema: request.outputSchema, imageAttachments }
+                : undefined,
             handoff: { begin, declined, onProviderOutcome },
             validateDispatch: validateBinding,
             assertDispatchAllowed: assertLiveBinding,
@@ -6785,6 +6861,13 @@ export class Session {
           if (result.disposition === "turn_started") {
             await waitForAgentRunStartWithTimeout(this.agentManager, agentId, result.started);
           }
+          if (result.disposition !== "out_of_band")
+            await this.storeHumanTopicAnchor(
+              agentId,
+              messageId,
+              request.initialPrompt?.trim() || undefined,
+              imageAttachments,
+            );
         },
       });
     } finally {
@@ -7276,9 +7359,13 @@ export class Session {
       const workspaceId = resolvedIntent.intent.workspaceId;
       const workspaceRole = options?.workspaceRole;
       const createAsMain = workspaceRole === "main";
+      let imageAttachments: AgentRunOptions["imageAttachments"];
       if (createAsMain) {
         releaseWorkspace = this.reserveWorkspaceMove(workspaceId);
-        await this.requireMoveSourceWorkspace(workspaceId);
+        const workspace = await this.requireMoveSourceWorkspace(workspaceId);
+        imageAttachments = await this.persistTopicPromptImages(
+          workspace.topic ? images : undefined,
+        );
       }
       const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
         {
@@ -7316,6 +7403,7 @@ export class Session {
           clientMessageId,
           outputSchema,
           images,
+          imageAttachments,
           attachments,
           labels: resolvedIntent.intent.labels,
           metadata: msg.metadata,
@@ -7334,8 +7422,13 @@ export class Session {
       await this.agentUpdates.forwardLiveAgent(
         this.agentManager.getAgent(snapshot.id) ?? liveSnapshot,
       );
-      if (createAsMain && initialPromptStarted && msg.clientMessageId && trimmedPrompt) {
-        await this.storeHumanTopicAnchor(snapshot.id, msg.clientMessageId, trimmedPrompt);
+      if (createAsMain && initialPromptStarted) {
+        await this.storeHumanTopicAnchor(
+          snapshot.id,
+          msg.clientMessageId,
+          trimmedPrompt || undefined,
+          imageAttachments,
+        );
       }
       if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
         this.workspaceAutoName.scheduleForDirectory(
@@ -12330,8 +12423,25 @@ export class Session {
     }
   }
 
-  private async storeHumanTopicAnchor(agentId: string, messageId: string, text: string) {
-    if (!this.persistTopicAnchor) return;
+  private async persistTopicPromptImages(
+    images: readonly { data: string; mimeType: string }[] | undefined,
+  ) {
+    if (!images?.length) return;
+    try {
+      return await this.workspaceFilesSession.persistMessageImages(this.hostSourceId, images);
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Could not persist topic prompt images");
+    }
+  }
+
+  private async storeHumanTopicAnchor(
+    agentId: string,
+    messageId: string | undefined,
+    text: string | undefined,
+    imageAttachments?: AgentRunOptions["imageAttachments"],
+  ) {
+    if (!this.persistTopicAnchor || !messageId || (text === undefined && !imageAttachments?.length))
+      return;
     try {
       const agent = this.agentManager.getAgent(agentId);
       if (!agent?.workspaceId || agent.internal || !isMainControlAgentLabels(agent.labels)) return;
@@ -12347,7 +12457,8 @@ export class Session {
         mainAgentId: agentId,
         topicKey: `msg:${messageId}`,
         rootMessageId: messageId,
-        rootPromptText: text,
+        rootPromptText: text ?? "",
+        ...(imageAttachments?.length ? { imageAttachments } : {}),
       });
     } catch (error) {
       this.sessionLogger.warn(
@@ -12355,6 +12466,48 @@ export class Session {
         "Could not persist topic question",
       );
     }
+  }
+
+  private async dispatchHumanAgentMessage(
+    agentId: string,
+    msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
+    prompt: AgentPromptInput,
+    allowHumanAuthority: boolean,
+    beforeDispatch?: QueueHandoff["begin"],
+  ) {
+    const imageAgent = msg.images?.length
+      ? (this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId)))
+      : undefined;
+    const imageAttachments =
+      imageAgent?.workspaceId &&
+      !imageAgent.internal &&
+      isMainControlAgentLabels(imageAgent.labels) &&
+      (await this.workspaceRegistry.get(imageAgent.workspaceId))?.topic
+        ? await this.persistTopicPromptImages(msg.images)
+        : undefined;
+    const result = await this.sendHumanPrompt(
+      {
+        agentId,
+        prompt,
+        messageId: msg.messageId,
+        activeTurnBehavior: msg.activeTurnBehavior === "steer" ? "steer" : "interrupt",
+        sessionMode: msg.sessionMode,
+        runOptions: imageAttachments ? { imageAttachments } : undefined,
+        clearPendingPermissions: true,
+        beforeDispatch,
+      },
+      allowHumanAuthority,
+    );
+    if (result.disposition === "turn_started") {
+      await waitForAgentRunStartWithTimeout(
+        this.agentManager,
+        agentId,
+        result.started,
+        this.delivery.requestSignal,
+      );
+    }
+    if (result.disposition !== "out_of_band")
+      await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text, imageAttachments);
   }
 
   private recoverableAgentMessage(
@@ -12599,29 +12752,13 @@ export class Session {
           }
           return;
         }
-        const result = await this.sendHumanPrompt(
-          {
-            agentId,
-            prompt,
-            messageId: msg.messageId,
-            activeTurnBehavior: requested === "steer" ? "steer" : "interrupt",
-            sessionMode: msg.sessionMode,
-            clearPendingPermissions: true,
-            beforeDispatch: handoff?.begin,
-          },
+        await this.dispatchHumanAgentMessage(
+          agentId,
+          msg,
+          prompt,
           allowHumanAuthority,
+          handoff?.begin,
         );
-        if (result.disposition === "turn_started") {
-          await waitForAgentRunStartWithTimeout(
-            this.agentManager,
-            agentId,
-            result.started,
-            this.delivery.requestSignal,
-          );
-        }
-        if (msg.messageId && result.disposition !== "out_of_band") {
-          await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text);
-        }
       };
       const messageId = recoverable?.messageId ?? msg.messageId;
       const sent = messageId
@@ -13125,6 +13262,7 @@ function isValidGitHubRepoSegment(value: string): boolean {
 function sessionEventCategory(message: SessionOutboundMessage): SessionEventSubscription | null {
   switch (message.type) {
     case "project.update":
+    case "workspace.topic.anchor.updated":
     case "providers_snapshot_update":
     case "agent_attention_required":
     case "agent_permission_request":
@@ -13140,18 +13278,19 @@ function sessionEventCategory(message: SessionOutboundMessage): SessionEventSubs
     case "hub.execution.agent.stream":
       return message.type;
     case "status":
-      switch (message.payload.status) {
-        case "server_info":
-          return "status.server_info";
-        case "daemon_config_changed":
-          return "status.daemon_config_changed";
-        case "plugin_catalog_changed":
-          return "status.plugin_catalog_changed";
-        case "plugin_settings_changed":
-          return "status.plugin_settings_changed";
-        default:
-          return null;
-      }
+      return statusEventCategory(message.payload.status);
+    default:
+      return null;
+  }
+}
+
+function statusEventCategory(status: string): SessionEventSubscription | null {
+  switch (status) {
+    case "server_info":
+    case "daemon_config_changed":
+    case "plugin_catalog_changed":
+    case "plugin_settings_changed":
+      return `status.${status}`;
     default:
       return null;
   }
@@ -13170,6 +13309,8 @@ function legacyWantsEvent(
     case "agent_permission_request":
     case "agent_permission_resolved":
       return !capabilities.has(CLIENT_CAPS.explicitEventSubscriptions);
+    case "workspace.topic.anchor.updated":
+      return capabilities.has(CLIENT_CAPS.workspaceButlerV1);
     case "agent.provider_subagents.update":
       return capabilities.has(CLIENT_CAPS.providerSubagents);
     // Old apps parse outbound messages strictly and do not know this type.

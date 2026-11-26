@@ -1,8 +1,9 @@
-import { useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { replaceEqualDeep, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import type {
   AgentAttachment,
   TopicAnchorSummary,
   TopicBlockingResolutionKind,
+  TopicDelegationSummary,
   TopicReplyRouteMode,
   TopicThreadEntry,
   WorkspaceTaskSummary,
@@ -79,6 +80,26 @@ function findSiblingRootPromptText(
   return sibling?.rootPromptText ?? "";
 }
 
+function delegationKey(delegation: TopicDelegationSummary): string {
+  return JSON.stringify([delegation.serverId, delegation.agentId, delegation.messageId]);
+}
+
+function mergeDelegations(
+  existing?: TopicDelegationSummary[],
+  incoming?: TopicDelegationSummary[],
+): TopicDelegationSummary[] | undefined {
+  if (!existing || !incoming || existing === incoming) return incoming ?? existing;
+  const byDispatch = new Map(existing.map((delegation) => [delegationKey(delegation), delegation]));
+  for (const delegation of incoming) {
+    const key = delegationKey(delegation);
+    const previous = byDispatch.get(key);
+    if (!previous || Date.parse(delegation.updatedAt) >= Date.parse(previous.updatedAt)) {
+      byDispatch.set(key, delegation);
+    }
+  }
+  return [...byDispatch.values()];
+}
+
 function mergeAnchor(
   existing: TopicAnchorSummary,
   incoming: TopicAnchorSummary,
@@ -99,6 +120,7 @@ function mergeAnchor(
     leadAgentId: newer.leadAgentId ?? older.leadAgentId,
     leadServerId: newer.leadServerId ?? older.leadServerId,
     leadTitle: newer.leadTitle ?? older.leadTitle,
+    delegations: mergeDelegations(existing.delegations, incoming.delegations),
     createdAt:
       (Date.parse(older.createdAt) || Infinity) < (Date.parse(newer.createdAt) || Infinity)
         ? older.createdAt
@@ -195,6 +217,38 @@ export function upsertTopicAnchor(
   return [...rest, merged].sort(compareAnchors);
 }
 
+function mergeFetchedAnchors(
+  snapshot: readonly TopicAnchorSummary[],
+  beforeFetch: readonly TopicAnchorSummary[],
+  current: readonly TopicAnchorSummary[],
+): TopicAnchorSummary[] {
+  let merged = [...snapshot].sort(compareAnchors);
+  if (current === beforeFetch) return merged;
+  const priorByKey = new Map(beforeFetch.map((anchor) => [anchor.topicKey, anchor]));
+  for (const anchor of current) {
+    const prior =
+      priorByKey.get(anchor.topicKey) ??
+      (anchor.taskId && anchor.rootMessageId
+        ? priorByKey.get(`msg:${anchor.rootMessageId}`)
+        : undefined);
+    if (prior === anchor) continue;
+    // An ordinary thread event can update anchor metadata while carrying forward
+    // a stale delegation from the cache. Replay only changed dispatches.
+    const priorByDispatch = new Map(
+      prior?.delegations?.map((delegation) => [delegationKey(delegation), delegation]),
+    );
+    const changed = anchor.delegations?.filter((delegation) => {
+      const previous = priorByDispatch.get(delegationKey(delegation));
+      return !previous || replaceEqualDeep(previous, delegation) !== previous;
+    });
+    merged = upsertTopicAnchor(merged, {
+      ...anchor,
+      delegations: changed?.length ? changed : undefined,
+    });
+  }
+  return merged;
+}
+
 export function applyTopicAnchorToCache(
   queryClient: QueryClient,
   serverId: string,
@@ -277,18 +331,15 @@ export function useWorkspaceTopicEntries(
       const client = getOnlineThreadClient(serverId);
       if (!client || !mainAgentId) throw new Error("Host is offline");
       signal.throwIfAborted();
+      const beforeFetch = queryClient.getQueryData<TopicAnchorSummary[]>(anchorsKey) ?? [];
       const response = await client.listWorkspaceTopicEntries({ workspaceId, mainAgentId });
       signal.throwIfAborted();
       if (response.error) throw new Error(response.error);
       if (response.anchors) {
         const incomingAnchors = response.anchors;
-        queryClient.setQueryData<TopicAnchorSummary[]>(anchorsKey, (previous) => {
-          let merged = [...incomingAnchors].sort(compareAnchors);
-          for (const existing of previous ?? []) {
-            merged = upsertTopicAnchor(merged, existing);
-          }
-          return merged;
-        });
+        queryClient.setQueryData<TopicAnchorSummary[]>(anchorsKey, (current) =>
+          mergeFetchedAnchors(incomingAnchors, beforeFetch, current ?? []),
+        );
       }
       return [...response.entries].sort(compareEntries);
     },

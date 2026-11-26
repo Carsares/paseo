@@ -330,7 +330,7 @@ function renderConversation(
   return within(container);
 }
 
-it("shows only structured requests from this agent and workspace, including previous decisions", async () => {
+it("shows only pending requests from this agent and workspace", async () => {
   const { list } = serve([
     pending,
     decided({ ...pending, requestId: "old", title: "Earlier authorization" }),
@@ -345,8 +345,8 @@ it("shows only structured requests from this agent and workspace, including prev
   seedConversationAgents();
   const view = renderConversation("agent");
   await view.findByText("Workspace authorization");
-  await expect.element(view.getByText("Earlier authorization")).toBeVisible();
-  expect(view.getAllByTestId("durable-item-card")).toHaveLength(2);
+  expect(view.queryByText("Earlier authorization")).toBeNull();
+  expect(view.getAllByTestId("durable-item-card")).toHaveLength(1);
   expect(view.getAllByRole("button", { name: "Approve" })).toHaveLength(1);
   expect(view.queryByText(/^Needs my action/)).toBeNull();
   expect(view.queryByText("Another workspace's request")).toBeNull();
@@ -422,7 +422,7 @@ it("blocks a stale evidence revision in both the conversation and the sidebar de
   expect(view.queryByText("Approved")).toBeNull();
 });
 
-it("refreshes a remote decision while visible and preserves the resolved card", async () => {
+it("collapses the request list when the last pending request is resolved remotely", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const items: WorkspaceDurableItem[] = [pending];
   const { list, decide } = serve(items);
@@ -431,9 +431,8 @@ it("refreshes a remote decision while visible and preserves the resolved card", 
 
   items[0] = decided(pending);
   await act(async () => vi.advanceTimersByTimeAsync(15_000));
-  await expect.element(await view.findByText("Approved")).toBeVisible();
+  await expect.poll(() => view.queryByTestId("agent-durable-items")).toBeNull();
   expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
-  expect(view.getByTestId("durable-item-card")).toBeVisible();
   expect(decide).not.toHaveBeenCalled();
 
   render("agent", false);
@@ -442,7 +441,7 @@ it("refreshes a remote decision while visible and preserves the resolved card", 
   expect(list).toHaveBeenCalledTimes(callsBeforeHiding);
 });
 
-it("shows the host's confirmed decision before the follow-up list returns", async () => {
+it("collapses the request list after a confirmed decision before refreshing the list", async () => {
   const { list, decide } = serve([pending]);
   const view = render();
   const approve = await view.findByRole("button", { name: "Approve" });
@@ -459,7 +458,7 @@ it("shows the host's confirmed decision before the follow-up list returns", asyn
   });
 
   act(() => approve.click());
-  await expect.element(await view.findByText("Approved")).toBeVisible();
+  await expect.poll(() => view.queryByTestId("agent-durable-items")).toBeNull();
   expect(decide).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 0 }));
   expect(list).toHaveBeenCalledTimes(2);
   await act(async () =>
@@ -486,7 +485,7 @@ it("blocks a cached action until a returning host confirms its latest state", as
   await act(async () =>
     finishRefresh({ requestId: "new", items: [decided(pending)], nextCursor: null, error: null }),
   );
-  await expect.element(await view.findByText("Approved")).toBeVisible();
+  await expect.poll(() => view.queryByTestId("agent-durable-items")).toBeNull();
   expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
 });
 

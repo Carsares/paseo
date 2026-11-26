@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { PARENT_AGENT_ID_LABEL, PARENT_REPORTING_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -29,6 +30,7 @@ import { MessageReceipts } from "./message-receipts/index.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { TopicThreadStore } from "./topic-threads/store.js";
+import { FileUploadStore } from "./file-upload/index.js";
 import { WorkspaceAutoName } from "./workspace-auto-name.js";
 import { FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 
@@ -41,6 +43,161 @@ type Response<T extends SessionOutboundMessage["type"]> = Extract<
   SessionOutboundMessage,
   { type: T }
 >;
+
+test(
+  "keeps image-only topic questions and replies readable from a cold WebSocket timeline",
+  async (context) => {
+    const onStartTurn = vi.fn();
+    const daemon = await startDaemon(context, {
+      agentClients: createTestAgentClients({ onStartTurn }),
+    });
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION);
+    const workspace = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Topic image upload",
+        topic: { summary: "Topic image upload" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const mainAgentId = workspace.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const mimeType = "image/png";
+    const data =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const bytes = Buffer.from(data, "base64");
+    const rootMessageId = randomUUID();
+    const root = await request(
+      socket,
+      {
+        type: "send_agent_message_request",
+        agentId: mainAgentId,
+        messageId: rootMessageId,
+        text: "",
+        images: [{ data, mimeType }],
+      },
+      "send_agent_message_response",
+    );
+    expect(root.payload.accepted).toBe(true);
+    await vi.waitFor(() =>
+      expect(daemon.daemon.agentManager.hasInFlightRun(mainAgentId)).toBe(false),
+    );
+
+    const client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "topic-image-upload",
+      appVersion: CURRENT_APP_VERSION,
+    });
+    context.onTestFinished(() => client.close());
+    await client.connect();
+    const uploaded = await client.uploadFile({
+      fileName: "build-output.png",
+      mimeType,
+      bytes,
+    });
+    if (!uploaded.file) throw new Error(uploaded.error ?? "Expected a completed upload");
+    const followupId = randomUUID();
+    const address = {
+      workspaceId: workspace.workspace.id,
+      mainAgentId,
+      topicKey: `msg:${rootMessageId}`,
+    };
+    await expect(
+      client.replyWorkspaceTopic({
+        ...address,
+        rootMessageId,
+        clientMessageId: followupId,
+        text: " ",
+        attachments: [uploaded.file],
+      }),
+    ).resolves.toMatchObject({ entry: { text: " " }, error: null });
+    await vi.waitFor(() => {
+      expect(onStartTurn).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining(`root-message-id="${rootMessageId}"`),
+          }),
+          { type: "image", data, mimeType },
+        ]),
+        expect.anything(),
+      );
+    });
+    await vi.waitFor(async () => {
+      const list = await client.listWorkspaceTopicEntries(address);
+      expect(list.entries[0]?.status).toBe("completed");
+    });
+    await daemon.daemon.agentManager.closeAgent(mainAgentId);
+    await client.close();
+    const cold = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "topic-image-cold",
+      appVersion: CURRENT_APP_VERSION,
+    });
+    context.onTestFinished(() => cold.close());
+    await cold.connect();
+
+    const list = await cold.listWorkspaceTopicEntries(address);
+    const rootImage = list.anchors[0]?.imageAttachments?.[0];
+    const { id, fileName, size } = uploaded.file;
+    const replyImage = { id, fileName, mimeType, size };
+    expect(rootImage).toEqual({
+      id: expect.stringMatching(/^upload_/),
+      fileName: "image.png",
+      mimeType,
+      size: bytes.length,
+    });
+    expect(list.entries[0]?.imageAttachments).toEqual([replyImage]);
+    expect(JSON.stringify(list)).not.toContain(daemon.paseoHome);
+    expect(JSON.stringify(list)).not.toContain('"delivery"');
+
+    const timeline = await cold.fetchAgentTimeline(mainAgentId, { direction: "tail" });
+    expect(timeline.entries.map(({ item }) => item)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "user_message",
+          messageId: rootMessageId,
+          imageAttachments: [rootImage],
+        }),
+        expect.objectContaining({
+          type: "user_message",
+          messageId: followupId,
+          imageAttachments: [replyImage],
+        }),
+      ]),
+    );
+    for (const reference of [rootImage!, replyImage]) {
+      const path = `paseo-attachment:${reference.id}`;
+      const file = await cold.readFile(daemon.staticDir, path);
+      expect(file).toMatchObject({
+        kind: "image",
+        mime: mimeType,
+        path,
+        bytes: new Uint8Array(bytes),
+      });
+    }
+    const foreignImage = await new FileUploadStore({
+      paseoHome: daemon.paseoHome,
+    }).persistMessageImage({
+      owner: "different-principal",
+      bytes,
+      mimeType,
+    });
+    await expect(
+      cold.readFile(daemon.staticDir, `paseo-attachment:${foreignImage.id}`),
+    ).rejects.toThrow("Image attachment is unavailable.");
+    const reset = await request(
+      socket,
+      { type: "agent.session.reset.request", agentId: mainAgentId, clearVisibleTimeline: true },
+      "agent.session.reset.response",
+    );
+    expect(reset.payload.accepted).toBe(true);
+    const refreshed = await cold.listWorkspaceTopicEntries(address);
+    expect(refreshed.anchors[0]?.imageAttachments).toEqual([rootImage]);
+    expect(refreshed.entries[0]?.imageAttachments).toEqual([replyImage]);
+  },
+  TEST_TIMEOUT,
+);
 
 test(
   "rejects an old blocking question version over WebSocket without starting Main Control",
@@ -1147,12 +1304,17 @@ test.for(["workspace", "agent"] as const)(
     const idempotencyKey = randomUUID();
     const clientMessageId = randomUUID();
     const question = "Where should we start?";
+    const image = {
+      mimeType: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+    };
     const title = "Private startup topic";
     const summary = "Review the private notes";
     const agent = {
       config: { provider: "codex" as const, cwd: daemon.staticDir },
       workspaceRole: "main" as const,
       initialPrompt: question,
+      images: [image],
       clientMessageId,
     };
     const topic = { summary, hideFromModel: true };
@@ -1253,8 +1415,22 @@ test.for(["workspace", "agent"] as const)(
       expect(timeline.error).toBeNull();
       expect(
         timeline.entries.flatMap(({ item }) => (item.type === "user_message" ? [item] : [])),
-      ).toEqual([expect.objectContaining({ text: question, clientMessageId })]);
+      ).toEqual([
+        expect.objectContaining({
+          text: question,
+          clientMessageId,
+          imageAttachments: [
+            {
+              id: expect.stringMatching(/^upload_/),
+              fileName: "image.png",
+              mimeType: image.mimeType,
+              size: Buffer.from(image.data, "base64").byteLength,
+            },
+          ],
+        }),
+      ]);
       expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContainEqual({ type: "image", ...image });
       const providerPrompt = JSON.stringify(prompts[0]);
       expect(providerPrompt).toContain(question);
       expect(providerPrompt).not.toContain(title);

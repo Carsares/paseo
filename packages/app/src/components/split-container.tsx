@@ -66,6 +66,7 @@ import { recordRenderProfileReasons, RenderProfile } from "@/utils/render-profil
 import { isNative } from "@/constants/platform";
 
 interface SplitContainerProps {
+  workspaceHeaderAboveSplit?: boolean;
   layout: WorkspaceLayout;
   /** The full workspace header: title, project row and workspace actions. */
   renderMainHeader?: (pane?: WorkspaceCompactHeaderActions["pane"]) => ReactNode;
@@ -137,6 +138,7 @@ interface SplitNodeViewProps extends Omit<
    * header. Split panes share one header above them and always show their tab rails.
    */
   ownsWorkspaceHeader: boolean;
+  workspaceHeaderAboveSplit: boolean;
   onTogglePaneMaximized: (paneId: string) => void;
 }
 
@@ -196,6 +198,7 @@ export function SplitContainer({
   renderMainHeader,
   renderCompactHeader,
   isTabInTeamDirectory,
+  workspaceHeaderAboveSplit = false,
 }: SplitContainerProps) {
   const inheritedWindowChromeCorners = useWindowChromeCorners();
   const windowChromeCorners = inheritedWindowChromeCorners;
@@ -235,27 +238,30 @@ export function SplitContainer({
   const mainColumnStyle = styles.mainColumn;
   const renderRoot = useMemo(() => wrapRootPaneForStableMount(splitRoot.root), [splitRoot.root]);
   const panesShareWorkspaceHeader = hasMultipleVisiblePanes(splitRoot.root);
+  const rendersSharedHeader = panesShareWorkspaceHeader && !workspaceHeaderAboveSplit;
   const sharedCompactHeader = useMemo(
     () =>
-      panesShareWorkspaceHeader ? (
+      rendersSharedHeader ? (
         <WindowChromeSafeArea placement="inline">
           <TitlebarDragRegion />
           {renderCompactHeader(null)}
         </WindowChromeSafeArea>
       ) : null,
-    [panesShareWorkspaceHeader, renderCompactHeader],
+    [rendersSharedHeader, renderCompactHeader],
   );
   return (
     <RenderProfile id="SplitContainer">
       <View style={styles.workspaceShell}>
         <WindowChromeRegion corners={mainColumnWindowChromeCorners}>
           <View style={mainColumnStyle}>
-            {panesShareWorkspaceHeader ? (
+            {rendersSharedHeader ? (
               <AdaptiveWorkspaceChrome compactHeader={sharedCompactHeader}>
                 {renderMainHeader?.()}
               </AdaptiveWorkspaceChrome>
             ) : null}
-            {splitRoot.usesFallbackStrip && <WindowChromeSafeArea placement="below" />}
+            {splitRoot.usesFallbackStrip && !workspaceHeaderAboveSplit && (
+              <WindowChromeSafeArea placement="below" />
+            )}
             {renderRoot ? (
               <SplitNodeView
                 node={renderRoot}
@@ -291,7 +297,9 @@ export function SplitContainer({
                 dropPreview={dropPreview}
                 tabDropPreview={tabDropPreview}
                 windowChromeCorners={
-                  splitRoot.usesFallbackStrip || panesShareWorkspaceHeader
+                  splitRoot.usesFallbackStrip ||
+                  panesShareWorkspaceHeader ||
+                  workspaceHeaderAboveSplit
                     ? "none"
                     : windowChromeCorners
                 }
@@ -301,8 +309,9 @@ export function SplitContainer({
                 onTogglePaneMaximized={handleTogglePaneMaximized}
                 focusModeEnabled={focusModeEnabled}
                 onExitFocusMode={onExitFocusMode}
-                renderMainHeader={renderMainHeader}
+                renderMainHeader={workspaceHeaderAboveSplit ? undefined : renderMainHeader}
                 renderCompactHeader={renderCompactHeader}
+                workspaceHeaderAboveSplit={workspaceHeaderAboveSplit}
                 isTabInTeamDirectory={isTabInTeamDirectory}
               />
             ) : null}
@@ -488,6 +497,7 @@ function SplitNodeView({
   focusModeEnabled,
   onExitFocusMode,
   ownsWorkspaceHeader,
+  workspaceHeaderAboveSplit,
   renderMainHeader,
   renderCompactHeader,
   isTabInTeamDirectory,
@@ -582,6 +592,7 @@ function SplitNodeView({
             focusModeEnabled={focusModeEnabled}
             onExitFocusMode={onExitFocusMode}
             ownsWorkspaceHeader={ownsWorkspaceHeader}
+            workspaceHeaderAboveSplit={workspaceHeaderAboveSplit}
             renderMainHeader={renderMainHeader}
             renderCompactHeader={renderCompactHeader}
             isTabInTeamDirectory={isTabInTeamDirectory}
@@ -651,6 +662,7 @@ function SplitNodeView({
               focusModeEnabled={focusModeEnabled}
               onExitFocusMode={onExitFocusMode}
               ownsWorkspaceHeader={ownsWorkspaceHeader}
+              workspaceHeaderAboveSplit={workspaceHeaderAboveSplit}
               renderMainHeader={renderMainHeader}
               renderCompactHeader={renderCompactHeader}
               isTabInTeamDirectory={isTabInTeamDirectory}
@@ -713,6 +725,7 @@ const SplitPaneView = memo(function SplitPaneView({
   focusModeEnabled,
   onExitFocusMode,
   ownsWorkspaceHeader,
+  workspaceHeaderAboveSplit,
   renderMainHeader,
   renderCompactHeader,
   isTabInTeamDirectory,
@@ -867,7 +880,7 @@ const SplitPaneView = memo(function SplitPaneView({
   });
   const compactHeader = useMemo(
     () =>
-      ownsWorkspaceHeader ? (
+      ownsWorkspaceHeader && !workspaceHeaderAboveSplit ? (
         <WindowChromeSafeArea placement="inline">
           <TitlebarDragRegion />
           {renderCompactHeader({
@@ -879,6 +892,7 @@ const SplitPaneView = memo(function SplitPaneView({
       ) : null,
     [
       ownsWorkspaceHeader,
+      workspaceHeaderAboveSplit,
       renderCompactHeader,
       paneTabs,
       activeTabDescriptor?.key,

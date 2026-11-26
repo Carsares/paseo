@@ -68,6 +68,18 @@ import { PendingSubagentInboxBar } from "./agent-panel-inbox";
 
 vi.mock("@/stores/navigation-active-workspace-store", { spy: true });
 
+vi.mock("@/styles/theme", async (importOriginal) => {
+  const theme = await importOriginal<typeof import("@/styles/theme")>();
+  return {
+    ...theme,
+    lightTheme: {
+      ...theme.lightTheme,
+      // The browser test double resolves theme styles once. A variable lets the test switch widths.
+      contentMaxWidth: `var(--test-content-max-width, ${theme.DEFAULT_CONTENT_MAX_WIDTH}px)`,
+    },
+  };
+});
+
 let compactTestLayout: boolean | undefined;
 vi.mock("@/constants/layout", async (importOriginal) => {
   const layout = await importOriginal<typeof import("@/constants/layout")>();
@@ -245,7 +257,14 @@ async function mountTopicConversation(
   queueWhenRunning = false,
   additionalTopicItems: StreamItem[] = [],
   modeInHeader = false,
-  options?: { paneHost?: PaneContextValue["host"]; sideChatSourceId?: string },
+  options?: {
+    paneHost?: PaneContextValue["host"];
+    sideChatSourceId?: string;
+    rewindRecovery?: "ordinary" | "main";
+    headerWorkspaceId?: string;
+    paneFallback?: { agentId: string; tabId: string };
+    chatOutline?: boolean;
+  },
 ) {
   compactTestLayout = width < 600;
   await page.viewport(width, 760);
@@ -279,9 +298,17 @@ async function mountTopicConversation(
     features: {
       workspaceTopicReadState: true,
       workspaceTopicThreads: true,
+      rewindPendingFiles: Boolean(options?.rewindRecovery),
+      agentTimelinePromptIndex: Boolean(options?.chatOutline),
     },
   });
-  publishAgent(true, undefined, false, pane.workspaceId, queueWhenRunning ? "running" : "idle");
+  publishAgent(
+    options?.rewindRecovery !== "ordinary",
+    undefined,
+    false,
+    pane.workspaceId,
+    queueWhenRunning ? "running" : "idle",
+  );
   if (options?.sideChatSourceId) {
     const main = useSessionStore.getState().sessions[serverId]!.agents.get(agentId)!;
     store.setAgents(
@@ -339,10 +366,11 @@ async function mountTopicConversation(
       revision: 1,
     });
   }
-  settings.setQueryData(
-    APP_SETTINGS_QUERY_KEY,
-    queueWhenRunning ? { ...DEFAULT_APP_SETTINGS, sendBehavior: "queue" } : DEFAULT_APP_SETTINGS,
-  );
+  settings.setQueryData(APP_SETTINGS_QUERY_KEY, {
+    ...DEFAULT_APP_SETTINGS,
+    ...(queueWhenRunning ? { sendBehavior: "queue" } : {}),
+    ...(options?.chatOutline ? { chatOutlineEnabled: true } : {}),
+  });
   await act(async () =>
     root.render(
       <QueryClientProvider client={settings}>
@@ -351,7 +379,9 @@ async function mountTopicConversation(
             <ConversationPane paneHost={options?.paneHost}>
               <TopicStreamModeHeaderProvider
                 serverId={serverId}
-                agentId={modeInHeader ? agentId : null}
+                workspaceId={options?.headerWorkspaceId ?? pane.workspaceId}
+                agentId={modeInHeader || options?.headerWorkspaceId ? agentId : null}
+                paneFallback={options?.paneFallback}
               >
                 {modeInHeader ? (
                   <TopicStreamModeControl
@@ -371,10 +401,70 @@ async function mountTopicConversation(
   );
   await vi.waitFor(() => {
     expect(
-      view.getByTestId(options?.sideChatSourceId ? "assistant-message" : "topic-stream-list"),
+      view.getByTestId(
+        options?.sideChatSourceId || options?.rewindRecovery === "ordinary"
+          ? "assistant-message"
+          : "topic-stream-list",
+      ),
     ).toBeTruthy();
   });
 }
+
+it.each(["main", "ordinary"] as const)(
+  "loads pending file recovery only for ordinary conversations (%s)",
+  async (kind) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    const recovery = vi.spyOn(client, "getAgentRewindFileRecovery").mockResolvedValue({
+      pendingFiles: [],
+      unconfirmedFileRewinds: [],
+    });
+    await mountTopicConversation(
+      client,
+      true,
+      1000,
+      false,
+      [
+        {
+          kind: "assistant_message",
+          id: "rewind-answer",
+          messageId: "rewind-answer",
+          text: "Conversation ready",
+          timestamp: new Date("2026-04-20T00:03:00.000Z"),
+        },
+      ],
+      false,
+      { rewindRecovery: kind },
+    );
+    if (kind === "ordinary") {
+      await vi.waitFor(() => expect(recovery).toHaveBeenCalledExactlyOnceWith(agentId));
+    } else {
+      expect(recovery).not.toHaveBeenCalled();
+    }
+  },
+);
+
+it("shows the pane toolbar when the header belongs to another workspace", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  await mountTopicConversation(client, true, 1000, false, [], false, {
+    headerWorkspaceId: "another-workspace",
+  });
+  expect(view.getAllByTestId("topic-stream-mode-switch")).toHaveLength(1);
+  expect(view.getByTestId("topic-stream-top-bar")).toBeTruthy();
+});
+
+it.each([
+  { fallbackTabId: pane.tabId, showsModeSwitch: true },
+  { fallbackTabId: "other-main-tab", showsModeSwitch: false },
+])(
+  "shows the fallback on the selected copy of a split Main tab ($fallbackTabId)",
+  async ({ fallbackTabId, showsModeSwitch }) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    await mountTopicConversation(client, true, 1000, false, [], false, {
+      paneFallback: { agentId, tabId: fallbackTabId },
+    });
+    expect(Boolean(view.queryByTestId("topic-stream-top-bar"))).toBe(showsModeSwitch);
+  },
+);
 
 it.each([
   { width: 1000, language: "en", topicsName: "Topic stream", timelineName: "Full timeline" },
@@ -1176,6 +1266,51 @@ function expectColumnsToAlign(card: HTMLElement, reference: HTMLElement) {
   expect(bounds.right).toBeCloseTo(expected.right);
   expect(bounds.width).toBeCloseTo(expected.width);
 }
+
+it("aligns the topic cards, tracks and composer while reserving the gutter in the timeline", async () => {
+  const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+  const width = CHAT_OUTLINE_MIN_PANEL_WIDTH + 2;
+  await mountTopicConversation(client, true, width, false, [], true, { chatOutline: true });
+  await userEvent.click(page.getByRole("button", { name: "Hide team directory" }));
+
+  const railSelector = '[data-chat-rail-lane="true"]';
+  const topicCard = () => view.getByTestId("topic-thread-card-msg:a");
+  const tracks = () => view.getByTestId("composer-track-scroll");
+  const composerRail = () => {
+    const input: HTMLElement = view.getByRole("textbox", { name: "Message agent..." });
+    return input.closest<HTMLElement>(railSelector)!;
+  };
+  const expectTopicColumns = (expectedWidth: number) => {
+    const card = topicCard();
+    const rail = composerRail();
+    expect(rail.closest('[data-chat-rail-active="true"]')).toBeNull();
+    expect(getComputedStyle(rail).paddingLeft).toBe("16px");
+    expect(getComputedStyle(tracks().closest(railSelector)!).paddingLeft).toBe("16px");
+    expectColumnsToAlign(card, rail.firstElementChild as HTMLElement);
+    expectColumnsToAlign(card, tracks().closest(railSelector)!.firstElementChild as HTMLElement);
+    expect(card.getBoundingClientRect().width).toBeCloseTo(expectedWidth);
+  };
+
+  expectTopicColumns(DEFAULT_CONTENT_MAX_WIDTH);
+  await userEvent.click(page.getByTestId("topic-stream-mode-timeline"));
+  await vi.waitFor(() => {
+    expect(view.queryByTestId("topic-stream-list")).toBeNull();
+    expect(getComputedStyle(composerRail()).paddingLeft).toBe(
+      `${16 + CHAT_OUTLINE_GUTTER_INSET}px`,
+    );
+    expect(getComputedStyle(tracks().closest(railSelector)!).paddingLeft).toBe(
+      `${16 + CHAT_OUTLINE_GUTTER_INSET}px`,
+    );
+  });
+
+  await userEvent.click(page.getByTestId("topic-stream-mode-topics"));
+  container.style.width = "420px";
+  await vi.waitFor(() => expectTopicColumns(420 - 32));
+
+  container.style.width = `${width}px`;
+  container.style.setProperty("--test-content-max-width", "100%");
+  await vi.waitFor(() => expectTopicColumns(width - 32));
+});
 
 it("aligns to the shared chat column with and without the outline gutter", async () => {
   initializeSession();

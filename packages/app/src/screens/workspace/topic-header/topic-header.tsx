@@ -1,6 +1,6 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceDescriptorPayload, WorkspaceTopic } from "@getpaseo/protocol/messages";
-import { PanelLeft } from "lucide-react-native";
+import { PanelLeft, PanelLeftClose } from "lucide-react-native";
 import type { TFunction } from "i18next";
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -10,6 +10,7 @@ import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { useHostFeature } from "@/runtime/host-features";
 import type { TeamDirectorySummary } from "@/subagents/team-directory";
 import { useAppActivelyVisible } from "@/hooks/use-app-visible";
+import { useTeamDirectoryShell } from "@/subagents/team-directory/shell-context";
 import {
   EMPTY_REPOS,
   getRebaseConflictLabel,
@@ -28,24 +29,26 @@ import {
 const ThemedPanelLeft = withUnistyles(PanelLeft, (theme) => ({
   color: theme.colors.foregroundMuted,
 }));
+const ThemedPanelLeftClose = withUnistyles(PanelLeftClose, (theme) => ({
+  color: theme.colors.foregroundMuted,
+}));
 
-export function TopicDirectoryToggle({
-  visible,
-  onToggle,
-}: {
-  visible: boolean;
-  onToggle: () => void;
-}) {
+export function TopicDirectoryToggle({ compact = false }: { compact?: boolean }) {
   const { t } = useTranslation();
+  const { isDirectoryVisible, toggleDirectory, openDirectory } = useTeamDirectoryShell();
+  if (!openDirectory) return null;
+  const Icon = isDirectoryVisible ? ThemedPanelLeftClose : ThemedPanelLeft;
   return (
     <ToolbarButton
-      compact
-      selected={visible}
-      label={t("topicWorkbench.header.toggleDirectory")}
-      onPress={onToggle}
+      compact={compact}
+      selected={isDirectoryVisible}
+      label={t(
+        isDirectoryVisible ? "topicWorkbench.directory.hide" : "topicWorkbench.directory.show",
+      )}
+      onPress={toggleDirectory}
       testID="topic-header-toggle-directory"
     >
-      <ThemedPanelLeft size={16} />
+      <Icon size={16} />
     </ToolbarButton>
   );
 }

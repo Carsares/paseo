@@ -42,6 +42,12 @@ import {
   type TopicDelivery,
   type TopicThreadStore,
 } from "./store.js";
+import {
+  resolveTopicPromptAttachments,
+  restoreTopicRetryAttachments,
+  TopicAttachmentsReuploadRequired,
+  type TopicUploadAccess,
+} from "./uploaded-attachments.js";
 
 type ReplyPayload = WorkspaceTopicReplyResponse["payload"];
 type Route = Required<Pick<ReplyPayload, "routedTo" | "fallbackReason">> & {
@@ -64,6 +70,7 @@ type DispatchTopicPrompt = ((input: {
   messageId: string;
   scope: Parameters<typeof topicFollowupRunOptions>[0];
   prompt: AgentPromptInput;
+  imageAttachments?: TopicThreadEntry["imageAttachments"];
   validate: () => Promise<void>;
   onHandoff: (pending: boolean) => Promise<void>;
   onStarted: () => Promise<void>;
@@ -267,6 +274,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     entry: TopicThreadEntry,
     route: Route,
     humanInitiated: boolean,
+    uploads: TopicUploadAccess | undefined,
     decision?: TopicDecisionDispatch,
     originalTaskCreatedAt?: string,
     boundRetryTask?: WorkspaceTask,
@@ -307,7 +315,14 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       }
     };
     let submittedTask: WorkspaceTask | undefined;
-    const send = async (target: Route) => {
+    const send = async (
+      target: Route,
+      {
+        files,
+        images,
+        imageAttachments,
+      }: Awaited<ReturnType<typeof resolveTopicPromptAttachments>>,
+    ) => {
       const task = await readTask();
       return deps.dispatch({
         agentId: target.targetAgentId,
@@ -320,9 +335,10 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         },
         prompt: buildAgentPrompt(
           topicContext(entry, target.fallbackReason) + (decision?.promptText ?? request.text),
-          undefined,
-          request.attachments,
+          images,
+          files,
         ),
+        ...(imageAttachments.length ? { imageAttachments } : {}),
         validate: async () => {
           await requireMain(request);
           if (target.fallbackReason !== "explicit_main") {
@@ -365,11 +381,18 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     };
     let outcome: TopicTurnOutcome | undefined;
     try {
+      const attachments = await resolveTopicPromptAttachments(request.attachments, uploads);
+      if (!request.text.trim() && !attachments.images.length)
+        throw new Error("Topic follow-up text is required.");
+      if (attachments.imageAttachments.length)
+        publish(
+          await store.setImageAttachments(workspaceId, entryId, attachments.imageAttachments),
+        );
       let target = route;
       for (;;) {
         shutdown.signal.throwIfAborted();
         try {
-          outcome = await send(target);
+          outcome = await send(target, attachments);
           break;
         } catch (error) {
           if (
@@ -576,11 +599,41 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       throw new Error("The reply no longer belongs to this topic operation.");
   }
 
+  async function prepareRetryAttachments(
+    address: ReplyAddress,
+    request: WorkspaceTopicReplyRequest,
+    replay: SavedDelivery,
+    replacements?: WorkspaceTopicReplyRequest["attachments"],
+    uploads?: TopicUploadAccess,
+  ) {
+    const { entry, delivery } = replay;
+    if (entry.origin && entry.origin !== "topic_reply") return;
+    if (replay.retryAttachments) return;
+    const repeat = await store.getDelivery(address, { sourceMessageId: request.clientMessageId });
+    if (
+      repeat?.retryAttachments ||
+      repeat?.entry.status === "completed" ||
+      repeat?.entry.status === "error"
+    )
+      return;
+    if (!entry.retryable && (repeat?.entry ?? entry).status !== "queued") return;
+    const restored = await restoreTopicRetryAttachments(
+      delivery.attachments,
+      replacements,
+      uploads,
+    );
+    if (restored === delivery.attachments) return;
+    await resolveTopicPromptAttachments(restored, uploads);
+    return restored;
+  }
+
   async function prepareDelivery(
     request: WorkspaceTopicReplyRequest,
     decision?: TopicDecisionDispatch,
+    uploads?: TopicUploadAccess,
   ) {
     const { workspaceId, topicKey } = request;
+    const replacementAttachments = request.retryOfEntryId ? request.attachments : undefined;
     // COMPAT(topicReplyLegacyRetry): v0.18.0 clients used a deterministic retry:<entryId> ID.
     // Remove after the client floor sends retryOfEntryId.
     const legacyRetry = /^retry:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i;
@@ -595,10 +648,20 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       ? await requireRetryDelivery(topicKey, retryOfEntryId, resolved)
       : await store.getDelivery(address, { sourceMessageId: request.clientMessageId });
     let boundRetryTask: WorkspaceTask | undefined;
+    let retryAttachments: TopicDelivery["attachments"];
     if (replay) {
       const { entry: previous, delivery: stored, decision: record } = replay;
       verifyDelivery(request, decision, retryOfEntryId, previous, stored, task, address);
-      if (retryOfEntryId) boundRetryTask = retryTaskBinding(replay, address, task, tasks);
+      if (retryOfEntryId) {
+        boundRetryTask = retryTaskBinding(replay, address, task, tasks);
+        retryAttachments = await prepareRetryAttachments(
+          address,
+          request,
+          replay,
+          replacementAttachments,
+          uploads,
+        );
+      }
       request = {
         ...request,
         text: previous.text,
@@ -608,7 +671,8 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       if (retryOfEntryId && record)
         decision = resumeDecision(workspaceId, record, previous, stored);
     }
-    if (!request.text.trim()) throw new Error("Topic follow-up text is required.");
+    if (!request.text.trim() && !request.attachments?.some((file) => file.type === "uploaded_file"))
+      throw new Error("Topic follow-up text is required.");
     const delivery = replay
       ? {
           ...replay.delivery,
@@ -620,7 +684,17 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           decisionPrompt: decision?.promptText,
           taskCreatedAt: task?.createdAt,
         };
-    return { request, decision, delivery, address, task, tasks, retryOfEntryId, boundRetryTask };
+    return {
+      request,
+      decision,
+      delivery,
+      address,
+      task,
+      tasks,
+      retryOfEntryId,
+      boundRetryTask,
+      retryAttachments,
+    };
   }
 
   return {
@@ -651,6 +725,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       request: WorkspaceTopicReplyRequest,
       decision?: TopicDecisionDispatch,
       humanInitiated = false,
+      uploads?: TopicUploadAccess,
     ): Promise<WorkspaceTopicReplyResponse> {
       const { requestId, workspaceId, topicKey } = request;
       const structured = decision !== undefined;
@@ -672,7 +747,8 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           tasks,
           retryOfEntryId,
           boundRetryTask,
-        } = await prepareDelivery(request, decision);
+          retryAttachments,
+        } = await prepareDelivery(request, decision, uploads);
         request = preparedRequest;
         decision = preparedDecision;
         const route = await selectRoute(request, task, deps);
@@ -700,6 +776,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
             delivery,
             retryOfEntryId,
             retryTasks,
+            retryAttachments,
           );
           return { ...result, anchorWrite };
         };
@@ -712,15 +789,23 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
             });
           return write();
         };
-        const { entry, changed, release, anchorWrite, sourceUpdate } = await claim();
+        const {
+          entry,
+          changed,
+          release,
+          anchorWrite,
+          sourceUpdate,
+          retryAttachments: claimedAttachments,
+        } = await claim();
         if (sourceUpdate) publish(sourceUpdate);
         if (changed || anchorWrite.changed) publish(entry, anchorWrite.anchor);
         if (release) {
           const work = dispatch(
-            request,
+            claimedAttachments ? { ...request, attachments: claimedAttachments } : request,
             entry,
             route,
             humanInitiated,
+            uploads,
             decision,
             delivery.taskCreatedAt,
             boundRetryTask,
@@ -745,7 +830,10 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         });
       } catch (error) {
         if (error instanceof TopicDecisionError && structured) throw error;
-        if (error instanceof SupersededDurableDecisionError)
+        if (
+          error instanceof SupersededDurableDecisionError ||
+          error instanceof TopicAttachmentsReuploadRequired
+        )
           return respond({
             routedTo: "main",
             targetAgentId: null,
@@ -812,6 +900,7 @@ export function createTopicPromptDispatcher({
     messageId,
     scope,
     prompt,
+    imageAttachments,
     validate,
     onHandoff,
     onStarted,
@@ -889,7 +978,7 @@ export function createTopicPromptDispatcher({
             agentId,
             prompt,
             messageId,
-            runOptions: topicFollowupRunOptions(scope),
+            runOptions: { ...topicFollowupRunOptions(scope), imageAttachments },
             logger,
             idleOnly: true,
             unarchive: false,

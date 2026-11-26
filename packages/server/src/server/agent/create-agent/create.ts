@@ -114,6 +114,7 @@ export interface CreateAgentFromSessionInput {
   clientMessageId?: string;
   outputSchema?: Record<string, unknown>;
   images?: Array<{ data: string; mimeType: string }>;
+  imageAttachments?: AgentRunOptions["imageAttachments"];
   attachments?: AgentAttachment[];
   labels: Record<string, string>;
   metadata?: CreateAgentOptions["metadata"];
@@ -539,6 +540,7 @@ async function resolveSessionCreateAgent(
       ? {
           ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
           ...(clientMessageId ? { clientMessageId } : {}),
+          ...(input.imageAttachments?.length ? { imageAttachments: input.imageAttachments } : {}),
         }
       : undefined;
   const workspaceId = input.workspaceId;

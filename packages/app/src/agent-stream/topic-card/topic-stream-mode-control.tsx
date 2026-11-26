@@ -26,7 +26,14 @@ import type { Theme } from "@/styles/theme";
 import type { StreamItem } from "@/types/stream";
 import { useTopicStreamMarkAllRead } from "./topic-stream-list";
 
-const ModeHeaderAgentKey = createContext<string | null>(null);
+interface TopicStreamToolbarScope {
+  serverId: string;
+  workspaceId: string;
+  agentId: string | null;
+  paneFallback?: { agentId: string; tabId: string };
+}
+
+const ModeHeader = createContext<TopicStreamToolbarScope | null>(null);
 const MODE_SWITCH_ID = "topic-stream-mode-switch";
 const EMPTY_STREAM_ITEMS: readonly StreamItem[] = [];
 const ThemedEllipsis = withUnistyles(Ellipsis, (theme: Theme) => ({
@@ -35,22 +42,32 @@ const ThemedEllipsis = withUnistyles(Ellipsis, (theme: Theme) => ({
 const ThemedHistory = withUnistyles(History);
 const ThemedMessageSquare = withUnistyles(MessageSquare);
 
-/** Supply the agent whose workspace header currently renders the mode and actions. */
+/** The workspace owns the toolbar when its header can show it, or picks one visible copy. */
 export function TopicStreamModeHeaderProvider({
   serverId,
+  workspaceId,
   agentId,
+  paneFallback,
   children,
-}: {
-  serverId: string;
-  agentId: string | null;
-  children: ReactNode;
-}) {
-  const agentKey = agentId ? buildTopicAgentKey(serverId, agentId) : null;
-  return <ModeHeaderAgentKey.Provider value={agentKey}>{children}</ModeHeaderAgentKey.Provider>;
+}: TopicStreamToolbarScope & { children: ReactNode }) {
+  const owner = useMemo(
+    () => ({ serverId, workspaceId, agentId, paneFallback }),
+    [agentId, paneFallback, serverId, workspaceId],
+  );
+  return <ModeHeader.Provider value={owner}>{children}</ModeHeader.Provider>;
 }
 
-export function useTopicStreamModeInHeader(serverId: string, agentId: string): boolean {
-  return useContext(ModeHeaderAgentKey) === buildTopicAgentKey(serverId, agentId);
+export function useTopicStreamToolbarInPane(
+  serverId: string,
+  workspaceId: string,
+  agentId: string,
+  tabId: string,
+): boolean {
+  const owner = useContext(ModeHeader);
+  if (owner?.serverId !== serverId || owner.workspaceId !== workspaceId) return true;
+  if (owner.agentId === agentId) return false;
+  const fallback = owner.paneFallback;
+  return fallback?.agentId !== agentId || fallback.tabId === tabId;
 }
 
 export function useTopicStreamMode(
@@ -67,11 +84,13 @@ export function TopicStreamModeControl({
   serverId,
   agentId,
   compact,
+  iconOnly = compact,
   workspaceId,
 }: {
   serverId: string;
   agentId: string;
   compact: boolean;
+  iconOnly?: boolean;
   workspaceId?: string;
 }) {
   const { t } = useTranslation();
@@ -113,14 +132,14 @@ export function TopicStreamModeControl({
     />
   ) : null;
 
-  if (compact) {
+  if (iconOnly) {
     const showingTopics = viewMode === "topics";
     const ModeIcon = showingTopics ? ThemedMessageSquare : ThemedHistory;
     return (
       <DropdownMenu>
         <ToolbarButton
           kind="menu"
-          compact
+          compact={compact}
           label={showingTopics ? topicsLabel : timelineLabel}
           testID={MODE_SWITCH_ID}
         >
@@ -170,6 +189,26 @@ export function TopicStreamModeControl({
     </ToolbarControls>
   ) : (
     switcher
+  );
+}
+
+export function TopicStreamWorkspaceMenuItems({
+  serverId,
+  workspaceId,
+  agentId,
+}: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+}) {
+  const viewMode = useTopicStreamMode(serverId, agentId);
+  return (
+    <TopicStreamActionItems
+      serverId={serverId}
+      workspaceId={workspaceId}
+      agentId={agentId}
+      viewMode={viewMode}
+    />
   );
 }
 

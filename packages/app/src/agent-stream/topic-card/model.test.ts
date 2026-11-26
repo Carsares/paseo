@@ -9,11 +9,18 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { describe, expect, it } from "vitest";
 import { upsertTopicAnchor } from "@/topic-threads/queries";
+import { TURN_LIVENESS_IDLE } from "@/timeline/turn-liveness";
 import { reduceStreamUpdate, type StreamItem } from "@/types/stream";
-import { canDecideDurableItemInTopic, extractQuickReplyOptions, projectTopicUnits } from "./model";
+import {
+  canDecideDurableItemInTopic,
+  extractQuickReplyOptions,
+  projectTopicUnits,
+  type TopicAgentRuntime,
+} from "./model";
 
 function makeHumanPrompt(input: {
   id: string;
+  turnId?: string;
   messageId?: string;
   text: string;
   seq: number;
@@ -22,6 +29,7 @@ function makeHumanPrompt(input: {
   return {
     kind: "user_message",
     id: input.id,
+    turnId: input.turnId,
     messageId: input.messageId ?? input.id,
     text: input.text,
     timestamp: new Date(input.ts),
@@ -31,7 +39,9 @@ function makeHumanPrompt(input: {
 
 function makeSubagentReport(input: {
   id: string;
+  turnId?: string;
   senderId: string;
+  senderServerId?: string;
   senderTitle: string;
   text: string;
   taskId?: string;
@@ -44,6 +54,7 @@ function makeSubagentReport(input: {
   return {
     kind: "tool_call",
     id: input.id,
+    turnId: input.turnId,
     timestamp: new Date(input.ts),
     timelineCursor: { epoch: "ep-1", seq: input.seq },
     payload: {
@@ -57,7 +68,7 @@ function makeSubagentReport(input: {
         detail: { type: "unknown", input: null, output: null },
         agentMessage: {
           event: input.event ?? "finished",
-          sender: { id: input.senderId, title: input.senderTitle },
+          sender: { id: input.senderId, title: input.senderTitle, serverId: input.senderServerId },
           text: input.text,
           ...(input.reportStatus ? { reportStatus: input.reportStatus } : {}),
           ...(input.taskId ? { taskId: input.taskId } : {}),
@@ -68,8 +79,249 @@ function makeSubagentReport(input: {
   };
 }
 
+function makePaseoToolResult(
+  name: string,
+  id: string,
+  output: unknown,
+  turnId?: string,
+): StreamItem {
+  return {
+    kind: "tool_call",
+    id,
+    turnId,
+    timestamp: new Date(2000),
+    payload: {
+      source: "agent",
+      data: {
+        provider: "codex",
+        callId: id,
+        name: `paseo.${name}`,
+        status: "completed",
+        error: null,
+        detail: { type: "unknown", input: {}, output: { structuredContent: output } },
+      },
+    },
+  };
+}
+
+describe("delegation lifecycle", () => {
+  const child = { agentId: "resident", serverId: "local" };
+  function dispatch(rootMessageId: string, messageId: string, serverId = child.serverId) {
+    return makePaseoToolResult("send_agent_prompt", messageId, {
+      success: true,
+      deliveryStatus: "queued",
+      topicDelegation: { agentId: child.agentId, serverId, rootMessageId, messageId },
+    });
+  }
+  const a = makeHumanPrompt({ id: "root-a", text: "First", seq: 1, ts: 1000 });
+  const b = makeHumanPrompt({ id: "root-b", text: "Second", seq: 2, ts: 3000 });
+  const prompt = (messageId: string, turnId: string): StreamItem => ({
+    kind: "user_message",
+    id: messageId,
+    clientMessageId: messageId,
+    turnId,
+    text: "Work",
+    timestamp: new Date(2000),
+  });
+  const explicitReportId = 'paseo-agent-message:["local","resident","report-a"]';
+  const report = (ref: { rootMessageId?: string; senderServerId?: string } = {}) =>
+    makeSubagentReport({
+      id: explicitReportId,
+      senderId: child.agentId,
+      senderServerId: "local",
+      senderTitle: "Old title",
+      text: "Finished first",
+      reportStatus: "completed",
+      seq: 3,
+      ts: 5000,
+      ...ref,
+    });
+  const read = {
+    workspaceId: "workspace",
+    mainAgentId: "main",
+    watermarkEpoch: "ep-1",
+    watermarkSeq: 10,
+    watermarkTimestampMs: 6000,
+    topics: [],
+    revision: 1,
+  } satisfies WorkspaceTopicReadSnapshot;
+  const finishReport = makePaseoToolResult(
+    "report_to_parent",
+    "tool-report-a",
+    { success: true, messageId: "report-a" },
+    "turn-a",
+  );
+  function runtime(timeline: StreamItem[], turnId?: string): TopicAgentRuntime {
+    return {
+      title: "Live specialist",
+      status: turnId ? "running" : "idle",
+      turn: turnId
+        ? { phase: "open", turnId, startedAt: null, cancellationRequestId: null }
+        : TURN_LIVENESS_IDLE,
+      timeline,
+    };
+  }
+
+  it("keeps a finished dispatch separate from a running or queued dispatch to the same resident", () => {
+    const items = [a, dispatch("root-a", "dispatch-a"), b, dispatch("root-b", "dispatch-b")];
+    const queued = projectTopicUnits({
+      items,
+      localServerId: "local",
+      readAgentRuntime: () => runtime([prompt("dispatch-a", "turn-a")], "turn-a"),
+    });
+    expect(queued.topics.map(({ lifecycleStatus }) => lifecycleStatus)).toEqual([
+      "dispatching",
+      "dispatching",
+    ]);
+    const later = projectTopicUnits({
+      items,
+      localServerId: "local",
+      readAgentRuntime: () =>
+        runtime([prompt("dispatch-a", "turn-a"), prompt("dispatch-b", "turn-b")], "turn-b"),
+    });
+    expect(
+      later.topics.map(({ lifecycleStatus, leadTitle }) => [lifecycleStatus, leadTitle]),
+    ).toEqual([
+      ["awaitingReport", "Live specialist"],
+      ["dispatching", "Live specialist"],
+    ]);
+  });
+
+  it("routes an explicit report for a previous turn to that topic and keeps completed status after read", () => {
+    const readAgentRuntime = () =>
+      runtime([prompt("dispatch-a", "turn-a"), finishReport, prompt("dispatch-b", "turn-b")]);
+    const items = [
+      a,
+      dispatch("root-a", "dispatch-a"),
+      b,
+      dispatch("root-b", "dispatch-b"),
+      report(),
+    ];
+    const unread = projectTopicUnits({
+      items,
+      localServerId: "local",
+      readAgentRuntime,
+      agentRequiresAttention: true,
+    });
+    expect(unread.topics[0]?.replies.map((reply) => reply.id)).toEqual([explicitReportId]);
+    const seen = projectTopicUnits({
+      items,
+      localServerId: "local",
+      readAgentRuntime,
+      readSnapshot: read,
+    });
+    expect(
+      seen.topics.map(({ lifecycleStatus, replies }) => [lifecycleStatus, replies.length]),
+    ).toEqual([
+      ["completed", 1],
+      ["awaitingReport", 0],
+    ]);
+  });
+
+  it("does not count an automatic finish, a report scoped to another card, or the same agent ID on another host", () => {
+    const auto = makeSubagentReport({
+      id: "auto-finish",
+      senderId: child.agentId,
+      senderServerId: "local",
+      senderTitle: "Old title",
+      rootMessageId: "root-a",
+      text: "Finished automatically",
+      seq: 3,
+      ts: 4000,
+    });
+    const projection = projectTopicUnits({
+      items: [
+        a,
+        dispatch("root-a", "dispatch-a"),
+        b,
+        dispatch("root-b", "dispatch-b", "remote"),
+        auto,
+        report({ rootMessageId: "root-b" }),
+      ],
+      pendingInboxItems: [{ agentId: child.agentId, serverId: "local", event: "finished" }],
+      localServerId: "local",
+      readSnapshot: read,
+      readAgentRuntime: (host) =>
+        host === "local"
+          ? runtime([prompt("dispatch-a", "turn-a"), finishReport])
+          : { ...runtime([prompt("dispatch-b", "turn-b")], "turn-b"), title: "Remote specialist" },
+    });
+    expect(
+      projection.topics.map(({ lifecycleStatus, leadTitle }) => [lifecycleStatus, leadTitle]),
+    ).toEqual([
+      ["awaitingReport", "Live specialist"],
+      ["dispatching", "Remote specialist"],
+    ]);
+    expect(projection.topics.map(({ pendingInboxItems }) => pendingInboxItems.length)).toEqual([
+      0, 0,
+    ]);
+  });
+
+  it("uses cold dispatch state and rejects an explicit report stamped with another topic", () => {
+    const anchor = (
+      rootMessageId: string,
+      status: "ended" | "completed" | "queued",
+      serverId = "local",
+      reportIds?: string[],
+    ): TopicAnchorSummary => ({
+      workspaceId: "workspace",
+      mainAgentId: "main",
+      topicKey: `msg:${rootMessageId}`,
+      rootMessageId,
+      rootPromptText: rootMessageId === "root-a" ? "First" : "Second",
+      createdAt: new Date(rootMessageId === "root-a" ? 1000 : 3000).toISOString(),
+      updatedAt: new Date(5000).toISOString(),
+      delegations: [
+        {
+          ...child,
+          serverId,
+          messageId: "same-dispatch-id",
+          title: `Specialist on ${serverId}`,
+          status,
+          reportIds,
+          updatedAt: new Date(5000).toISOString(),
+        },
+      ],
+    });
+    const project = (status: "ended" | "completed", items: StreamItem[]) =>
+      projectTopicUnits({
+        items,
+        localServerId: "local",
+        readSnapshot: read,
+        topicAnchors: [
+          anchor("root-a", status, "local", ["report-a"]),
+          anchor("root-b", "queued", "remote"),
+        ],
+      }).topics.map((topic) => [topic.lifecycleStatus, topic.leadTitle, topic.replies.length]);
+    expect(project("ended", [])).toEqual([
+      ["awaitingReport", "Specialist on local", 0],
+      ["dispatching", "Specialist on remote", 0],
+    ]);
+    expect(project("completed", [report({ rootMessageId: "root-b" })])).toEqual([
+      ["completed", "Specialist on local", 0],
+      ["dispatching", "Specialist on remote", 0],
+    ]);
+  });
+
+  it("shows replied for direct main answers and leaves a prompt without evidence unbadged", () => {
+    const projection = projectTopicUnits({
+      items: [
+        a,
+        makeAssistantConclusion({ id: "answer", text: "Direct answer", seq: 2, ts: 2000 }),
+        b,
+      ],
+      readSnapshot: read,
+    });
+    expect(projection.topics.map(({ lifecycleStatus }) => lifecycleStatus)).toEqual([
+      "replied",
+      null,
+    ]);
+  });
+});
+
 function makeAssistantConclusion(input: {
   id: string;
+  turnId?: string;
   text: string;
   seq: number;
   ts: number;
@@ -77,12 +329,173 @@ function makeAssistantConclusion(input: {
   return {
     kind: "assistant_message",
     id: input.id,
+    turnId: input.turnId,
     messageId: input.id,
     text: input.text,
     timestamp: new Date(input.ts),
     timelineCursor: { epoch: "ep-1", seq: input.seq },
   };
 }
+
+function topicReplyIds(topic: ReturnType<typeof projectTopicUnits>["topics"][number]) {
+  return topic.replies.map((row) => row.id);
+}
+
+describe("main replies in topic turns", () => {
+  const human = (id: string, seq: number, turnId?: string) =>
+    makeHumanPrompt({ id, turnId, text: id, seq, ts: seq * 1000 });
+  const answer = (id: string, seq: number, turnId?: string) =>
+    makeAssistantConclusion({ id, turnId, text: id, seq, ts: seq * 1000 });
+  const report = (
+    id: string,
+    rootMessageId: string,
+    seq: number,
+    turnId?: string,
+    complete = true,
+  ) =>
+    makeSubagentReport({
+      id: "paseo-agent-message:" + id,
+      rootMessageId,
+      turnId,
+      seq,
+      ts: seq * 1000,
+      senderId: "specialist",
+      senderServerId: "local",
+      senderTitle: "Specialist",
+      event: complete ? "message" : "finished",
+      reportStatus: complete ? "completed" : undefined,
+      text: id,
+    });
+  const tool = (rootMessageId: string, success: boolean) =>
+    makePaseoToolResult(
+      "send_agent_prompt",
+      "dispatch",
+      {
+        success,
+        deliveryStatus: "queued",
+        topicDelegation: {
+          agentId: "specialist",
+          serverId: "local",
+          rootMessageId,
+          messageId: "handoff",
+        },
+      },
+      "human",
+    );
+
+  it("preserves dispatch progress after a formal report and restores the conclusion to the older card", () => {
+    const result = projectTopicUnits({
+      items: [
+        human("old", 1, "human"),
+        tool("old", true),
+        answer("waiting", 3, "human"),
+        human("new", 4, "new-human"),
+        answer("direct", 5, "new-human"),
+        report("finish-notice", "old", 6, "auto", false),
+        answer("still-waiting", 7, "auto"),
+        report("formal", "old", 8, "report"),
+        answer("formal-answer", 9, "report"),
+      ],
+      localServerId: "local",
+    });
+    expect(result.topics[0]!.replies).toMatchObject([
+      { id: "waiting", kind: "main_progress", dispatched: true },
+      { id: "paseo-agent-message:finish-notice", kind: "subagent_report" },
+      { id: "still-waiting", kind: "main_progress", dispatched: true },
+      { id: "paseo-agent-message:formal", kind: "subagent_report" },
+      { id: "formal-answer", kind: "main_conclusion" },
+    ]);
+    expect(result.topics[1]!.replies).toMatchObject([{ id: "direct", kind: "main_conclusion" }]);
+  });
+
+  it("keeps a mirrored main follow-up in progress with its original message identity", () => {
+    const entry = {
+      workspaceId: "workspace",
+      mainAgentId: "main",
+      routedAgentId: "main",
+      topicKey: "msg:old",
+      rootMessageId: "old",
+      status: "completed",
+      createdAt: new Date(2000).toISOString(),
+      updatedAt: new Date(2000).toISOString(),
+    } as const;
+    const { topics } = projectTopicUnits({
+      items: [
+        human("old", 1, "root"),
+        human("followup", 2, "human"),
+        tool("old", true),
+        answer("waiting", 3, "human"),
+      ],
+      threadEntries: [
+        {
+          ...entry,
+          role: "user_followup",
+          entryId: "followup",
+          text: "followup",
+          seq: 1,
+          sourceMessageId: "followup",
+        },
+        {
+          ...entry,
+          role: "agent_reply",
+          entryId: "mirror",
+          text: "waiting",
+          seq: 2,
+          sourceMessageId: "waiting",
+        },
+      ],
+    });
+    expect(topics[0]!.replies).toMatchObject([
+      { id: "thread:followup" },
+      { id: "thread:mirror", messageId: "waiting", kind: "main_progress", dispatched: true },
+    ]);
+  });
+
+  it("shows a failed dispatch as neutral progress and never counts it as an answer", () => {
+    const { topics } = projectTopicUnits({
+      items: [human("old", 1, "human"), tool("old", false), answer("could-not-send", 3, "human")],
+    });
+    expect(topics[0]!.replies).toMatchObject([
+      { id: "could-not-send", kind: "main_progress", dispatched: false },
+    ]);
+    expect(topics[0]!.lifecycleStatus).toBeNull();
+  });
+
+  it("keeps a multi-topic report batch unassigned while routing each individual report", () => {
+    const { topics } = projectTopicUnits({
+      items: [
+        human("old", 1, "old-human"),
+        human("new", 2, "new-human"),
+        report("one", "old", 3, "batch"),
+        report("two", "new", 4, "batch"),
+        answer("ambiguous-summary", 5, "batch"),
+      ],
+    });
+    expect(topics.map(topicReplyIds)).toEqual([
+      ["paseo-agent-message:one"],
+      ["paseo-agent-message:two"],
+    ]);
+  });
+
+  it("keeps a steered human prompt's reply on its own topic and supports legacy report turns", () => {
+    const { topics } = projectTopicUnits({
+      items: [
+        human("old", 1, "old-human"),
+        human("new", 2, "new-human"),
+        report("pre-steer", "old", 3, "steered"),
+        human("steer", 4, "steered"),
+        answer("steered-answer", 5, "steered"),
+        report("legacy", "new", 6),
+        answer("legacy-answer", 7),
+      ],
+    });
+    expect(topics.map(topicReplyIds)).toEqual([
+      ["paseo-agent-message:pre-steer"],
+      ["paseo-agent-message:legacy", "legacy-answer"],
+      ["steered-answer"],
+    ]);
+  });
+});
 
 describe("projectTopicUnits", () => {
   it("routes out-of-order concurrent subagent reports to their matching topic card by taskId", () => {
@@ -121,6 +534,7 @@ describe("projectTopicUnits", () => {
       }),
       makeHumanPrompt({
         id: "u-2",
+        turnId: "human-2",
         messageId: "msg-2",
         text: "Question 2: sidebar",
         seq: 2,
@@ -129,6 +543,7 @@ describe("projectTopicUnits", () => {
       // Out-of-order report for T-1 arriving AFTER Question 2!
       makeSubagentReport({
         id: "rep-1",
+        turnId: "human-2",
         senderId: "lead-1",
         senderTitle: "Backend Lead",
         text: "Auth refactor complete",
@@ -138,7 +553,13 @@ describe("projectTopicUnits", () => {
         seq: 3,
         ts: 3000,
       }),
-      makeAssistantConclusion({ id: "main-2", text: "Sidebar fixed", seq: 4, ts: 4000 }),
+      makeAssistantConclusion({
+        id: "main-2",
+        turnId: "human-2",
+        text: "Sidebar fixed",
+        seq: 4,
+        ts: 4000,
+      }),
     ];
 
     const result = projectTopicUnits({ items, tasks });
@@ -658,7 +1079,7 @@ describe("projectTopicUnits", () => {
         revision: 1,
       },
     });
-    expect(recovered.topics[0]!.lifecycleStatus).toBe("settled");
+    expect(recovered.topics[0]!.lifecycleStatus).toBeNull();
     expect(recovered.topics[0]!.retryCandidate).toBeNull();
     const failedFollowup = {
       ...recoveredEntries[0]!,

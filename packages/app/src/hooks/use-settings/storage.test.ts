@@ -55,6 +55,22 @@ function makeDeps(
 }
 
 describe("loadAppSettingsFromStorage", () => {
+  it("defaults missing or invalid message alignment to right and persists left", async () => {
+    const storage = createInMemoryKeyValueStorage({
+      [APP_SETTINGS_KEY]: JSON.stringify({ userMessageAlignment: "center" }),
+    });
+    const deps = makeDeps({ storage });
+    const queryClient = new QueryClient();
+    expect((await loadAppSettingsFromStorage(deps)).userMessageAlignment).toBe("right");
+    expect((await loadAppSettingsFromStorage(makeDeps())).userMessageAlignment).toBe("right");
+
+    await saveAppSettings({ queryClient, deps, updates: { userMessageAlignment: "left" } });
+    expect(queryClient.getQueryData(APP_SETTINGS_QUERY_KEY)).toMatchObject({
+      userMessageAlignment: "left",
+    });
+    expect((await loadAppSettingsFromStorage(deps)).userMessageAlignment).toBe("left");
+  });
+
   it("defaults Main Control off and persists an explicit choice in client settings", async () => {
     const deps = makeDeps({
       desktop: createFakeDesktopBridge({ isElectron: true }),

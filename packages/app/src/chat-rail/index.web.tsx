@@ -66,7 +66,11 @@ function cssLength(value: number | string): string {
  * via CSS custom properties to the composer, track bar, and callouts. Only the outline
  * enabled flag and reserved inset (`0` or `44`) enter React context for `AgentStreamView`.
  */
-export function ChatColumnRailSurface({ serverId, children }: ChatColumnRailSurfaceProps) {
+export function ChatColumnRailSurface({
+  serverId,
+  allowOutline = true,
+  children,
+}: ChatColumnRailSurfaceProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const [isBelow, setIsBelow] = useState(true);
   const chatOutlineEnabled = useSettings((settings) => settings.chatOutlineEnabled);
@@ -95,7 +99,7 @@ export function ChatColumnRailSurface({ serverId, children }: ChatColumnRailSurf
     return () => observer.disconnect();
   }, []);
 
-  const enabled = supportsChatOutline && chatOutlineEnabled;
+  const enabled = allowOutline && supportsChatOutline && chatOutlineEnabled;
   const inset = enabled && !isBelow ? CHAT_OUTLINE_GUTTER_INSET : 0;
 
   useLayoutEffect(() => {

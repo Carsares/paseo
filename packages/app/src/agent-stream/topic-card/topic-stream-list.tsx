@@ -1,4 +1,9 @@
+import { Buffer } from "buffer";
+import { resolveRasterImageMimeType } from "@/attachments/file-types";
+import type { MessageImageReader } from "@/components/read-only-message-images";
+import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
 import type {
+  AgentAttachment,
   TopicReplyRouteMode,
   WorkspaceDurableItem,
   WorkspaceTodoItem,
@@ -15,8 +20,17 @@ import {
   type NativeSyntheticEvent,
 } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
+import { useShallow } from "zustand/react/shallow";
 import type { ComposerAttachment } from "@/attachments/types";
-import { submitActiveTopicReply } from "./submit-topic-reply";
+import type { QuoteComposerAttachment } from "@/attachments/quote";
+import { uploadFileAttachments } from "@/composer/actions";
+import { isHandoffInputLocked } from "@/composer/handoff-input-lock";
+import { useDraftStore } from "@/stores/draft-store";
+import {
+  isTopicComposerDraftSubmitting,
+  resolveReplyComposerDraftKey,
+  submitActiveTopicReply,
+} from "./submit-topic-reply";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { Button } from "@/components/ui/button";
 import { useWorkspaceTasks } from "@/composer/workspace-task-ledger/query";
@@ -27,6 +41,7 @@ import {
   useWorkspaceDurableItems,
 } from "@/durable-items/queries";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
+import { useFilePicker } from "@/hooks/use-file-picker";
 import { usePaneContext } from "@/panels/pane-context";
 import { useHostFeature } from "@/runtime/host-features";
 import { getHostRuntimeStore, useHostRuntimeClient } from "@/runtime/host-runtime";
@@ -59,6 +74,7 @@ import {
   useWorkspaceTopicReadState,
 } from "@/topic-read/queries";
 import {
+  applyTopicAnchorToCache,
   decideWorkspaceTopicOnHost,
   replyToWorkspaceTopic,
   TopicReplyRejectedError,
@@ -68,7 +84,13 @@ import type { PendingPermission } from "@/types/shared";
 import { generateMessageId, type StreamItem } from "@/types/stream";
 import { DisclosureRow } from "../disclosure";
 import type { DisclosureTriggerEdge, StreamViewportHandle } from "../strategy";
-import { canDecideDurableItemInTopic, projectTopicUnits, type TopicUnit } from "./model";
+import {
+  canDecideDurableItemInTopic,
+  projectTopicUnits,
+  getTopicProjectionAgentAddresses,
+  type TopicAgentRuntime,
+  type TopicUnit,
+} from "./model";
 import type { TopicDecisionSubmitInput, TopicDecisionSubmitResult } from "./topic-decision-slot";
 import {
   resolveFlushableTaskId,
@@ -80,7 +102,27 @@ import {
 
 const MAX_JUMP_HISTORY_FETCHES = 4;
 // Keep the request ID if the topic view closes before the host acknowledges a retry.
-const retryIntents = new Map<string, string>();
+const retryIntents = new Map<
+  string,
+  { clientMessageId: string; attachments?: AgentAttachment[] }
+>();
+
+// The file API handles this virtual attachment address with the authenticated upload owner.
+const MESSAGE_IMAGE_PREFIX = "paseo-attachment:";
+const MAX_MESSAGE_IMAGE_BYTES = 50 * 1024 * 1024;
+
+function readRetryUploadNames(error: TopicReplyRejectedError): string[] | null {
+  const prefix = "topic_attachments_reupload_required:";
+  if (!error.message.startsWith(prefix)) return null;
+  try {
+    const names: unknown = JSON.parse(error.message.slice(prefix.length));
+    if (Array.isArray(names) && names.length && names.every((name) => typeof name === "string"))
+      return names;
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 interface ActiveDisclosureHold {
   rowId: string;
@@ -103,7 +145,8 @@ function topicMatchesJumpIntent(
     if (
       topic.replies.some(
         (reply) =>
-          (reply.kind === "main_conclusion" && reply.messageId === jump.messageId) ||
+          ((reply.kind === "main_conclusion" || reply.kind === "main_progress") &&
+            reply.messageId === jump.messageId) ||
           (reply.kind === "thread_entry" && reply.entry.sourceMessageId === jump.messageId),
       )
     ) {
@@ -537,12 +580,36 @@ export const TopicStreamList = memo(function TopicStreamList({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const client = useHostRuntimeClient(serverId);
+  const workspaceDirectory = useWorkspaceDirectory(serverId, workspaceId);
+  const imageReader = useMemo<MessageImageReader | undefined>(() => {
+    if (!client || !workspaceDirectory) return undefined;
+    return {
+      serverId,
+      workspaceId,
+      read: async (image) => {
+        const file = await client.readFile(
+          workspaceDirectory,
+          MESSAGE_IMAGE_PREFIX + image.id,
+          undefined,
+          Math.min(image.size, MAX_MESSAGE_IMAGE_BYTES),
+        );
+        const mime = resolveRasterImageMimeType({ mimeType: file.mime });
+        if (!mime || mime !== image.mimeType || file.size !== image.size) {
+          throw new Error("Image attachment is unavailable.");
+        }
+        return "data:" + mime + ";base64," + Buffer.from(file.bytes).toString("base64");
+      },
+    };
+  }, [client, serverId, workspaceDirectory, workspaceId]);
   const paneActive = useRetainedPanelActive();
   const { tabId } = usePaneContext();
   const teamDirectoryShell = useTeamDirectoryShell();
   const setTeamDirectoryTab = useTeamDirectoryViewStore((state) => state.setActiveTab);
 
   const agentKey = buildTopicAgentKey(serverId, mainAgentId);
+  const lastLiveItem = isTurnActive ? streamHead.at(-1) : undefined;
+  const streamingConclusionId =
+    lastLiveItem?.kind === "assistant_message" ? lastLiveItem.id : undefined;
   const unreadOnly = useTopicStreamViewStore(
     (state) => state.unreadOnlyByAgentKey[agentKey] ?? false,
   );
@@ -563,12 +630,42 @@ export const TopicStreamList = memo(function TopicStreamList({
     workspaceId,
     paneActive && supportsTaskLedger,
   );
-  const { entries: threadEntries, anchors: topicAnchors } = useWorkspaceTopicEntries(
-    serverId,
-    workspaceId,
+  const {
+    entries: threadEntries,
+    anchors: topicAnchors,
+    refetch: refetchTopicEntries,
+  } = useWorkspaceTopicEntries(serverId, workspaceId, mainAgentId, paneActive);
+  const supportsTopicAnchorEvents = useHostFeature(serverId, "workspaceTopicAnchorEvents");
+  useEffect(() => {
+    // COMPAT(workspaceTopicAnchorEvents): added in v0.18.0, remove gate after 2027-06-01.
+    if (!supportsTopicAnchorEvents || !client || !paneActive) return;
+    const observation = client.observeEvents(["workspace.topic.anchor.updated"]);
+    const unsubscribe = observation.subscribe({
+      snapshot: () => {
+        void refetchTopicEntries().catch(() => undefined);
+      },
+      update: (message) => {
+        if (message.type !== "workspace.topic.anchor.updated") return;
+        const { payload } = message;
+        if (payload.workspaceId !== workspaceId || payload.mainAgentId !== mainAgentId) return;
+        applyTopicAnchorToCache(queryClient, serverId, payload);
+      },
+    });
+    void observation.ready.catch(() => undefined);
+    return () => {
+      unsubscribe();
+      void observation.release().catch(() => undefined);
+    };
+  }, [
+    client,
     mainAgentId,
     paneActive,
-  );
+    queryClient,
+    refetchTopicEntries,
+    serverId,
+    supportsTopicAnchorEvents,
+    workspaceId,
+  ]);
   const { snapshot: readSnapshot } = useWorkspaceTopicReadState(
     serverId,
     workspaceId,
@@ -608,23 +705,62 @@ export const TopicStreamList = memo(function TopicStreamList({
     const agent = session?.agents.get(mainAgentId) ?? session?.agentDetails.get(mainAgentId);
     return agent?.pendingSubagentInbox?.items;
   });
-  const sessionAgents = useSessionStore((state) => state.sessions[serverId]?.agents);
   const isTimelineSynced = useSessionStore(
     (state) => selectAgentTimelineState(state.sessions[serverId], mainAgentId).status === "synced",
   );
-
-  const agentTitleById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const [id, agent] of sessionAgents ?? []) {
-      if (agent.title?.trim()) map.set(id, agent.title.trim());
-    }
-    return map;
-  }, [sessionAgents]);
-
   const combinedItems = useMemo(
     () => (streamHead.length > 0 ? [...streamItems, ...streamHead] : [...streamItems]),
     [streamHead, streamItems],
   );
+  const delegationAddresses = useMemo(
+    () =>
+      getTopicProjectionAgentAddresses(
+        {
+          items: combinedItems,
+          topicAnchors,
+          tasks: tasksQuery.data,
+          threadEntries,
+          pendingInboxItems,
+        },
+        serverId,
+      ),
+    [combinedItems, topicAnchors, tasksQuery.data, threadEntries, pendingInboxItems, serverId],
+  );
+  const delegationAgents = useSessionStore(
+    useShallow((state) =>
+      delegationAddresses.map(({ serverId: childServerId, agentId }) => {
+        const session = state.sessions[childServerId];
+        return session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+      }),
+    ),
+  );
+  const runtimeByAddress = useMemo(() => {
+    const runtimes = new Map<string, TopicAgentRuntime>();
+    for (const [index, address] of delegationAddresses.entries()) {
+      const agent = delegationAgents[index];
+      if (agent)
+        runtimes.set(JSON.stringify([address.serverId, address.agentId]), {
+          title: agent.title,
+          status: agent.status,
+          turn: agent.turn,
+        });
+    }
+    return runtimes;
+  }, [delegationAddresses, delegationAgents]);
+  const readAgentRuntime = useCallback(
+    (childServerId: string, agentId: string) =>
+      runtimeByAddress.get(JSON.stringify([childServerId, agentId])),
+    [runtimeByAddress],
+  );
+  const agentTitleById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [index, address] of delegationAddresses.entries()) {
+      if (address.serverId !== serverId) continue;
+      const title = delegationAgents[index]?.title?.trim();
+      if (title) map.set(address.agentId, title);
+    }
+    return map;
+  }, [delegationAddresses, delegationAgents, serverId]);
 
   const projection = useMemo(
     () =>
@@ -641,6 +777,8 @@ export const TopicStreamList = memo(function TopicStreamList({
         legacyReadScope,
         isTurnActive,
         agentRequiresAttention,
+        localServerId: serverId,
+        readAgentRuntime,
         agentTitleById,
       }),
     [
@@ -652,7 +790,9 @@ export const TopicStreamList = memo(function TopicStreamList({
       legacyReadScope,
       pendingInboxItems,
       pendingPermissions,
+      readAgentRuntime,
       readSnapshot,
+      serverId,
       tasksQuery.data,
       threadEntries,
       topicAnchors,
@@ -700,6 +840,10 @@ export const TopicStreamList = memo(function TopicStreamList({
     return () => clearTimeout(timer);
   }, [highlightedTopicKey]);
   const [replyingTopics, setReplyingTopics] = useState<ReadonlySet<string>>(() => new Set());
+  const [retryUploadNames, setRetryUploadNames] = useState<ReadonlyMap<string, string[]>>(
+    () => new Map(),
+  );
+  const { pickFiles } = useFilePicker();
   const [flushingTopicKey, setFlushingTopicKey] = useState<string | null>(null);
 
   const disclosureViewportRef = useRef<StreamViewportHandle | null>(null);
@@ -920,6 +1064,23 @@ export const TopicStreamList = memo(function TopicStreamList({
     ],
   );
 
+  const pickRetryAttachments = useCallback(
+    async (names: string[]) => {
+      if (!client) throw new Error(t("workspace.terminal.hostDisconnected"));
+      // The picker must start during the retry button's press on web.
+      const files = await pickFiles();
+      if (!files) return;
+      if (files.length !== names.length) {
+        onErrorToast?.(
+          t("topicWorkbench.topicStream.retryUploadFiles", { files: names.join(", ") }),
+        );
+        return;
+      }
+      return (await uploadFileAttachments({ client, files })).map(({ attachment }) => attachment);
+    },
+    [client, onErrorToast, pickFiles, t],
+  );
+
   const handleRetryTopic = useCallback(
     async (topic: TopicUnit, retry: { entryId: string; text: string }) => {
       if (!supportsTopicThreads || submitLocks.current.has(topic.topicKey)) return;
@@ -930,12 +1091,22 @@ export const TopicStreamList = memo(function TopicStreamList({
         topic.topicKey,
         retry.entryId,
       ]);
-      const clientMessageId = retryIntents.get(key) ?? generateMessageId();
-      retryIntents.set(key, clientMessageId);
       submitLocks.current.add(topic.topicKey);
       setReplyingTopics(new Set(submitLocks.current));
+      let intent = retryIntents.get(key);
       let acknowledged = false;
       try {
+        const names = retryUploadNames.get(retry.entryId);
+        if (names && !intent?.attachments) {
+          const attachments = await pickRetryAttachments(names);
+          if (!attachments) return;
+          intent = {
+            clientMessageId: intent?.clientMessageId ?? generateMessageId(),
+            attachments,
+          };
+        }
+        intent ??= { clientMessageId: generateMessageId() };
+        retryIntents.set(key, intent);
         await replyToWorkspaceTopic({
           queryClient,
           serverId,
@@ -944,35 +1115,83 @@ export const TopicStreamList = memo(function TopicStreamList({
           topicKey: topic.topicKey,
           retryOfEntryId: retry.entryId,
           text: retry.text.trim() || "[attachment]",
-          clientMessageId,
+          ...intent,
         });
         acknowledged = true;
+        setRetryUploadNames((current) => {
+          if (!current.has(retry.entryId)) return current;
+          const next = new Map(current);
+          next.delete(retry.entryId);
+          return next;
+        });
       } catch (err) {
         acknowledged = err instanceof TopicReplyRejectedError;
+        const names = err instanceof TopicReplyRejectedError ? readRetryUploadNames(err) : null;
+        if (names) {
+          setRetryUploadNames((current) => new Map(current).set(retry.entryId, names));
+          return;
+        }
         onErrorToast?.(err instanceof Error ? err.message : String(err));
       } finally {
-        if (acknowledged && retryIntents.get(key) === clientMessageId) retryIntents.delete(key);
+        if (acknowledged && retryIntents.get(key) === intent) retryIntents.delete(key);
         submitLocks.current.delete(topic.topicKey);
         setReplyingTopics(new Set(submitLocks.current));
       }
     },
-    [mainAgentId, onErrorToast, queryClient, serverId, supportsTopicThreads, workspaceId],
+    [
+      mainAgentId,
+      onErrorToast,
+      pickRetryAttachments,
+      queryClient,
+      retryUploadNames,
+      serverId,
+      supportsTopicThreads,
+      workspaceId,
+    ],
   );
 
   const handleActivateCompactReply = useCallback(
-    (topic: TopicUnit, routeMode: TopicReplyRouteMode) => {
-      setActiveReplyTopic(agentKey, {
+    (topic: TopicUnit, routeMode: TopicReplyRouteMode, quote?: QuoteComposerAttachment) => {
+      const active = useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey];
+      const target = {
         topicKey: topic.topicKey,
         taskId: topic.taskId,
         rootMessageId: topic.rootMessageId,
         leadAgentId: topic.leadAgentId,
         leadTitle: topic.leadTitle,
         promptPreview: topic.rootPrompt.text.slice(0, 60),
-        routeMode,
-      });
+        routeMode:
+          quote && active?.topicKey === topic.topicKey && !active.decisionContext
+            ? active.routeMode
+            : routeMode,
+      };
+      if (quote && isHandoffInputLocked(serverId, mainAgentId)) return;
+      const draftKey = quote
+        ? resolveReplyComposerDraftKey({ serverId, workspaceId, agentId: mainAgentId, target })
+        : null;
+      if (draftKey && isTopicComposerDraftSubmitting(draftKey)) {
+        onErrorToast?.(t("topicWorkbench.topicStream.quoteAfterSending"));
+        return;
+      }
+      setActiveReplyTopic(agentKey, target);
+      if (quote && draftKey) {
+        useDraftStore.getState().updateDraftInput({
+          draftKey,
+          update: (draft) => ({ ...draft, attachments: [...draft.attachments, quote] }),
+        });
+      }
       onFocusCompactComposer?.();
     },
-    [agentKey, onFocusCompactComposer, setActiveReplyTopic],
+    [
+      agentKey,
+      mainAgentId,
+      onErrorToast,
+      onFocusCompactComposer,
+      serverId,
+      setActiveReplyTopic,
+      t,
+      workspaceId,
+    ],
   );
 
   const handleActivateCompactDecision = useCallback(
@@ -1283,11 +1502,13 @@ export const TopicStreamList = memo(function TopicStreamList({
                   serverId={serverId}
                   workspaceId={workspaceId}
                   topic={topic}
+                  imageReader={imageReader}
                   isPaneFocused={isPaneFocused}
                   viewportBounds={viewportBounds}
                   cardLayout={measuredLayoutSnapshot.get(topic.topicKey) ?? null}
                   isHighlighted={highlightedTopicKey === topic.topicKey}
                   isReplying={replyingTopics.has(topic.topicKey)}
+                  streamingConclusionId={streamingConclusionId}
                   isFlushingInbox={flushingTopicKey === topic.topicKey}
                   supportsButlerV1={supportsButlerV1}
                   durableItemsOnline={durableItemsOnline}
@@ -1305,6 +1526,7 @@ export const TopicStreamList = memo(function TopicStreamList({
                   onOpenAgentBeside={handleOpenAgentBeside}
                   onSubmitDesktopReply={handleSubmitDesktopReply}
                   onRetryTopic={supportsTopicThreads ? handleRetryTopic : undefined}
+                  retryUploadNames={retryUploadNames}
                   onActivateCompactReply={handleActivateCompactReply}
                   onConvertToTodo={handleConvertToTodo}
                   onToggleTodoStatus={handleToggleTodoStatus}

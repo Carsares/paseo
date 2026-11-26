@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 
 export interface ChatColumnRailSurfaceProps {
   serverId: string;
+  allowOutline?: boolean;
   children: ReactNode;
 }
 

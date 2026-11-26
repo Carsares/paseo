@@ -1,9 +1,12 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
 import { PortalProvider } from "@gorhom/portal";
 import { within } from "@testing-library/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
+import type { MessageImageReader } from "@/components/read-only-message-images";
 import { DisclosureRow } from "@/agent-stream/disclosure";
 import type { StreamViewportHandle } from "@/agent-stream/strategy";
 import { type HostRuntimeSnapshot, getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -15,6 +18,7 @@ import { TopicThreadCard } from "./topic-thread-card";
 let container: HTMLDivElement;
 let root: Root;
 let view: ReturnType<typeof within>;
+let queryClient: QueryClient;
 
 beforeEach(async () => {
   await i18n.changeLanguage("en");
@@ -29,6 +33,8 @@ beforeEach(async () => {
   container.style.width = "900px";
   root = createRoot(container);
   view = within(container);
+  queryClient = new QueryClient();
+  queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS);
 });
 
 afterEach(() => {
@@ -133,7 +139,11 @@ function createViewportRef(holdRow: StreamViewportHandle["holdRow"]) {
   return { current: { holdRow } as unknown as StreamViewportHandle };
 }
 
-it("renders user prompt first, collapses process steps behind useDisclosureHold, and triggers split-open & flush", () => {
+function makeImageReader(read: MessageImageReader["read"]): MessageImageReader {
+  return { serverId: "srv-1", workspaceId: "workspace", read };
+}
+
+it("renders user prompt first, collapses process steps behind useDisclosureHold, and triggers split-open & flush", async () => {
   const holdRow = vi.fn((_rowId: string, apply: () => void) => apply());
   const viewportRef = createViewportRef(holdRow);
   const onAutoMarkRead = vi.fn();
@@ -146,28 +156,73 @@ it("renders user prompt first, collapses process steps behind useDisclosureHold,
   const onToggleTodoStatus = vi.fn();
   const onEditTodo = vi.fn();
   const topic = makeTopic();
+  const image = { id: "image", fileName: "example.png", mimeType: "image/png", size: 68 };
+  const read = vi.fn(
+    async () =>
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jqfQAAAAASUVORK5CYII=",
+  );
+  const imageReader = makeImageReader(read);
+  topic.rootPrompt.imageAttachments = [image];
+  topic.replies.push({
+    kind: "thread_entry",
+    id: "thread:followup",
+    seq: null,
+    threadSeq: 1,
+    timestampMs: 1_700_000_004_000,
+    isUnread: false,
+    entry: {
+      entryId: "followup",
+      workspaceId: "workspace",
+      mainAgentId: "main",
+      routedAgentId: "main",
+      topicKey: topic.topicKey,
+      role: "user_followup",
+      text: "Please check this image.",
+      status: "completed",
+      imageAttachments: [image],
+      seq: 1,
+      createdAt: new Date(1_700_000_004_000).toISOString(),
+      updatedAt: new Date(1_700_000_004_000).toISOString(),
+    },
+  });
+  const conclusion = topic.replies.find((reply) => reply.kind === "main_conclusion");
+  if (!conclusion) throw new Error("Missing conclusion fixture.");
+  topic.replies.push({
+    ...conclusion,
+    id: "progress",
+    kind: "main_progress",
+    dispatched: true,
+    isUnread: true,
+  });
+  queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, {
+    ...DEFAULT_CLIENT_SETTINGS,
+    userMessageAlignment: "left",
+  });
 
   act(() => {
     root.render(
-      <PortalProvider>
-        <DisclosureRow rowId="topic-row" viewportRef={viewportRef}>
-          <TopicThreadCard
-            agentKey="srv-1:mc-1"
-            topic={topic}
-            isPaneFocused={false}
-            isVisibleInViewport={true}
-            onAutoMarkRead={onAutoMarkRead}
-            onMarkTopicMode={onMarkTopicMode}
-            onFlushTopicInbox={onFlushTopicInbox}
-            onOpenAgentBeside={onOpenAgentBeside}
-            onSubmitDesktopReply={onSubmitDesktopReply}
-            onActivateCompactReply={onActivateCompactReply}
-            onConvertToTodo={onConvertToTodo}
-            onToggleTodoStatus={onToggleTodoStatus}
-            onEditTodo={onEditTodo}
-          />
-        </DisclosureRow>
-      </PortalProvider>,
+      <QueryClientProvider client={queryClient}>
+        <PortalProvider>
+          <DisclosureRow rowId="topic-row" viewportRef={viewportRef}>
+            <TopicThreadCard
+              agentKey="srv-1:mc-1"
+              topic={topic}
+              imageReader={imageReader}
+              isPaneFocused={false}
+              isVisibleInViewport={true}
+              onAutoMarkRead={onAutoMarkRead}
+              onMarkTopicMode={onMarkTopicMode}
+              onFlushTopicInbox={onFlushTopicInbox}
+              onOpenAgentBeside={onOpenAgentBeside}
+              onSubmitDesktopReply={onSubmitDesktopReply}
+              onActivateCompactReply={onActivateCompactReply}
+              onConvertToTodo={onConvertToTodo}
+              onToggleTodoStatus={onToggleTodoStatus}
+              onEditTodo={onEditTodo}
+            />
+          </DisclosureRow>
+        </PortalProvider>
+      </QueryClientProvider>,
     );
   });
 
@@ -175,6 +230,22 @@ it("renders user prompt first, collapses process steps behind useDisclosureHold,
   expect(view.getByTestId("topic-card-root-prompt").textContent).toBe(
     "Audit the WebSocket reconnect path",
   );
+  const bubbles: HTMLElement[] = view.getAllByTestId("topic-user-message");
+  expect(bubbles).toHaveLength(2);
+  expect(bubbles.map((bubble) => getComputedStyle(bubble).alignSelf)).toEqual([
+    "flex-start",
+    "flex-start",
+  ]);
+  expect(bubbles.every((bubble) => within(bubble).getByText("You"))).toBe(true);
+  const progress = within(view.getByTestId("topic-reply-progress-progress"));
+  expect(progress.getByText("Dispatched")).toBeTruthy();
+  expect(progress.getByTestId("topic-progress-unread")).toBeTruthy();
+  await vi.waitFor(() => {
+    expect(bubbles.map((bubble) => bubble.querySelectorAll("img").length)).toEqual([1, 1]);
+  });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledWith(image);
+
   // New replies divider is rendered
   expect(view.getByTestId("topic-new-replies-divider")).toBeTruthy();
   // Subagent report renders inside topic card rail (never as a right-side user message bubble)
@@ -239,24 +310,26 @@ it("renders conflict banner and blocking decision slot in browser layout", () =>
 
   act(() => {
     root.render(
-      <PortalProvider>
-        <TopicThreadCard
-          agentKey="srv-1:mc-1"
-          topic={topic}
-          isPaneFocused={false}
-          supportsButlerV1={true}
-          onJumpToPeerTopic={onJumpToPeerTopic}
-          onAutoMarkRead={vi.fn()}
-          onMarkTopicMode={vi.fn()}
-          onFlushTopicInbox={vi.fn()}
-          onOpenAgentBeside={vi.fn()}
-          onSubmitDesktopReply={vi.fn(() => true)}
-          onActivateCompactReply={vi.fn()}
-          onConvertToTodo={vi.fn()}
-          onToggleTodoStatus={vi.fn()}
-          onEditTodo={vi.fn()}
-        />
-      </PortalProvider>,
+      <QueryClientProvider client={queryClient}>
+        <PortalProvider>
+          <TopicThreadCard
+            agentKey="srv-1:mc-1"
+            topic={topic}
+            isPaneFocused={false}
+            supportsButlerV1={true}
+            onJumpToPeerTopic={onJumpToPeerTopic}
+            onAutoMarkRead={vi.fn()}
+            onMarkTopicMode={vi.fn()}
+            onFlushTopicInbox={vi.fn()}
+            onOpenAgentBeside={vi.fn()}
+            onSubmitDesktopReply={vi.fn(() => true)}
+            onActivateCompactReply={vi.fn()}
+            onConvertToTodo={vi.fn()}
+            onToggleTodoStatus={vi.fn()}
+            onEditTodo={vi.fn()}
+          />
+        </PortalProvider>
+      </QueryClientProvider>,
     );
   });
 
@@ -308,24 +381,26 @@ it("locks the wide reply recipient during send and retains attachments only on f
   const topic = makeTopic();
   await act(async () =>
     root.render(
-      <PortalProvider>
-        <TopicThreadCard
-          agentKey="inline:main"
-          serverId="inline-host"
-          workspaceId="inline-workspace"
-          topic={topic}
-          isPaneFocused={false}
-          onAutoMarkRead={vi.fn()}
-          onMarkTopicMode={vi.fn()}
-          onFlushTopicInbox={vi.fn()}
-          onOpenAgentBeside={vi.fn()}
-          onSubmitDesktopReply={onSubmitDesktopReply}
-          onActivateCompactReply={vi.fn()}
-          onConvertToTodo={vi.fn()}
-          onToggleTodoStatus={vi.fn()}
-          onEditTodo={vi.fn()}
-        />
-      </PortalProvider>,
+      <QueryClientProvider client={queryClient}>
+        <PortalProvider>
+          <TopicThreadCard
+            agentKey="inline:main"
+            serverId="inline-host"
+            workspaceId="inline-workspace"
+            topic={topic}
+            isPaneFocused={false}
+            onAutoMarkRead={vi.fn()}
+            onMarkTopicMode={vi.fn()}
+            onFlushTopicInbox={vi.fn()}
+            onOpenAgentBeside={vi.fn()}
+            onSubmitDesktopReply={onSubmitDesktopReply}
+            onActivateCompactReply={vi.fn()}
+            onConvertToTodo={vi.fn()}
+            onToggleTodoStatus={vi.fn()}
+            onEditTodo={vi.fn()}
+          />
+        </PortalProvider>
+      </QueryClientProvider>,
     ),
   );
   act(() => view.getByTestId("topic-inline-reply-trigger-task:T-100").click());

@@ -51,6 +51,7 @@ import {
   type AppSettings,
   type AppSettingsUpdate,
   type ChatDisplay,
+  type UserMessageAlignment,
   type ContentWidthPreset,
   type OpenInSidePanePreferences,
   type PullRequestOpenLocation,
@@ -104,6 +105,7 @@ export type {
   AppSettings,
   AppSettingsUpdate,
   ChatDisplay,
+  UserMessageAlignment,
   ContentWidthPreset,
   AppLanguage,
   OpenInSidePanePreferences,
@@ -163,6 +165,19 @@ export interface UseSettingsReturn {
 }
 
 type SettingsSelector<TSelected> = (settings: Settings) => TSelected;
+
+const selectUserMessageAlignment = (settings: AppSettings) => settings.userMessageAlignment;
+
+export function useUserMessageAlignment(): UserMessageAlignment {
+  const { data } = useQuery({
+    queryKey: APP_SETTINGS_QUERY_KEY,
+    queryFn: () => loadAppSettingsFromStorage(),
+    select: selectUserMessageAlignment,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  return data ?? DEFAULT_CLIENT_SETTINGS.userMessageAlignment;
+}
 
 export function useAppSettings(): UseAppSettingsReturn {
   const queryClient = useQueryClient();

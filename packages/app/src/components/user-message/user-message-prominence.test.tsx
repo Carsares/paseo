@@ -4,6 +4,7 @@
 import { MessageOuterSpacingProvider, UserMessage } from "@/components/message";
 import { ToastProvider } from "@/contexts/toast-context";
 import { i18n } from "@/i18n/i18next";
+import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
 import { formatMessageTimestamp } from "@/utils/time";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
@@ -14,10 +15,15 @@ import { createUserMessageExpansion } from "./expansion";
 
 const timestamp = new Date(2020, 0, 2, 15, 4);
 
-function renderPrompt(props: Partial<ComponentProps<typeof UserMessage>> = {}) {
+function renderPrompt(
+  props: Partial<ComponentProps<typeof UserMessage>> = {},
+  userMessageAlignment = DEFAULT_CLIENT_SETTINGS.userMessageAlignment,
+) {
   const expansion = createUserMessageExpansion();
+  const client = new QueryClient();
+  client.setQueryData(APP_SETTINGS_QUERY_KEY, { ...DEFAULT_CLIENT_SETTINGS, userMessageAlignment });
   return render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={client}>
       <ToastProvider>
         <UserMessageExpansionContext.Provider value={expansion}>
           <MessageOuterSpacingProvider disableOuterSpacing>
@@ -98,6 +104,17 @@ describe("UserMessage prominence", () => {
     expect(getByTestId("user-message-turn-label").textContent).toBe(
       formatMessageTimestamp(timestamp),
     );
+  });
+
+  it("left-aligns only the user's messages when the preference is left", () => {
+    const prompt = renderPrompt({}, "left");
+    expect(getComputedStyle(prompt.getByTestId("user-message-content")).alignSelf).toBe(
+      "flex-start",
+    );
+    prompt.unmount();
+
+    const agent = renderPrompt({ sender: { id: "agent", title: "Reviewer" } }, "left");
+    expect(getComputedStyle(agent.getByTestId("user-message-content")).alignSelf).toBe("flex-end");
   });
 
   it("right-aligns and caps content without setting a fixed width for short prompts", () => {

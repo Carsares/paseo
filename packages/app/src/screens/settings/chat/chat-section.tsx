@@ -8,7 +8,8 @@ import {
   SettingsSwitch,
 } from "@/components/settings";
 import { isNative } from "@/constants/platform";
-import { useAppSettings, type ChatDisplay } from "@/hooks/use-settings";
+import { useAppSettings, type ChatDisplay, type UserMessageAlignment } from "@/hooks/use-settings";
+import { getUserMessageAlignmentCopy } from "@/i18n/domains/settings";
 
 const CHAT_DISPLAYS: readonly ChatDisplay[] = ["full", "collapseToolCalls", "collapseTurns"];
 
@@ -16,6 +17,19 @@ export function ChatSection() {
   const { t, i18n } = useTranslation();
   const isChinese = i18n.language?.startsWith("zh");
   const { settings, updateSettings } = useAppSettings();
+
+  const alignmentCopy = getUserMessageAlignmentCopy(i18n.language);
+  const alignmentOptions = useMemo(
+    () => [
+      { value: "left" as const, label: alignmentCopy.left },
+      { value: "right" as const, label: alignmentCopy.right },
+    ],
+    [alignmentCopy],
+  );
+  const changeAlignment = useCallback(
+    (userMessageAlignment: UserMessageAlignment) => void updateSettings({ userMessageAlignment }),
+    [updateSettings],
+  );
 
   const chatDisplayOptions = useMemo(
     () =>
@@ -79,6 +93,13 @@ export function ChatSection() {
             value={settings.chatDisplay}
             options={chatDisplayOptions}
             onValueChange={changeChatDisplay}
+          />
+          <SettingsSelect
+            label={alignmentCopy.label}
+            hint={alignmentCopy.description}
+            value={settings.userMessageAlignment}
+            options={alignmentOptions}
+            onValueChange={changeAlignment}
           />
           {isNative ? null : (
             <SettingsSwitch

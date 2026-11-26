@@ -170,7 +170,11 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { createSpeechSettingsOwner } from "./speech/speech-settings.js";
-import { AgentManager, AgentManagerShuttingDownError } from "./agent/agent-manager.js";
+import {
+  AgentManager,
+  AgentManagerShuttingDownError,
+  restartRecoveryRunOptions,
+} from "./agent/agent-manager.js";
 import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { recoverAgentWorkspaceMove } from "./agent/agent-workspace-move-journal.js";
@@ -181,6 +185,7 @@ import {
   createPaseoAgentToolManifest,
   type PaseoToolHostDependencies,
 } from "./agent/tools/paseo-tools.js";
+import { TopicDelegationStore } from "./agent/tools/topic-delegation.js";
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
 import { ProviderUpdateCleanupError } from "./agent/provider-installation/provider-installations.js";
 import { createAgentProviderRuntime } from "./agent/provider-runtime.js";
@@ -1090,6 +1095,7 @@ export async function createPaseoDaemon(
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const taskLedger = new WorkspaceTaskLedgerStore(config.paseoHome);
+  const topicDelegations = new TopicDelegationStore(config.paseoHome);
   const agentManager = new AgentManager({
     serverId,
     pluginLifecycle: pluginRuntime,
@@ -1098,6 +1104,7 @@ export async function createPaseoDaemon(
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
     taskLedger,
+    topicDelegations,
     workspaceRegistry,
     preserveTopicHistory: (scope, rows) => {
       if (!wsServer) throw new Error("Topic history storage is unavailable.");
@@ -1176,6 +1183,7 @@ export async function createPaseoDaemon(
           }
         : undefined;
       try {
+        const record = await agentStorage.get(agentId);
         const result = await sendPromptToAgent({
           agentId,
           prompt,
@@ -1187,7 +1195,7 @@ export async function createPaseoDaemon(
           idleOnly: canDispatch !== undefined,
           assertDispatchAllowed,
           waitForCommandOutcome: true,
-          runOptions: { recoveryIntent: "automatic" },
+          runOptions: restartRecoveryRunOptions(record?.restartTopicDelegation),
         });
         if (result.disposition !== "turn_started") return;
         try {

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ComponentProps } from "react";
 import { Pressable, View } from "react-native";
-import { GestureDetector, type GestureType } from "react-native-gesture-handler";
+import { GestureDetector } from "react-native-gesture-handler";
 import { StyleSheet } from "react-native-unistyles";
 import {
   resolveSidebarResizeHandleGeometry,
@@ -11,9 +11,10 @@ import { usePointerCapabilities } from "@/hooks/pointer-capabilities";
 
 interface SidebarResizeHandleProps {
   edge: SidebarResizeEdge;
-  gesture: GestureType;
+  gesture: ComponentProps<typeof GestureDetector>["gesture"];
   pressed: boolean;
   testID: string;
+  highlightWhilePressed?: boolean;
 }
 
 const HIGHLIGHT_DELAY_MS = 100;
@@ -28,16 +29,22 @@ function edgeOffsetStyle(edge: SidebarResizeEdge, edgeOffset: number) {
   return edge === "left" ? { left: edgeOffset } : { right: edgeOffset };
 }
 
-export function SidebarResizeHandle({ edge, gesture, pressed, testID }: SidebarResizeHandleProps) {
+export function SidebarResizeHandle(props: SidebarResizeHandleProps) {
   const { finePointer } = usePointerCapabilities();
 
   if (finePointer) {
-    return <PointerResizeHandle edge={edge} gesture={gesture} pressed={pressed} testID={testID} />;
+    return <PointerResizeHandle {...props} />;
   }
-  return <TouchResizeHandle edge={edge} gesture={gesture} pressed={pressed} testID={testID} />;
+  return <TouchResizeHandle {...props} />;
 }
 
-function PointerResizeHandle({ edge, gesture, testID }: SidebarResizeHandleProps) {
+function PointerResizeHandle({
+  edge,
+  gesture,
+  pressed,
+  testID,
+  highlightWhilePressed,
+}: SidebarResizeHandleProps) {
   const [highlighted, setHighlighted] = useState(false);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const geometry = resolveSidebarResizeHandleGeometry(true);
@@ -77,7 +84,7 @@ function PointerResizeHandle({ edge, gesture, testID }: SidebarResizeHandleProps
         onHoverIn={handleHoverIn}
         onHoverOut={handleHoverOut}
       >
-        {highlighted ? (
+        {highlighted || (highlightWhilePressed && pressed) ? (
           <View pointerEvents="none" testID={`${testID}-highlight`} style={styles.highlight} />
         ) : null}
       </Pressable>

@@ -143,7 +143,10 @@ function AgentDurableItemsList({
 }: Omit<AgentDurableItemsProps, "agentId"> & { agentId: string }) {
   const workspace = useWorkspaceDurableItems(serverId, workspaceId, isPaneFocused);
   const items = workspace.result.data?.filter(
-    (item) => item.workspaceId === workspaceId && item.sourceAgentId === agentId,
+    (item) =>
+      item.workspaceId === workspaceId &&
+      item.sourceAgentId === agentId &&
+      item.status === "pending",
   );
   if (!items?.length) return null;
 

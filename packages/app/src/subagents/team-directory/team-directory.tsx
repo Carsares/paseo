@@ -13,7 +13,6 @@ import {
   Columns2,
   ExternalLink,
   MoreVertical,
-  PanelLeftClose,
   Plus,
   RotateCcw,
   Trash2,
@@ -21,7 +20,16 @@ import {
   UserMinus,
   UserPlus,
 } from "lucide-react-native";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
 import { HoverEnvelope } from "@/agent-stream/topic-card/hover-envelope";
@@ -59,6 +67,7 @@ import {
 import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 import { planTimelineResumeFetch } from "@/timeline/timeline-sync-plan";
 import {
+  TEAM_DIRECTORY_DEFAULT_WIDTH,
   useTeamDirectoryViewStore,
   type TeamDirectoryAgentGroupMode,
   type TeamDirectoryTab,
@@ -106,7 +115,6 @@ import {
 const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const ThemedChevronDown = withUnistyles(ChevronDown, mutedIconMapping);
 const ThemedChevronRight = withUnistyles(ChevronRight, mutedIconMapping);
-const ThemedPanelLeftClose = withUnistyles(PanelLeftClose, mutedIconMapping);
 const ThemedPlus = withUnistyles(Plus, mutedIconMapping);
 const ThemedMoreVertical = withUnistyles(MoreVertical, mutedIconMapping);
 const ThemedTrash2 = withUnistyles(Trash2, mutedIconMapping);
@@ -144,7 +152,8 @@ export interface WorkspaceTeamDirectoryProps {
   focusedProviderSubagentId: string | null;
   overlay?: boolean;
   inSheet?: boolean;
-  onHide: () => void;
+  dockWidth?: number;
+  resizeHandle?: ReactNode;
   onOpenAgent: (node: TeamDirectoryMemberNode) => void;
   onOpenAgentBeside: (address: AgentAddress) => void;
   onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
@@ -216,39 +225,106 @@ function DirectoryTabBody({
   return agentsContent;
 }
 
-function buildDirectoryTabOptions(input: {
+export function TeamDirectoryTabs({
+  unreadCount,
+  totalTodosTabCount,
+  runningCount,
+  activeTab,
+  onSelect,
+}: {
   unreadCount: number;
   totalTodosTabCount: number;
   runningCount: number;
-  t: TFunction;
-}): SegmentedControlOption<TeamDirectoryTab>[] {
-  const { unreadCount, totalTodosTabCount, runningCount, t } = input;
-  return [
+  activeTab: TeamDirectoryTab;
+  onSelect: (tab: TeamDirectoryTab) => void;
+}) {
+  const { t } = useTranslation();
+  const tabs = [
     {
       value: "messages",
-      label:
-        unreadCount > 0
-          ? t("topicWorkbench.directory.tabMessagesCount", { count: unreadCount })
-          : t("topicWorkbench.directory.tabMessages"),
-      testID: "team-directory-tab-messages",
+      label: t("topicWorkbench.directory.tabMessages"),
+      count: unreadCount,
+      countedLabel: t("topicWorkbench.directory.tabMessagesAccessibility", { count: unreadCount }),
     },
     {
       value: "todos",
-      label:
-        totalTodosTabCount > 0
-          ? t("topicWorkbench.directory.tabTodosCount", { count: totalTodosTabCount })
-          : t("topicWorkbench.directory.tabTodos"),
-      testID: "team-directory-tab-todos",
+      label: t("topicWorkbench.directory.tabTodos"),
+      count: totalTodosTabCount,
+      countedLabel: t("topicWorkbench.directory.tabTodosAccessibility", {
+        count: totalTodosTabCount,
+      }),
     },
     {
       value: "agents",
-      label:
-        runningCount > 0
-          ? t("topicWorkbench.directory.tabAgentsCount", { count: runningCount })
-          : t("topicWorkbench.directory.tabAgents"),
-      testID: "team-directory-tab-agents",
+      label: t("topicWorkbench.directory.tabAgents"),
+      count: runningCount,
+      countedLabel: t("topicWorkbench.directory.tabAgentsAccessibility", { count: runningCount }),
     },
-  ];
+  ] as const;
+  return (
+    <View style={styles.header}>
+      <ScrollView horizontal style={styles.tabsScroll} testID="team-directory-tabs-scroll">
+        <View style={styles.tabs} testID="team-directory-tabs">
+          {tabs.map(({ value, label, count, countedLabel }) => (
+            <TeamDirectoryTabButton
+              key={value}
+              value={value}
+              label={label}
+              count={count}
+              accessibilityLabel={count > 0 ? countedLabel : label}
+              selected={activeTab === value}
+              onSelect={onSelect}
+            />
+          ))}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+function TeamDirectoryTabButton({
+  value,
+  label,
+  count,
+  accessibilityLabel,
+  selected,
+  onSelect,
+}: {
+  value: TeamDirectoryTab;
+  label: string;
+  count: number;
+  accessibilityLabel: string;
+  selected: boolean;
+  onSelect: (tab: TeamDirectoryTab) => void;
+}) {
+  const accessibilityState = useMemo(() => ({ selected }), [selected]);
+  const select = useCallback(() => {
+    if (!selected) onSelect(value);
+  }, [onSelect, selected, value]);
+  const badge = useMemo(
+    () =>
+      count > 0 ? (
+        <Text style={styles.tabCount} numberOfLines={1} aria-hidden>
+          {count > 99 ? "99+" : count}
+        </Text>
+      ) : null,
+    [count],
+  );
+  return (
+    <Button
+      size="sm"
+      variant={selected ? "secondary" : "ghost"}
+      style={styles.tab}
+      testID={`team-directory-tab-${value}`}
+      accessibilityLabel={accessibilityLabel}
+      accessibilityState={accessibilityState}
+      aria-selected={selected}
+      onPress={select}
+      trailing={badge}
+    >
+      {label}
+    </Button>
+  );
 }
 
 function allowsTopicMainResetPermissions(
@@ -782,7 +858,8 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   focusedProviderSubagentId,
   overlay = false,
   inSheet = false,
-  onHide,
+  dockWidth,
+  resizeHandle,
   onOpenAgent,
   onOpenAgentBeside,
   onOpenProviderSubrun,
@@ -1097,11 +1174,6 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   const totalTodosTabCount = pendingTodoCount + pendingDurableCount;
   const unreadCount = messagesProjection.unread.length;
   const runningCount = directory.summary.runningCount;
-  const tabOptions = useMemo<SegmentedControlOption<TeamDirectoryTab>[]>(
-    () => buildDirectoryTabOptions({ unreadCount, totalTodosTabCount, runningCount, t }),
-    [runningCount, t, totalTodosTabCount, unreadCount],
-  );
-
   const groupModeOptions = useMemo<SegmentedControlOption<TeamDirectoryAgentGroupMode>[]>(
     () => [
       {
@@ -1120,29 +1192,25 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
 
   return (
     <View
-      style={inSheet ? styles.sheet : [styles.sidebar, overlay && styles.overlay]}
+      style={
+        inSheet
+          ? styles.sheet
+          : [
+              styles.sidebar,
+              dockWidth !== undefined && { width: dockWidth },
+              overlay && styles.overlay,
+            ]
+      }
       testID="workspace-team-directory"
     >
-      <View style={styles.header}>
-        <SegmentedControl
-          size="sm"
-          options={tabOptions}
-          value={activeTab}
-          onValueChange={setActiveTab}
-          style={styles.tabsControl}
-          testID="team-directory-tabs"
-        />
-        {inSheet ? null : (
-          <ToolbarButton
-            compact
-            testID="team-directory-hide"
-            label={t("topicWorkbench.directory.hide")}
-            onPress={onHide}
-          >
-            <ThemedPanelLeftClose size={16} />
-          </ToolbarButton>
-        )}
-      </View>
+      {resizeHandle}
+      <TeamDirectoryTabs
+        unreadCount={unreadCount}
+        totalTodosTabCount={totalTodosTabCount}
+        runningCount={runningCount}
+        activeTab={activeTab}
+        onSelect={setActiveTab}
+      />
 
       <ScrollView keyboardShouldPersistTaps="handled" style={styles.scroll}>
         <View style={styles.list}>
@@ -2153,7 +2221,7 @@ const styles = StyleSheet.create((theme) => ({
     minHeight: 0,
   },
   sidebar: {
-    width: 256,
+    width: TEAM_DIRECTORY_DEFAULT_WIDTH,
     maxWidth: "100%",
     flexShrink: 0,
     backgroundColor: theme.colors.surfaceSidebar,
@@ -2172,15 +2240,35 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     justifyContent: "space-between",
     minHeight: 38,
-    paddingHorizontal: theme.spacing[2],
+    paddingHorizontal: theme.spacing[1],
     paddingVertical: theme.spacing[1],
     gap: theme.spacing[1],
     borderBottomWidth: theme.borderWidth[1],
     borderBottomColor: theme.colors.border,
   },
-  tabsControl: {
+  tabsScroll: {
     flex: 1,
     minWidth: 0,
+  },
+  tabs: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[0.5],
+  },
+  tab: {
+    flexShrink: 0,
+    borderRadius: theme.borderRadius.full,
+    borderWidth: 0,
+    paddingHorizontal: theme.spacing[1],
+    gap: theme.spacing[1],
+  },
+  tabCount: {
+    color: theme.colors.foregroundMuted,
+    backgroundColor: theme.colors.surface2,
+    fontSize: theme.fontSize.sm,
+    fontVariant: ["tabular-nums"],
+    borderRadius: theme.borderRadius.full,
+    paddingHorizontal: theme.spacing[1],
   },
   groupSwitcherRow: {
     flexDirection: "row",

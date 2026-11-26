@@ -267,7 +267,6 @@ function setupDirectory({
           isTopicWorkspace
           focusedAgentId={focusedAgentId}
           focusedProviderSubagentId={null}
-          onHide={vi.fn()}
           onOpenAgent={onOpenAgent}
           onOpenAgentBeside={vi.fn()}
           onOpenProviderSubrun={vi.fn()}

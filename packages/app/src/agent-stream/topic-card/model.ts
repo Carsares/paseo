@@ -1,6 +1,8 @@
+import type { MessageImageAttachment } from "@getpaseo/protocol/agent-types";
 import type {
   PendingSubagentInboxItem,
   TopicAnchorSummary,
+  TopicDelegationSummary,
   TopicThreadEntry,
   WorkspaceDurableItem,
   WorkspaceTaskFileConflict,
@@ -8,7 +10,10 @@ import type {
   WorkspaceTodoItem,
   WorkspaceTopicReadSnapshot,
 } from "@getpaseo/protocol/messages";
+import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
+import { getPaseoToolLeafName } from "@getpaseo/protocol/tool-name-normalization";
 import type { PendingPermission } from "@/types/shared";
+import type { TurnLiveness } from "@/timeline/turn-liveness";
 import { isTopicInboxItemRead, type TopicInboxReadScope } from "@/stores/topic-inbox-read-store";
 import {
   getStreamItemMessageId,
@@ -17,7 +22,9 @@ import {
   type ThoughtItem,
   type ToolCallItem,
   type UserMessageItem,
+  type UserMessageImageAttachment,
 } from "@/types/stream";
+import { isTurnTrigger, startsNewTurn } from "../turn-membership";
 import {
   getAgentMessage,
   getAgentSourcePresentation,
@@ -32,7 +39,31 @@ export type TopicLifecycleStatus =
   | "blocked"
   | "interrupted"
   | "error"
-  | "settled";
+  | "completed"
+  | "awaitingReport"
+  | "replied";
+
+export interface TopicAgentRuntime {
+  title: string | null;
+  status: AgentLifecycleStatus;
+  turn: TurnLiveness;
+  timeline?: readonly StreamItem[];
+}
+
+interface TopicDelegation {
+  agentId: string;
+  serverId: string;
+  messageId: string;
+  rootMessageId: string;
+  taskId?: string;
+}
+
+interface ObservedDelegation extends TopicDelegation {
+  runtime?: TopicAgentRuntime;
+  turnId?: string;
+  explicitReportIds: ReadonlySet<string>;
+  persisted?: TopicDelegationSummary;
+}
 
 export type TopicProcessStep =
   | {
@@ -59,6 +90,7 @@ export type TopicReplyItem =
       senderId: string;
       senderServerId?: string;
       senderTitle: string;
+      reportMessageId?: string;
       status: AgentSourceStatus;
       text: string;
       taskId?: string;
@@ -69,22 +101,12 @@ export type TopicReplyItem =
       timestampMs: number;
       isUnread: boolean;
     }
-  | {
-      kind: "main_conclusion";
-      id: string;
-      messageId?: string;
-      text: string;
-      epoch: string | null;
-      /** Main timeline sequence number (null when unavailable). */
-      seq: number | null;
-      timestampMs: number;
-      isUnread: boolean;
-      item: AssistantMessageItem;
-    }
+  | TopicMainReply
   | {
       kind: "thread_entry";
       id: string;
       entry: TopicThreadEntry;
+      images?: readonly UserMessageImageAttachment[];
       /** Separate topic-thread sequence domain; never compared against main timeline seq. */
       threadSeq: number;
       /** Always null for thread entries so main timeline watermarks stay unpolluted. */
@@ -92,6 +114,21 @@ export type TopicReplyItem =
       timestampMs: number;
       isUnread: boolean;
     };
+
+type TopicMainReply = (
+  | { kind: "main_conclusion" }
+  | { kind: "main_progress"; dispatched: boolean }
+) & {
+  id: string;
+  messageId?: string;
+  text: string;
+  epoch: string | null;
+  /** Main timeline sequence number (null when unavailable). */
+  seq: number | null;
+  timestampMs: number;
+  isUnread: boolean;
+  item: AssistantMessageItem;
+};
 
 export interface TopicRetryCandidate {
   text: string;
@@ -152,6 +189,7 @@ export interface TopicUnit {
     seq: number | null;
     epoch: string | null;
     item: UserMessageItem | null;
+    imageAttachments?: readonly MessageImageAttachment[];
   };
   task: WorkspaceTaskSummary | null;
   leadAgentId?: string;
@@ -173,7 +211,7 @@ export interface TopicUnit {
   latestSeq: number | null;
   latestTimestampMs: number;
   latestEpoch: string | null;
-  lifecycleStatus: TopicLifecycleStatus;
+  lifecycleStatus: TopicLifecycleStatus | null;
   retryCandidate: TopicRetryCandidate | null;
 }
 
@@ -209,6 +247,8 @@ export interface ProjectTopicUnitsInput {
   agentRequiresAttention?: boolean;
   fallbackSenderTitle?: string;
   agentTitleById?: ReadonlyMap<string, string>;
+  localServerId?: string;
+  readAgentRuntime?: (serverId: string, agentId: string) => TopicAgentRuntime | undefined;
 }
 
 interface MutableTopicUnit {
@@ -239,17 +279,24 @@ interface TopicBuilderState {
   taskById: Map<string, WorkspaceTaskSummary>;
   tasksByRootMessageId: Map<string, WorkspaceTaskSummary[]>;
   userFollowupBySourceMessageId: Map<string, TopicThreadEntry>;
-  mirroredReplySourceMessageIds: Set<string>;
+  mirroredReplyBySourceMessageId: Map<string, TopicThreadEntry>;
+  projectedMirroredReplies: Map<string, TopicMainReply>;
   loadedAgentMessageIds: Set<string>;
   unmatchedUserFollowups: TopicThreadEntry[];
   unmatchedAgentReplies: TopicThreadEntry[];
   consumedFollowupEntryIds: Set<string>;
+  followupImages: Map<string, readonly UserMessageImageAttachment[]>;
+  pendingDispatches: Map<MutableTopicUnit, Map<string, ObservedDelegation>>;
+  settledDispatches: Set<string>;
   consumedReplyEntryIds: Set<string>;
   unmatchedExplicitRefs: TopicUnmatchedRef[];
   activeTopic: MutableTopicUnit | undefined;
   activeMainFollowup: TopicThreadEntry | undefined;
   fallbackSenderTitle: string;
   agentTitleById?: ReadonlyMap<string, string>;
+  localServerId?: string;
+  readAgentRuntime?: ProjectTopicUnitsInput["readAgentRuntime"];
+  delegations: ObservedDelegation[];
 }
 
 const FALLBACK_MIRROR_WINDOW_MS = 120_000;
@@ -295,6 +342,198 @@ function resolveToolCallName(item: ToolCallItem): string {
 
 function resolveToolCallStatus(item: ToolCallItem): string {
   return item.payload.source === "agent" ? item.payload.data.status : item.payload.data.status;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readPaseoToolResult(item: StreamItem, tools: readonly string[]) {
+  if (item.kind !== "tool_call" || resolveToolCallStatus(item) !== "completed") return;
+  const name = resolveToolCallName(item);
+  const leaf = getPaseoToolLeafName(name) ?? name.replace(/^paseo_/, "");
+  if (!tools.includes(leaf)) return;
+  const { payload } = item;
+  let output: unknown;
+  if (payload.source === "orchestrator") output = payload.data.result;
+  else if (payload.data.detail.type === "unknown") output = payload.data.detail.output;
+  const result = asRecord(output);
+  if (!result || result.isError === true) return;
+  const structured = asRecord(result.structuredContent) ?? result;
+  if (structured.ok === false) return;
+  return asRecord(structured.result) ?? structured;
+}
+
+function readTopicDelegation(item: StreamItem): TopicDelegation | undefined {
+  const result = readPaseoToolResult(item, ["create_agent", "send_agent_prompt"]);
+  if (result?.success === false) return;
+  const delegation = asRecord(result?.topicDelegation);
+  if (!delegation) return;
+  const { agentId, serverId, messageId, rootMessageId } = delegation;
+  if (
+    typeof agentId !== "string" ||
+    !agentId ||
+    typeof serverId !== "string" ||
+    !serverId ||
+    typeof messageId !== "string" ||
+    !messageId ||
+    typeof rootMessageId !== "string" ||
+    !rootMessageId
+  )
+    return;
+  return {
+    agentId,
+    serverId,
+    messageId,
+    rootMessageId,
+    taskId:
+      typeof result?.taskId === "string" ? result.taskId : optionalDelegationTaskId(delegation),
+  };
+}
+
+function optionalDelegationTaskId(delegation: Record<string, unknown>) {
+  return typeof delegation.taskId === "string" ? delegation.taskId : undefined;
+}
+
+function projectedAgentMessageId(item: StreamItem): string | undefined {
+  const prefix = "paseo-agent-message:";
+  if (item.kind !== "tool_call" || item.payload.source !== "agent") return;
+  const { callId } = item.payload.data;
+  return callId.startsWith(prefix) ? callId.slice(prefix.length) : undefined;
+}
+
+export function getTopicProjectionAgentAddresses(
+  input: Pick<
+    ProjectTopicUnitsInput,
+    "items" | "topicAnchors" | "tasks" | "threadEntries" | "pendingInboxItems"
+  >,
+  localServerId: string,
+): { serverId: string; agentId: string }[] {
+  const addresses = new Map<string, { serverId: string; agentId: string }>();
+  function add(agentId?: string, serverId = localServerId) {
+    if (agentId) addresses.set(JSON.stringify([serverId, agentId]), { serverId, agentId });
+  }
+  for (const task of input.tasks ?? []) {
+    add(task.leadAgentId, task.leadServerId);
+    for (const participant of task.participants) add(participant.agentId, participant.serverId);
+  }
+  for (const anchor of input.topicAnchors ?? []) {
+    add(anchor.leadAgentId, anchor.leadServerId);
+    for (const dispatch of anchor.delegations ?? []) add(dispatch.agentId, dispatch.serverId);
+  }
+  for (const entry of input.threadEntries ?? []) add(entry.authorAgentId);
+  for (const inboxItem of input.pendingInboxItems ?? []) add(inboxItem.agentId, inboxItem.serverId);
+  for (const row of input.items) {
+    const dispatch = readTopicDelegation(row);
+    if (dispatch) add(dispatch.agentId, dispatch.serverId);
+    const report = getAgentMessage(row);
+    if (report) add(report.sender.id, report.sender.serverId);
+    if (row.kind !== "user_message") continue;
+    const sender = row.sender ?? getAgentSourcePresentation(row)?.group.sources[0]?.sender;
+    if (sender) add(sender.id);
+  }
+  return [...addresses.values()];
+}
+
+function indexDelegations(input: ProjectTopicUnitsInput): ObservedDelegation[] {
+  const byAgent = new Map<
+    string,
+    {
+      runtime?: TopicAgentRuntime;
+      turns: Map<string, string>;
+      reports: Map<string, Set<string>>;
+    }
+  >();
+  const persisted = new Map<string, ObservedDelegation>();
+  for (const anchor of input.topicAnchors ?? []) {
+    if (!anchor.rootMessageId) continue;
+    for (const dispatch of anchor.delegations ?? []) {
+      const key = JSON.stringify([dispatch.serverId, dispatch.agentId, dispatch.messageId]);
+      const existing = persisted.get(key)?.persisted;
+      if (existing && existing.updatedAt >= dispatch.updatedAt) continue;
+      persisted.set(key, {
+        ...dispatch,
+        rootMessageId: anchor.rootMessageId,
+        runtime: input.readAgentRuntime?.(dispatch.serverId, dispatch.agentId),
+        explicitReportIds: new Set(dispatch.reportIds),
+        persisted: dispatch,
+      });
+    }
+  }
+  const legacy = input.items.flatMap((item) => {
+    const delegation = readTopicDelegation(item);
+    if (!delegation) return [];
+    if (
+      persisted.has(JSON.stringify([delegation.serverId, delegation.agentId, delegation.messageId]))
+    )
+      return [];
+    const address = JSON.stringify([delegation.serverId, delegation.agentId]);
+    let evidence = byAgent.get(address);
+    if (!evidence) {
+      const runtime = input.readAgentRuntime?.(delegation.serverId, delegation.agentId);
+      evidence = { runtime, turns: new Map(), reports: new Map() };
+      for (const row of runtime?.timeline ?? []) {
+        if (!row.turnId) continue;
+        const ids =
+          row.kind === "user_message"
+            ? [row.messageId, row.clientMessageId]
+            : [projectedAgentMessageId(row)];
+        for (const id of ids) {
+          if (id) evidence.turns.set(id, row.turnId);
+        }
+        const result = readPaseoToolResult(row, ["report_to_parent"]);
+        if (result?.success === true && typeof result.messageId === "string") {
+          const reports = evidence.reports.get(row.turnId) ?? new Set<string>();
+          reports.add(result.messageId);
+          evidence.reports.set(row.turnId, reports);
+        }
+      }
+      byAgent.set(address, evidence);
+    }
+    const turnId = evidence.turns.get(delegation.messageId);
+    return [
+      {
+        ...delegation,
+        runtime: evidence.runtime,
+        turnId,
+        explicitReportIds: (turnId && evidence.reports.get(turnId)) || new Set<string>(),
+      },
+    ];
+  });
+  return [...persisted.values(), ...legacy];
+}
+
+function sameChild(
+  delegation: ObservedDelegation,
+  agentId: string,
+  serverId: string | undefined,
+  localServerId: string | undefined,
+): boolean {
+  return delegation.agentId === agentId && delegation.serverId === (serverId ?? localServerId);
+}
+
+function localReportId(id: string | undefined, serverId?: string, agentId?: string) {
+  if (!id?.startsWith("[")) return id;
+  try {
+    const address: unknown = JSON.parse(id);
+    if (
+      Array.isArray(address) &&
+      address.length === 3 &&
+      address[0] === serverId &&
+      address[1] === agentId &&
+      typeof address[2] === "string"
+    )
+      return address[2];
+  } catch {
+    return undefined;
+  }
+}
+
+function findDelegationTopic(state: TopicBuilderState, delegation: TopicDelegation) {
+  const unit = findMatchingTopic(state, delegation);
+  if (unit?.rootMessageId === delegation.rootMessageId) return unit;
 }
 
 function parseIsoMs(iso: string | null | undefined, fallback = 0): number {
@@ -558,22 +797,28 @@ function findMirroredUserFollowup(
   return undefined;
 }
 
-function isMirroredReplyMessage(
-  state: TopicBuilderState,
-  item: StreamItem,
-  target?: MutableTopicUnit,
-): boolean {
-  if (state.mirroredReplySourceMessageIds.has(item.id)) return true;
+function findExactMirroredReply(state: TopicBuilderState, item: StreamItem) {
+  const byId = state.mirroredReplyBySourceMessageId.get(item.id);
+  if (byId) return byId;
   if ("messageId" in item && item.messageId) {
-    if (state.mirroredReplySourceMessageIds.has(item.messageId)) return true;
+    return state.mirroredReplyBySourceMessageId.get(item.messageId);
   }
+}
+
+function findMirroredReply(
+  state: TopicBuilderState,
+  item: AssistantMessageItem,
+  target: MutableTopicUnit,
+): TopicThreadEntry | undefined {
+  const exact = findExactMirroredReply(state, item);
+  if (exact) return exact;
   const followup = state.activeMainFollowup;
-  if (!target || !followup || item.kind !== "assistant_message") return false;
+  if (!followup) return;
 
   // Deterministic 1-to-1 fallback deduplication when provider lacks optional messageId
   // or mirrored main reply lacks sourceMessageId.
   const normalizedReply = normalizeDedupeText(item.text);
-  if (!normalizedReply) return false;
+  if (!normalizedReply) return undefined;
   const itemTs = item.timestamp.getTime();
   for (const candidate of state.unmatchedAgentReplies) {
     if (state.consumedReplyEntryIds.has(candidate.entryId)) continue;
@@ -589,9 +834,9 @@ function isMirroredReplyMessage(
     const entryTs = parseIsoMs(candidate.updatedAt || candidate.createdAt, itemTs);
     if (Math.abs(itemTs - entryTs) > FALLBACK_MIRROR_WINDOW_MS) continue;
     state.consumedReplyEntryIds.add(candidate.entryId);
-    return true;
+    return candidate;
   }
-  return false;
+  return undefined;
 }
 
 function ingestMirroredPrompt(state: TopicBuilderState, item: UserMessageItem): boolean {
@@ -600,6 +845,7 @@ function ingestMirroredPrompt(state: TopicBuilderState, item: UserMessageItem): 
   state.activeMainFollowup = undefined;
   if (!followup) return false;
   if (followup.routedAgentId === followup.mainAgentId) state.activeMainFollowup = followup;
+  if (item.images?.length) state.followupImages.set(followup.entryId, item.images);
   const topic = findMatchingTopic(state, followup);
   if (topic) markTopicCanceledIfStamped(topic, item);
   else recordUnmatchedRef(state, followup);
@@ -664,6 +910,7 @@ function createUnitFromAnchor(
       id: rootItemId,
       messageId: rootMessageId,
       text: resolveAnchorPromptText(anchor, linkedTask),
+      imageAttachments: anchor.imageAttachments,
       timestampMs: parseIsoMs(anchor.createdAt, parseIsoMs(linkedTask?.createdAt, 0)),
       seq: null,
       epoch: null,
@@ -704,6 +951,7 @@ function migrateUnboundUnitToAnchor(
   if (!unit.rootPrompt.text.trim()) {
     unit.rootPrompt.text = resolveAnchorPromptText(anchor, linkedTask);
   }
+  unit.rootPrompt.imageAttachments ??= anchor.imageAttachments;
   state.byTaskId.set(anchorTaskId, unit);
   state.byTopicKey.set(unit.topicKey, unit);
   addUnitToRootIndex(state, anchor.rootMessageId, unit);
@@ -713,16 +961,14 @@ function backfillBoundUnitsPrompt(
   state: TopicBuilderState,
   rootMessageId: string,
   promptText: string,
+  imageAttachments: TopicAnchorSummary["imageAttachments"],
 ): boolean {
   const boundUnits = (state.unitsByRootMessageId.get(rootMessageId) ?? []).filter((u) => u.taskId);
   if (boundUnits.length === 0) return false;
   const trimmed = promptText.trim();
-  if (trimmed) {
-    for (const unit of boundUnits) {
-      if (!unit.rootPrompt.text.trim()) {
-        unit.rootPrompt.text = trimmed;
-      }
-    }
+  for (const unit of boundUnits) {
+    if (trimmed && !unit.rootPrompt.text.trim()) unit.rootPrompt.text = trimmed;
+    unit.rootPrompt.imageAttachments ??= imageAttachments;
   }
   return true;
 }
@@ -741,7 +987,12 @@ function seedTopicsFromAnchors(
     if (!anchorTaskId) {
       if (
         anchor.rootMessageId &&
-        backfillBoundUnitsPrompt(state, anchor.rootMessageId, anchor.rootPromptText)
+        backfillBoundUnitsPrompt(
+          state,
+          anchor.rootMessageId,
+          anchor.rootPromptText,
+          anchor.imageAttachments,
+        )
       ) {
         continue;
       }
@@ -800,6 +1051,7 @@ function hydrateAnchorUnitWithHumanPrompt(
     id: item.id,
     messageId: item.messageId,
     text: item.text || existing.rootPrompt.text,
+    imageAttachments: existing.rootPrompt.imageAttachments,
     timestampMs: item.timestamp.getTime(),
     seq: cursor?.seq ?? null,
     epoch: cursor?.epoch ?? null,
@@ -933,7 +1185,16 @@ function updateTopicReportSender(
   }
 
   const senderTitle =
-    state.agentTitleById?.get(agentMessage.sender.id) ??
+    state
+      .readAgentRuntime?.(
+        agentMessage.sender.serverId ?? state.localServerId ?? "",
+        agentMessage.sender.id,
+      )
+      ?.title?.trim() ??
+    (agentMessage.sender.serverId === undefined ||
+    agentMessage.sender.serverId === state.localServerId
+      ? state.agentTitleById?.get(agentMessage.sender.id)
+      : undefined) ??
     agentMessage.sender.title?.trim() ??
     state.fallbackSenderTitle;
   if (!target.leadTitle && target.leadAgentId === agentMessage.sender.id) {
@@ -943,38 +1204,129 @@ function updateTopicReportSender(
   return senderTitle;
 }
 
+function matchTopicReport(
+  state: TopicBuilderState,
+  item: StreamItem,
+  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
+  recordUnmatched = true,
+) {
+  const reportMessageId = localReportId(
+    projectedAgentMessageId(item),
+    agentMessage.sender.serverId ?? state.localServerId,
+    agentMessage.sender.id,
+  );
+  const senderDelegations = state.delegations.filter((delegation) =>
+    sameChild(
+      delegation,
+      agentMessage.sender.id,
+      agentMessage.sender.serverId,
+      state.localServerId,
+    ),
+  );
+  const linkedDelegations = senderDelegations.filter(
+    (delegation) => reportMessageId && delegation.explicitReportIds.has(reportMessageId),
+  );
+  const hasExplicitRef = Boolean(agentMessage.taskId || agentMessage.rootMessageId);
+  if (
+    linkedDelegations.length > 0 &&
+    !linkedDelegations.some(
+      (delegation) =>
+        (!agentMessage.rootMessageId || agentMessage.rootMessageId === delegation.rootMessageId) &&
+        (!agentMessage.taskId || agentMessage.taskId === delegation.taskId),
+    )
+  )
+    return;
+  if (linkedDelegations.length > 1) return;
+  if (linkedDelegations.length === 1) {
+    const matched = findDelegationTopic(state, linkedDelegations[0]!);
+    return matched ? { matched, reportMessageId, scoped: true, exactDispatch: true } : undefined;
+  }
+  if (hasExplicitRef) {
+    const matched = findMatchingTopic(state, agentMessage);
+    if (!matched) {
+      if (recordUnmatched) recordUnmatchedRef(state, agentMessage);
+      return;
+    }
+    return { matched, reportMessageId, scoped: true, exactDispatch: false };
+  }
+  // A report without dispatch provenance must not move the active card to another topic.
+  if (senderDelegations.length > 0) return;
+  return {
+    matched: findMatchingTopic(state, {}),
+    reportMessageId,
+    scoped: false,
+    exactDispatch: false,
+  };
+}
+
+function dispatchKey(delegation: TopicDelegation): string {
+  return JSON.stringify([delegation.serverId, delegation.agentId, delegation.messageId]);
+}
+
+function rememberDispatch(state: TopicBuilderState, item: ToolCallItem, current: MutableTopicUnit) {
+  const sent = readTopicDelegation(item);
+  if (!sent) return;
+  const target = findDelegationTopic(state, sent);
+  if (!target) return;
+  const key = dispatchKey(sent);
+  const observed = state.delegations.find((delegation) => dispatchKey(delegation) === key);
+  const pending = state.pendingDispatches.get(target) ?? new Map<string, ObservedDelegation>();
+  pending.set(key, observed ?? { ...sent, explicitReportIds: new Set() });
+  state.pendingDispatches.set(target, pending);
+  return target === current;
+}
+
+function acceptFormalReport(
+  state: TopicBuilderState,
+  target: MutableTopicUnit,
+  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
+  reportMessageId: string | undefined,
+  scoped: boolean,
+) {
+  if (resolveAgentSourceStatus(agentMessage) !== "completed") return;
+  const pending = state.pendingDispatches.get(target);
+  if (!pending?.size) return;
+  const candidates = [...pending].filter(([, delegation]) =>
+    sameChild(
+      delegation,
+      agentMessage.sender.id,
+      agentMessage.sender.serverId,
+      state.localServerId,
+    ),
+  );
+  const exact = reportMessageId
+    ? candidates.filter(([, delegation]) => delegation.explicitReportIds.has(reportMessageId))
+    : [];
+  const only = candidates.length === 1 ? candidates[0] : undefined;
+  let matched = exact.length === 1 ? exact[0] : undefined;
+  if (exact.length === 0 && scoped && only?.[1].explicitReportIds.size === 0) matched = only;
+  if (matched) {
+    pending.delete(matched[0]);
+    state.settledDispatches.add(matched[0]);
+  }
+}
+
 function ingestAgentMessageItem(state: TopicBuilderState, item: StreamItem): boolean {
   const agentMessage = getAgentMessage(item);
   if (!agentMessage) return false;
-  if (isMirroredReplyMessage(state, item)) {
-    return true;
-  }
-
-  const hasExplicitRef = Boolean(agentMessage.taskId || agentMessage.rootMessageId);
-  const matched = findMatchingTopic(state, {
-    taskId: agentMessage.taskId,
-    rootMessageId: agentMessage.rootMessageId,
-  });
-
-  if (!matched && hasExplicitRef) {
-    recordUnmatchedRef(state, {
-      taskId: agentMessage.taskId,
-      rootMessageId: agentMessage.rootMessageId,
-    });
-    return true;
-  }
+  if (findExactMirroredReply(state, item)) return true;
+  const match = matchTopicReport(state, item, agentMessage);
+  if (!match) return true;
+  const { matched, reportMessageId, scoped } = match;
 
   const target = matched ?? ensureFallbackTopic(state, item);
 
   const senderTitle = updateTopicReportSender(state, target, agentMessage);
+  acceptFormalReport(state, target, agentMessage, reportMessageId, scoped);
 
-  if (state.activeTopic === target || !hasExplicitRef) markTopicCanceledIfStamped(target, item);
+  if (state.activeTopic === target || !scoped) markTopicCanceledIfStamped(target, item);
   target.replies.push({
     kind: "subagent_report",
     id: item.id,
     senderId: agentMessage.sender.id,
     senderServerId: agentMessage.sender.serverId,
     senderTitle,
+    reportMessageId,
     status: resolveAgentSourceStatus(agentMessage),
     text: agentMessage.text,
     taskId: agentMessage.taskId,
@@ -984,8 +1336,6 @@ function ingestAgentMessageItem(state: TopicBuilderState, item: StreamItem): boo
     timestampMs: item.timestamp.getTime(),
     isUnread: false,
   });
-  // A report belongs to its own card even when it arrives inside another prompt's turn.
-  if (!hasExplicitRef) state.activeTopic = target;
   return true;
 }
 
@@ -1024,7 +1374,121 @@ function ingestLegacySubagentUserMessage(state: TopicBuilderState, item: UserMes
   });
 }
 
-function ingestStreamItem(state: TopicBuilderState, item: StreamItem): void {
+interface TopicTurn {
+  reportOnly: boolean;
+  reportTopic?: MutableTopicUnit;
+  unresolvedReports: Set<string>;
+  dispatchAttempt: boolean;
+  dispatched: boolean;
+}
+
+function uniqueReportTopic(
+  state: TopicBuilderState,
+  item: StreamItem,
+  report: NonNullable<ReturnType<typeof getAgentMessage>>,
+): MutableTopicUnit | undefined {
+  const match = matchTopicReport(state, item, report, false);
+  if (!match?.matched) return;
+  if (!match.scoped) return state.topics.length === 1 ? match.matched : undefined;
+  if (match.exactDispatch || report.taskId || !report.rootMessageId) return match.matched;
+  if (state.unitsByRootMessageId.get(report.rootMessageId)?.length === 1) return match.matched;
+}
+
+function startTopicTurn(
+  state: TopicBuilderState,
+  items: readonly StreamItem[],
+  first: number,
+  end: number,
+): TopicTurn {
+  let startedByReport = false;
+  let firstTrigger = true;
+  let humanInput = false;
+  let reportTopic: MutableTopicUnit | undefined;
+  let ambiguous = false;
+
+  for (let index = first; index < end; index += 1) {
+    const item = items[index]!;
+    const report = getAgentMessage(item);
+    if (item.kind === "user_message" && isRealHumanPrompt(item)) humanInput = true;
+    if (firstTrigger && isTurnTrigger(item)) {
+      startedByReport = Boolean(report);
+      firstTrigger = false;
+    }
+    if (!report) continue;
+    const match = uniqueReportTopic(state, item, report);
+    if (!match || (reportTopic && reportTopic !== match)) ambiguous = true;
+    else reportTopic = match;
+  }
+
+  const reportOnly = startedByReport && !humanInput;
+  return {
+    reportOnly,
+    reportTopic: reportOnly && !ambiguous ? reportTopic : undefined,
+    unresolvedReports: new Set(),
+    dispatchAttempt: false,
+    dispatched: false,
+  };
+}
+
+function isDispatchTool(item: ToolCallItem): boolean {
+  const name = resolveToolCallName(item);
+  const leaf = getPaseoToolLeafName(name) ?? name.replace(/^paseo_/, "");
+  return leaf === "create_agent" || leaf === "send_agent_prompt";
+}
+
+function ingestMainReply(
+  state: TopicBuilderState,
+  target: MutableTopicUnit,
+  item: AssistantMessageItem,
+  turn: TopicTurn,
+): void {
+  const timestampMs = item.timestamp.getTime();
+  const hasPendingDispatch = [...(state.pendingDispatches.get(target)?.values() ?? [])].some(
+    ({ persisted }) =>
+      !persisted ||
+      parseIsoMs(persisted.updatedAt, Infinity) > timestampMs ||
+      !["error", "interrupted"].includes(persisted.status),
+  );
+  const hasObservedPendingDispatch = state.delegations.some((delegation) => {
+    const snapshot = delegation.persisted;
+    return (
+      snapshot &&
+      !state.settledDispatches.has(dispatchKey(delegation)) &&
+      ["queued", "running", "ended"].includes(snapshot.status) &&
+      parseIsoMs(snapshot.updatedAt, Infinity) <= timestampMs &&
+      findDelegationTopic(state, delegation) === target
+    );
+  });
+  const dispatched = hasPendingDispatch || hasObservedPendingDispatch;
+  const progress =
+    dispatched || turn.unresolvedReports.size > 0 || (turn.dispatchAttempt && !turn.dispatched);
+  const reply: TopicMainReply = {
+    ...(progress
+      ? ({ kind: "main_progress", dispatched } as const)
+      : ({ kind: "main_conclusion" } as const)),
+    id: item.id,
+    messageId: item.messageId,
+    text: item.text,
+    epoch: item.timelineCursor?.epoch ?? null,
+    seq: item.timelineCursor?.seq ?? null,
+    timestampMs,
+    isUnread: false,
+    item,
+  };
+  const mirror = findMirroredReply(state, item, target);
+  if (mirror) {
+    if (entryBelongsToUnit(mirror, target)) {
+      state.projectedMirroredReplies.set(mirror.entryId, {
+        ...reply,
+        id: `thread:${mirror.entryId}`,
+      });
+    }
+    return;
+  }
+  target.replies.push(reply);
+}
+
+function ingestStreamItem(state: TopicBuilderState, item: StreamItem, turn: TopicTurn): void {
   if (item.kind === "user_message") {
     if (isRealHumanPrompt(item)) {
       ingestHumanPrompt(state, item);
@@ -1033,21 +1497,32 @@ function ingestStreamItem(state: TopicBuilderState, item: StreamItem): void {
     }
     return;
   }
-  if (ingestAgentMessageItem(state, item)) return;
+  if (ingestAgentMessageItem(state, item)) {
+    const report = getAgentMessage(item);
+    if (turn.reportOnly && report) {
+      const source = JSON.stringify([
+        report.sender.serverId ?? state.localServerId,
+        report.sender.id,
+      ]);
+      if (resolveAgentSourceStatus(report) === "completed") turn.unresolvedReports.delete(source);
+      else turn.unresolvedReports.add(source);
+    }
+    return;
+  }
 
-  const target =
-    state.activeTopic ?? (state.topics.length > 0 ? undefined : ensureFallbackTopic(state, item));
+  const target = turn.reportOnly
+    ? turn.reportTopic
+    : (state.activeTopic ??
+      (state.topics.length > 0 ? undefined : ensureFallbackTopic(state, item)));
   if (!target) return;
 
   markTopicCanceledIfStamped(target, item);
 
-  // Skip assistant replies already mirrored into TopicThreadEntry for fallback-to-main turns
-  // so the topic card does not render duplicate conclusions (full timeline still preserves them).
-  if (item.kind === "assistant_message" && isMirroredReplyMessage(state, item, target)) {
-    return;
-  }
-
   if (item.kind === "tool_call") {
+    if (isDispatchTool(item)) {
+      turn.dispatchAttempt = true;
+      if (rememberDispatch(state, item, target)) turn.dispatched = true;
+    }
     target.processSteps.push({
       kind: "tool_call",
       id: item.id,
@@ -1066,17 +1541,7 @@ function ingestStreamItem(state: TopicBuilderState, item: StreamItem): void {
       item,
     });
   } else if (item.kind === "assistant_message" && item.text.trim().length > 0) {
-    target.replies.push({
-      kind: "main_conclusion",
-      id: item.id,
-      messageId: item.messageId,
-      text: item.text,
-      epoch: item.timelineCursor?.epoch ?? null,
-      seq: item.timelineCursor?.seq ?? null,
-      timestampMs: item.timestamp.getTime(),
-      isUnread: false,
-      item,
-    });
+    ingestMainReply(state, target, item, turn);
   }
 }
 
@@ -1129,10 +1594,16 @@ function attachThreadEntries(state: TopicBuilderState, entries: readonly TopicTh
       target.leadTitle =
         state.agentTitleById?.get(entry.authorAgentId) ?? entry.authorTitle?.trim();
     }
+    const mirroredReply = state.projectedMirroredReplies.get(entry.entryId);
+    if (mirroredReply) {
+      target.replies.push(mirroredReply);
+      continue;
+    }
     target.replies.push({
       kind: "thread_entry",
       id: `thread:${entry.entryId}`,
       entry,
+      images: state.followupImages.get(entry.entryId),
       threadSeq: entry.seq,
       seq: null,
       timestampMs: parseIsoMs(entry.updatedAt || entry.createdAt),
@@ -1147,6 +1618,13 @@ function attachPendingInboxItems(
 ): void {
   for (const inboxItem of inboxItems) {
     const hasExplicitRef = Boolean(inboxItem.taskId || inboxItem.rootMessageId);
+    if (
+      !hasExplicitRef &&
+      state.delegations.some((delegation) =>
+        sameChild(delegation, inboxItem.agentId, inboxItem.serverId, state.localServerId),
+      )
+    )
+      continue;
     const target = findMatchingTopic(state, {
       taskId: inboxItem.taskId,
       rootMessageId: inboxItem.rootMessageId,
@@ -1336,6 +1814,7 @@ function isTopicBlocked(
 }
 
 function isOutcomeReply(reply: TopicReplyItem): boolean {
+  if (reply.kind === "main_progress") return false;
   if (reply.kind === "main_conclusion" || reply.kind === "subagent_report") return true;
   if (reply.entry.role === "agent_reply") return true;
   return (
@@ -1346,7 +1825,7 @@ function isOutcomeReply(reply: TopicReplyItem): boolean {
 }
 
 function isCompletedOutcome(reply: TopicReplyItem | undefined): boolean {
-  if (!reply) return false;
+  if (!reply || reply.kind === "main_progress") return false;
   if (reply.kind === "main_conclusion") return true;
   if (reply.kind === "subagent_report") {
     return reply.status === "completed" || reply.status === "finished";
@@ -1429,13 +1908,15 @@ function isTopicInterrupted(
 
 function resolveTopicLifecycleStatus(input: {
   unit: MutableTopicUnit;
+  delegations: readonly ObservedDelegation[];
+  localServerId?: string;
   replies: readonly TopicReplyItem[];
   activeBlockingPrompt: TopicBlockingPrompt | null;
   hasUnread: boolean;
   isLatestTopic: boolean;
   isTurnActive: boolean;
-}): TopicLifecycleStatus {
-  const { unit, replies, activeBlockingPrompt, hasUnread } = input;
+}): TopicLifecycleStatus | null {
+  const { unit, replies, activeBlockingPrompt, hasUnread, delegations, localServerId } = input;
   const latestReport = replies
     .toReversed()
     .find(
@@ -1458,12 +1939,57 @@ function resolveTopicLifecycleStatus(input: {
   if (hasUnrecoveredError(unit, latestOutcome)) return "error";
   if (isTopicInterrupted(unit, latestOutcome)) return "interrupted";
   if (unit.pendingInboxItems.length > 0) return "aggregating";
-  return hasUnread ? "unread" : "settled";
+  if (unit.task?.status === "completed") return hasUnread ? "unread" : "completed";
+
+  const dispatchStates = delegations.map((delegation) => {
+    const { runtime, turnId } = delegation;
+    const reported = replies.some(
+      (reply) =>
+        reply.kind === "subagent_report" &&
+        reply.status === "completed" &&
+        reply.reportMessageId !== undefined &&
+        delegation.explicitReportIds.has(reply.reportMessageId) &&
+        sameChild(delegation, reply.senderId, reply.senderServerId, localServerId),
+    );
+    if (delegation.persisted) return delegation.persisted.status;
+    if (reported) return "completed";
+    // The accepted tool result identifies this exact queued request. A child's
+    // running status only applies after its timeline links the request to a turn.
+    if (!turnId || !runtime) return "queued";
+    if (runtime.turn.phase === "open") {
+      if (!runtime.turn.turnId) return "unknown";
+      return runtime.turn.turnId === turnId ? "running" : "ended";
+    }
+    return runtime.status === "idle" || runtime.status === "closed" ? "ended" : "unknown";
+  });
+  if (dispatchStates.some((status) => status === "queued" || status === "running"))
+    return "dispatching";
+  if (hasUnread) return "unread";
+  if (dispatchStates.length > 0) {
+    if (dispatchStates.every((status) => status === "completed")) return "completed";
+    if (dispatchStates.some((status) => status === "error")) return "error";
+    if (dispatchStates.some((status) => status === "interrupted")) return "interrupted";
+    if (dispatchStates.every((status) => status === "ended" || status === "completed"))
+      return "awaitingReport";
+    return null;
+  }
+  if (
+    replies.some(
+      (reply) =>
+        reply.kind === "main_conclusion" ||
+        (reply.kind === "thread_entry" &&
+          reply.entry.role === "agent_reply" &&
+          reply.entry.routedAgentId === reply.entry.mainAgentId &&
+          reply.entry.status === "completed"),
+    )
+  )
+    return "replied";
+  return null;
 }
 
 function resolveRetryCandidate(
   replies: readonly TopicReplyItem[],
-  lifecycleStatus: TopicLifecycleStatus,
+  lifecycleStatus: TopicLifecycleStatus | null,
 ): TopicRetryCandidate | null {
   if (lifecycleStatus !== "error" && lifecycleStatus !== "interrupted") return null;
   const latestFollowup = replies.findLast(
@@ -1492,13 +2018,32 @@ function sortRepliesChronologically(replies: readonly TopicReplyItem[]): TopicRe
     .map((entry) => entry.reply);
 }
 
+function getDelegationLead(
+  unit: MutableTopicUnit,
+  delegations: readonly ObservedDelegation[],
+  localServerId?: string,
+) {
+  const lead =
+    delegations.find(
+      ({ agentId, serverId }) =>
+        agentId === unit.leadAgentId && serverId === (unit.leadServerId ?? localServerId),
+    ) ?? (unit.task?.leadAgentId ? undefined : delegations[0]);
+  if (!lead) return;
+  return {
+    leadAgentId: lead.agentId,
+    leadServerId: lead.serverId,
+    leadTitle: lead.runtime?.title?.trim() || lead.persisted?.title?.trim() || unit.leadTitle,
+  };
+}
+
 function finalizeTopicUnit(input: {
   unit: MutableTopicUnit;
+  delegations: readonly ObservedDelegation[];
   isLatestTopic: boolean;
   projectionInput: ProjectTopicUnitsInput;
   watermark: TopicWatermarkSnapshot;
 }): TopicUnit {
-  const { unit, isLatestTopic, projectionInput, watermark } = input;
+  const { unit, delegations, isLatestTopic, projectionInput, watermark } = input;
   const topicReadEntry = projectionInput.readSnapshot?.topics.find(
     (entry) => entry.topicKey === unit.topicKey,
   );
@@ -1561,6 +2106,8 @@ function finalizeTopicUnit(input: {
   const activeBlockingPrompt = resolveActiveBlockingPrompt(unit);
   const lifecycleStatus = resolveTopicLifecycleStatus({
     unit,
+    delegations,
+    localServerId: projectionInput.localServerId,
     replies,
     activeBlockingPrompt,
     hasUnread,
@@ -1568,9 +2115,9 @@ function finalizeTopicUnit(input: {
     isTurnActive: Boolean(projectionInput.isTurnActive),
   });
   const retryCandidate = resolveRetryCandidate(replies, lifecycleStatus);
-
   return {
     ...unit,
+    ...getDelegationLead(unit, delegations, projectionInput.localServerId),
     replies,
     fileConflicts,
     activeBlockingPrompt,
@@ -1614,7 +2161,7 @@ function indexThreadEntries(
   assistantIds: ReadonlySet<string> | null,
 ) {
   const userFollowupBySourceMessageId = new Map<string, TopicThreadEntry>();
-  const mirroredReplySourceMessageIds = new Set<string>();
+  const mirroredReplyBySourceMessageId = new Map<string, TopicThreadEntry>();
   const unmatchedUserFollowups: TopicThreadEntry[] = [];
   const unmatchedAgentReplies: TopicThreadEntry[] = [];
 
@@ -1624,7 +2171,7 @@ function indexThreadEntries(
       unmatchedUserFollowups.push(entry);
     } else if (entry.role === "agent_reply" && entry.routedAgentId === entry.mainAgentId) {
       if (entry.sourceMessageId) {
-        mirroredReplySourceMessageIds.add(entry.sourceMessageId);
+        mirroredReplyBySourceMessageId.set(entry.sourceMessageId, entry);
         if (assistantIds?.has(entry.sourceMessageId)) continue;
       }
       unmatchedAgentReplies.push(entry);
@@ -1633,7 +2180,7 @@ function indexThreadEntries(
 
   return {
     userFollowupBySourceMessageId,
-    mirroredReplySourceMessageIds,
+    mirroredReplyBySourceMessageId,
     unmatchedUserFollowups,
     unmatchedAgentReplies,
   };
@@ -1664,6 +2211,21 @@ function indexTasksByRoot(tasks: readonly WorkspaceTaskSummary[]) {
   return { taskById, tasksByRootMessageId };
 }
 
+function ingestTopicTurns(state: TopicBuilderState, items: readonly StreamItem[]): void {
+  for (let first = 0; first < items.length; ) {
+    let end = first + 1;
+    while (end < items.length && !startsNewTurn(items[end]!, items[end - 1]!)) {
+      end += 1;
+    }
+    const turn = startTopicTurn(state, items, first, end);
+    if (turn.reportOnly) state.activeMainFollowup = undefined;
+    for (let index = first; index < end; index += 1) {
+      ingestStreamItem(state, items[index]!, turn);
+    }
+    first = end;
+  }
+}
+
 export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectionResult {
   const { taskById, tasksByRootMessageId } = indexTasksByRoot(input.tasks ?? []);
 
@@ -1683,20 +2245,25 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     ...indexed,
     loadedAgentMessageIds,
     consumedFollowupEntryIds: new Set(),
+    followupImages: new Map(),
+    projectedMirroredReplies: new Map(),
+    pendingDispatches: new Map(),
+    settledDispatches: new Set(),
     consumedReplyEntryIds: new Set(),
     unmatchedExplicitRefs: [],
     activeTopic: undefined,
     activeMainFollowup: undefined,
     fallbackSenderTitle: input.fallbackSenderTitle ?? "Subagent",
     agentTitleById: input.agentTitleById,
+    localServerId: input.localServerId,
+    readAgentRuntime: input.readAgentRuntime,
+    delegations: indexDelegations(input),
   };
 
   if (input.topicAnchors && input.topicAnchors.length > 0) {
     seedTopicsFromAnchors(state, input.topicAnchors);
   }
-  for (const item of input.items) {
-    ingestStreamItem(state, item);
-  }
+  ingestTopicTurns(state, input.items);
   attachExternalCollections(state, input);
 
   if (input.topicAnchors && input.topicAnchors.length > 0 && state.topics.length > 1) {
@@ -1712,9 +2279,18 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
 
   let totalUnreadTopics = 0;
   let totalUnreadReplies = 0;
+  const delegationsByUnit = new Map<MutableTopicUnit, ObservedDelegation[]>();
+  for (const delegation of state.delegations) {
+    const unit = findDelegationTopic(state, delegation);
+    if (!unit) continue;
+    const existing = delegationsByUnit.get(unit);
+    if (existing) existing.push(delegation);
+    else delegationsByUnit.set(unit, [delegation]);
+  }
   const topics = state.topics.map((unit, index) => {
     const finalized = finalizeTopicUnit({
       unit,
+      delegations: delegationsByUnit.get(unit) ?? [],
       isLatestTopic: index === state.topics.length - 1,
       projectionInput: input,
       watermark,

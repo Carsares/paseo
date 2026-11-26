@@ -9,6 +9,8 @@ import React, {
   useState,
   type ReactNode,
 } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
 import { act, fireEvent } from "@testing-library/react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +45,11 @@ vi.mock("@/hooks/use-daemon-config", () => ({
 
 vi.mock("@/hooks/use-active-workspace-archive", () => ({
   useActiveWorkspaceArchive: () => ({ canArchive: false, archive: vi.fn() }),
+}));
+
+vi.mock("@/git/use-actions", () => ({
+  useGitActions: () => ({ gitActions: { primary: null, secondary: [], menu: [] } }),
+  useGitActionRunner: () => vi.fn(),
 }));
 
 vi.mock("@/plugins", () => ({
@@ -276,12 +283,15 @@ function createTerminalTab(id: string): WorkspaceTabDescriptor {
 describe("WorkspaceHeaderMenuMobile per-tab actions", () => {
   let container: HTMLDivElement;
   let root: Root;
+  let queryClient: QueryClient;
 
   beforeEach(() => {
     vi.stubGlobal("React", React);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     container = document.body.appendChild(document.createElement("div"));
     root = createRoot(container);
+    queryClient = new QueryClient();
+    queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS);
   });
 
   afterEach(() => {
@@ -293,24 +303,26 @@ describe("WorkspaceHeaderMenuMobile per-tab actions", () => {
   function renderMenu(props: Partial<WorkspaceHeaderMenuMobileProps>) {
     act(() => {
       root.render(
-        <WorkspaceHeaderMenuMobile
-          currentBranchName={null}
-          showWorkspaceSetup={false}
-          importAgentDisabled
-          copyPathDisabled
-          onOpenImportSheet={noop}
-          onCopyWorkspacePath={noop}
-          onCopyBranchName={noop}
-          onOpenSetupTab={noop}
-          normalizedServerId="server-1"
-          normalizedWorkspaceId="workspace-1"
-          scripts={emptyScripts}
-          showCreateBrowserTab={false}
-          createTerminalDisabled={false}
-          onCreateTerminalWithProfile={noop}
-          onCreateBrowser={noop}
-          {...props}
-        />,
+        <QueryClientProvider client={queryClient}>
+          <WorkspaceHeaderMenuMobile
+            currentBranchName={null}
+            showWorkspaceSetup={false}
+            importAgentDisabled
+            copyPathDisabled
+            onOpenImportSheet={noop}
+            onCopyWorkspacePath={noop}
+            onCopyBranchName={noop}
+            onOpenSetupTab={noop}
+            normalizedServerId="server-1"
+            normalizedWorkspaceId="workspace-1"
+            scripts={emptyScripts}
+            showCreateBrowserTab={false}
+            createTerminalDisabled={false}
+            onCreateTerminalWithProfile={noop}
+            onCreateBrowser={noop}
+            {...props}
+          />
+        </QueryClientProvider>,
       );
     });
   }
@@ -322,6 +334,20 @@ describe("WorkspaceHeaderMenuMobile per-tab actions", () => {
       fireEvent.click(element as HTMLElement);
     });
   }
+
+  it("toggles the global user message alignment through the compact menu", () => {
+    renderMenu({});
+    clickTestId("workspace-header-menu-trigger");
+    const testId = "workspace-header-user-message-alignment";
+    const action = () => container.querySelector(`[data-testid="${testId}"]`);
+    expect(action()?.textContent).toBe("Align my messages left");
+    clickTestId(testId);
+    expect(queryClient.getQueryData(APP_SETTINGS_QUERY_KEY)).toMatchObject({
+      userMessageAlignment: "left",
+    });
+    clickTestId("workspace-header-menu-trigger");
+    expect(action()?.textContent).toBe("Align my messages right");
+  });
 
   it("copies ID, renames, and closes an unselected background terminal without selecting it", () => {
     const terminal = createTerminalTab("bg-1");

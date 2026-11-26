@@ -15,7 +15,8 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { createTestAgentClients } from "../../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import type { WorkspaceRegistry } from "../../workspace-registry.js";
-import { AgentManager } from "../agent-manager.js";
+import { AgentManager, directHumanPromptRunOptions } from "../agent-manager.js";
+import { sendPromptToAgent } from "../agent-prompt.js";
 import { AgentStorage } from "../agent-storage.js";
 import {
   createFinishSubscriptions,
@@ -69,6 +70,103 @@ async function cleanupWorkdir(params: {
 }
 
 describe("create_agent orchestration playbooks", () => {
+  test("returns the main turn's topic and dispatch identity for create and send without a task", async () => {
+    const workdir = mkdtempSync(join(tmpdir(), "create-agent-topic-"));
+    const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const workspaceRegistry = createWorkspaceRegistry(workdir);
+    const release = Promise.withResolvers<void>();
+    const humanPrompt = "Delegate work about this topic";
+    const clients = createTestAgentClients({
+      async beforeTurnComplete(prompt) {
+        const mainPrompt =
+          typeof prompt === "string"
+            ? prompt.includes(humanPrompt)
+            : prompt.some((part) => part.type === "text" && part.text.includes(humanPrompt));
+        if (!mainPrompt) return;
+        await release.promise;
+      },
+    });
+    const agentManager = new AgentManager({
+      clients,
+      registry: agentStorage,
+      workspaceRegistry,
+      logger,
+    });
+    try {
+      const main = await agentManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: "ws-playbook",
+      });
+      await agentManager.setAgentMainControl(main.id, true);
+      const catalog = createPaseoToolCatalog({
+        serverId: "self",
+        callerAgentId: main.id,
+        verifiedCallerAgentId: main.id,
+        paseoHome: workdir,
+        agentManager,
+        agentStorage,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        workspaceRegistry,
+        queueAgentPrompt: async () => "queued-dispatch",
+        logger,
+      });
+      const mainTurn = await sendPromptToAgent({
+        agentManager,
+        agentStorage,
+        logger,
+        agentId: main.id,
+        prompt: humanPrompt,
+        messageId: "human-topic",
+        runOptions: directHumanPromptRunOptions(),
+      });
+      if (mainTurn.disposition !== "turn_started") throw new Error("Expected the main turn");
+      await mainTurn.started;
+      expect(agentManager.isActiveTurnHumanInitiated(main.id)).toBe(true);
+      const root = (await agentManager.getTimelineRows(main.id)).find(
+        ({ item }) => item.type === "user_message",
+      )?.item;
+      if (root?.type !== "user_message") throw new Error("Expected the main turn's human prompt");
+      const rootMessageId = root.messageId ?? root.clientMessageId;
+      expect(rootMessageId).toEqual(expect.any(String));
+
+      const created = await catalog.executeTool("create_agent", {
+        provider: "codex/gpt-5.4",
+        title: "Specialist",
+        initialPrompt: "Work on the first step",
+        notifyOnFinish: false,
+      });
+      expect(created.isError).toBeFalsy();
+      const { agentId, topicDelegation } = created.structuredContent as {
+        agentId: string;
+        topicDelegation: { messageId: string };
+      };
+      expect(topicDelegation).toEqual({
+        agentId,
+        serverId: "self",
+        rootMessageId,
+        messageId: expect.any(String),
+      });
+      const childRows = await agentManager.getTimelineRows(agentId);
+      expect(childRows.map(({ item }) => item)).toContainEqual(
+        expect.objectContaining({ callId: `paseo-agent-message:${topicDelegation.messageId}` }),
+      );
+
+      const sent = await catalog.executeTool("send_agent_prompt", {
+        agentId,
+        prompt: "Work on the second step",
+        notifyOnFinish: false,
+      });
+      expect(sent.structuredContent).toMatchObject({
+        success: true,
+        deliveryStatus: "queued",
+        messageId: "queued-dispatch",
+        topicDelegation: { agentId, serverId: "self", rootMessageId, messageId: "queued-dispatch" },
+      });
+    } finally {
+      release.resolve();
+      await cleanupWorkdir({ agentManager, agentStorage, workdir });
+    }
+  });
+
   test("stamps playbook labels, forces explicit reporting without finish notifications, and skips defaultResident", async () => {
     const workdir = mkdtempSync(join(tmpdir(), "create-agent-playbook-"));
     const agentStorage = new AgentStorage(join(workdir, "agents"), logger);

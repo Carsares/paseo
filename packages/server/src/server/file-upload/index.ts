@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 
 import { FileTransferOpcode, type FileTransferFrame } from "@getpaseo/protocol/binary-frames/index";
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
+import { UploadedFileAttachmentSchema } from "@getpaseo/protocol/messages";
+import { z } from "zod";
+import { writeJsonFileAtomic } from "../atomic-file.js";
 import type { FileUploadRequest, FileUploadResponse } from "../messages.js";
+
+const UploadRegistrationSchema = z.object({
+  owner: z.string(),
+  file: UploadedFileAttachmentSchema,
+});
+const UPLOAD_ID = /^upload_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 
 interface FileUploadStoreOptions {
   paseoHome: string;
@@ -15,6 +24,7 @@ interface PendingUpload {
   requestId: string;
   id: string;
   source: object;
+  owner?: string;
   completed: boolean;
   finished(response: FileUploadResponse | null): void;
   fileName: string;
@@ -46,6 +56,7 @@ export class FileUploadStore {
     request: FileUploadRequest,
     source: object = this.defaultSource,
     finished: (response: FileUploadResponse | null) => void = () => {},
+    owner?: string,
   ): () => Promise<void> {
     const existingUpload = this.pending.get(source)?.get(request.requestId);
     if (existingUpload) void this.cancel(existingUpload).catch(() => {});
@@ -56,6 +67,7 @@ export class FileUploadStore {
       requestId: request.requestId,
       id,
       source,
+      owner,
       completed: false,
       finished,
       fileName,
@@ -71,6 +83,51 @@ export class FileUploadStore {
     uploads.set(request.requestId, upload);
     this.pending.set(source, uploads);
     return () => this.cancel(upload);
+  }
+
+  getUploadAccess(owner: string) {
+    return {
+      uploadsRoot: join(this.paseoHome, "uploads"),
+      lookup: async (id: string) => {
+        if (!UPLOAD_ID.test(id)) return null;
+        try {
+          const data = await readFile(this.registrationPath(id), "utf8");
+          const record = UploadRegistrationSchema.safeParse(JSON.parse(data));
+          if (!record.success || record.data.owner !== owner || record.data.file.id !== id)
+            return null;
+          return record.data.file;
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+          throw error;
+        }
+      },
+    };
+  }
+
+  async persistMessageImage(input: { owner: string; bytes: Uint8Array; mimeType: string }) {
+    const id = `upload_${randomUUID()}`;
+    const extension = input.mimeType.split("/")[1];
+    const fileName = sanitizeFileName(`image.${extension}`);
+    const directory = join(this.paseoHome, "uploads", id);
+    const path = join(directory, fileName);
+    const { mimeType } = input;
+    const size = input.bytes.byteLength;
+    await mkdir(directory, { recursive: true });
+    try {
+      await writeFile(path, input.bytes, { flag: "wx" });
+      await writeJsonFileAtomic(this.registrationPath(id), {
+        owner: input.owner,
+        file: { type: "uploaded_file", id, fileName, mimeType, size, path },
+      });
+      return { id, fileName, mimeType, size };
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private registrationPath(id: string): string {
+    return join(this.paseoHome, "upload-receipts", `${id}.json`);
   }
 
   async receiveFrame(
@@ -151,8 +208,15 @@ export class FileUploadStore {
         `Upload size mismatch: expected ${upload.size}, received ${upload.receivedBytes}.`,
       );
     }
+    const response = buildUploadResponse(upload, null);
+    if (upload.owner !== undefined && response.payload.file) {
+      await writeJsonFileAtomic(this.registrationPath(upload.id), {
+        owner: upload.owner,
+        file: response.payload.file,
+      });
+    }
     upload.completed = true;
-    return buildUploadResponse(upload, null);
+    return response;
   }
 
   private createStaleUploadTimeout(

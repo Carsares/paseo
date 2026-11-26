@@ -6,6 +6,7 @@ import type {
   AgentProviderNotice,
   AgentTaskItem,
   JsonValue,
+  MessageImageAttachment,
   ProviderOptions,
   ToolPolicy,
   UserMessageForkContext,
@@ -233,6 +234,8 @@ export type AgentPromptContentBlock =
 export type AgentPromptInput = string | AgentPromptContentBlock[];
 
 export interface AgentRunOptions {
+  /** Host-owned image references for recording the submitted user message. */
+  imageAttachments?: MessageImageAttachment[];
   /** Internal authorization derived from the verified peer queue entry. */
   turnAuthorization?: "peer-read-only";
   outputSchema?: unknown;
@@ -454,6 +457,7 @@ export type AgentTimelineItem =
       messageId?: string;
       clientMessageId?: string;
       forkContext?: UserMessageForkContext;
+      imageAttachments?: MessageImageAttachment[];
     }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
