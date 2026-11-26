@@ -938,19 +938,22 @@ export const AgentBackgroundWorkSummarySchema = z.object({
 
 export type AgentBackgroundWorkSummary = z.infer<typeof AgentBackgroundWorkSummarySchema>;
 
-export const PendingSubagentInboxSchema = z.object({
-  count: z.number(),
-  items: z.array(
-    z.object({
-      agentId: z.string(),
-      serverId: z.string().optional(),
-      title: z.string().optional(),
-      event: z.string(),
-      reportStatus: AgentReportStatusSchema.optional(),
-    }),
-  ),
+export const PendingSubagentInboxItemSchema = z.object({
+  agentId: z.string(),
+  serverId: z.string().optional(),
+  title: z.string().optional(),
+  event: z.string(),
+  reportStatus: AgentReportStatusSchema.optional(),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
 });
 
+export const PendingSubagentInboxSchema = z.object({
+  count: z.number(),
+  items: z.array(PendingSubagentInboxItemSchema),
+});
+
+export type PendingSubagentInboxItem = z.infer<typeof PendingSubagentInboxItemSchema>;
 export type PendingSubagentInbox = z.infer<typeof PendingSubagentInboxSchema>;
 
 const conversationLimitFields = {
@@ -2747,6 +2750,7 @@ export type AgentExplicitFinishReport = z.infer<typeof AgentExplicitFinishReport
 export const AgentInboxFlushRequestSchema = z.object({
   type: z.literal("agent.inbox.flush.request"),
   agentId: z.string(),
+  taskId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -3155,6 +3159,11 @@ export const WorkspaceTaskSummarySchema = z.object({
   verificationState: z.enum(["passed", "failed", "not_run", "blocked", "skipped"]).optional(),
   recentAgentStates: z.array(WorkspaceTaskAgentStateSchema).optional(),
   latestProgress: WorkspaceTaskAgentStateSchema.optional(),
+  rootMessageId: z.string().min(1).optional(),
+  leadAgentId: z.string().min(1).optional(),
+  leadServerId: z.string().min(1).optional(),
+  conclusionMessageId: z.string().min(1).optional(),
+  latestReplyPreview: z.string().optional(),
 });
 
 export const WorkspaceTasksListResponseSchema = z.object({
@@ -3166,6 +3175,341 @@ export const WorkspaceTasksListResponseSchema = z.object({
     error: z.string().nullable(),
   }),
 });
+
+export const TopicReplyRouteModeSchema = z.enum(["auto", "lead", "main"]);
+export type TopicReplyRouteMode = z.infer<typeof TopicReplyRouteModeSchema>;
+
+export const TopicThreadEntrySchema = z.object({
+  entryId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+  topicKey: z.string().min(1),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
+  role: z.enum(["user_followup", "agent_reply", "system_note"]),
+  authorAgentId: z.string().min(1).optional(),
+  authorTitle: z.string().min(1).optional(),
+  routedAgentId: z.string().min(1),
+  sourceMessageId: z.string().min(1).optional(),
+  text: z.string(),
+  status: z.enum(["queued", "running", "completed", "error"]),
+  seq: z.number().int().nonnegative(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+export type TopicThreadEntry = z.infer<typeof TopicThreadEntrySchema>;
+
+export const WorkspaceTopicReplyRequestSchema = z.object({
+  type: z.literal("workspace.topic.reply.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+  topicKey: z.string().min(1),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
+  clientMessageId: z.string().min(1),
+  text: z.string().min(1),
+  attachments: z.array(AgentAttachmentSchema).optional(),
+  routeMode: TopicReplyRouteModeSchema.optional(),
+});
+export type WorkspaceTopicReplyRequest = z.infer<typeof WorkspaceTopicReplyRequestSchema>;
+
+export const WorkspaceTopicReplyResponseSchema = z.object({
+  type: z.literal("workspace.topic.reply.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string().min(1),
+    topicKey: z.string().min(1),
+    routedTo: z.enum(["lead", "main"]),
+    targetAgentId: z.string().min(1).nullable(),
+    fallbackReason: z
+      .enum(["none", "explicit_main", "no_lead_bound", "lead_archived", "remote_lead"])
+      .optional(),
+    entry: TopicThreadEntrySchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTopicReplyResponse = z.infer<typeof WorkspaceTopicReplyResponseSchema>;
+
+export const WorkspaceTopicListEntriesRequestSchema = z.object({
+  type: z.literal("workspace.topic.list_entries.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+  topicKey: z.string().min(1).optional(),
+});
+export type WorkspaceTopicListEntriesRequest = z.infer<
+  typeof WorkspaceTopicListEntriesRequestSchema
+>;
+
+export const WorkspaceTopicListEntriesResponseSchema = z.object({
+  type: z.literal("workspace.topic.list_entries.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string().min(1),
+    entries: z.array(TopicThreadEntrySchema),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTopicListEntriesResponse = z.infer<
+  typeof WorkspaceTopicListEntriesResponseSchema
+>;
+
+// Broadcast only to sources advertising CLIENT_CAPS.workspaceTopicThreads.
+export const WorkspaceTopicThreadUpdatedMessageSchema = z.object({
+  type: z.literal("workspace.topic.thread.updated"),
+  payload: z.object({
+    workspaceId: z.string().min(1),
+    mainAgentId: z.string().min(1),
+    entry: TopicThreadEntrySchema,
+  }),
+});
+export type WorkspaceTopicThreadUpdatedMessage = z.infer<
+  typeof WorkspaceTopicThreadUpdatedMessageSchema
+>;
+
+export const TopicReadEntrySchema = z.object({
+  topicKey: z.string().min(1),
+  readUpToSeq: z.number().int(),
+  readUpToTimestampMs: z.number(),
+  markedUnreadAtMs: z.number().nullable(),
+  updatedAt: z.iso.datetime(),
+});
+export type TopicReadEntry = z.infer<typeof TopicReadEntrySchema>;
+
+export const WorkspaceTopicReadSnapshotSchema = z.object({
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+  watermarkEpoch: z.string().nullable(),
+  watermarkSeq: z.number().int(),
+  watermarkTimestampMs: z.number(),
+  topics: z.array(TopicReadEntrySchema),
+  revision: z.number().int().nonnegative(),
+});
+export type WorkspaceTopicReadSnapshot = z.infer<typeof WorkspaceTopicReadSnapshotSchema>;
+
+export const WorkspaceTopicReadGetStateRequestSchema = z.object({
+  type: z.literal("workspace.topic_read.get_state.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+});
+export type WorkspaceTopicReadGetStateRequest = z.infer<
+  typeof WorkspaceTopicReadGetStateRequestSchema
+>;
+export const WorkspaceTopicReadGetStateResponseSchema = z.object({
+  type: z.literal("workspace.topic_read.get_state.response"),
+  payload: z.object({
+    requestId: z.string(),
+    snapshot: WorkspaceTopicReadSnapshotSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTopicReadGetStateResponse = z.infer<
+  typeof WorkspaceTopicReadGetStateResponseSchema
+>;
+
+export const WorkspaceTopicReadMarkRequestSchema = z.object({
+  type: z.literal("workspace.topic_read.mark.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  mainAgentId: z.string().min(1),
+  topicKey: z.string().min(1),
+  mode: z.enum(["read", "unread"]),
+  seq: z.number().int().optional(),
+  timestampMs: z.number().optional(),
+});
+export type WorkspaceTopicReadMarkRequest = z.infer<typeof WorkspaceTopicReadMarkRequestSchema>;
+export const WorkspaceTopicReadMarkResponseSchema = z.object({
+  type: z.literal("workspace.topic_read.mark.response"),
+  payload: z.object({
+    requestId: z.string(),
+    snapshot: WorkspaceTopicReadSnapshotSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTopicReadMarkResponse = z.infer<typeof WorkspaceTopicReadMarkResponseSchema>;
+
+export const WorkspaceTopicReadMarkAllRequestSchema = z.object({
+  type: z.literal("workspace.topic_read.mark_all.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1).optional(), // 省略时清空本机所有活跃工作区的纯知晓未读
+  mainAgentId: z.string().min(1).optional(),
+  epoch: z.string().nullable().optional(),
+  maxSeq: z.number().int().optional(),
+  maxTimestampMs: z.number().optional(),
+});
+export type WorkspaceTopicReadMarkAllRequest = z.infer<
+  typeof WorkspaceTopicReadMarkAllRequestSchema
+>;
+export const WorkspaceTopicReadMarkAllResponseSchema = z.object({
+  type: z.literal("workspace.topic_read.mark_all.response"),
+  payload: z.object({
+    requestId: z.string(),
+    snapshots: z.array(WorkspaceTopicReadSnapshotSchema),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTopicReadMarkAllResponse = z.infer<
+  typeof WorkspaceTopicReadMarkAllResponseSchema
+>;
+
+// Broadcast only to sources advertising CLIENT_CAPS.workspaceTopicReadState.
+export const WorkspaceTopicReadUpdatedMessageSchema = z.object({
+  type: z.literal("workspace.topic_read.updated"),
+  payload: z.object({
+    snapshot: WorkspaceTopicReadSnapshotSchema,
+  }),
+});
+export type WorkspaceTopicReadUpdatedMessage = z.infer<
+  typeof WorkspaceTopicReadUpdatedMessageSchema
+>;
+
+export const WorkspaceTodoChecklistItemSchema = z.object({
+  itemId: z.string().min(1),
+  text: z.string().min(1),
+  completed: z.boolean(),
+});
+export type WorkspaceTodoChecklistItem = z.infer<typeof WorkspaceTodoChecklistItemSchema>;
+
+export const WorkspaceTodoSourceRefSchema = z.object({
+  mainAgentId: z.string().min(1),
+  topicKey: z.string().min(1),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
+  sourceMessageId: z.string().min(1).optional(),
+  authorAgentId: z.string().min(1).optional(),
+  topicTitlePreview: z.string().min(1),
+});
+export type WorkspaceTodoSourceRef = z.infer<typeof WorkspaceTodoSourceRefSchema>;
+
+export const WorkspaceTodoItemSchema = z.object({
+  todoId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  title: z.string().min(1),
+  note: z.string().optional(),
+  status: z.enum(["pending", "completed"]),
+  checklist: z.array(WorkspaceTodoChecklistItemSchema),
+  dueAt: z.iso.datetime().nullable(),
+  remindBeforeMinutes: z.number().int().nonnegative().nullable(),
+  snoozedUntil: z.iso.datetime().nullable(),
+  lastDueNotifiedAt: z.iso.datetime().nullable(),
+  source: WorkspaceTodoSourceRefSchema.nullable(),
+  assignedAgentId: z.string().min(1).nullable(),
+  revision: z.number().int().nonnegative(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+  completedAt: z.iso.datetime().nullable(),
+});
+export type WorkspaceTodoItem = z.infer<typeof WorkspaceTodoItemSchema>;
+
+export const WorkspaceTodoListRequestSchema = z.object({
+  type: z.literal("workspace.todo.list.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1).optional(),
+  statusFilter: z.enum(["pending", "completed"]).optional(),
+});
+export type WorkspaceTodoListRequest = z.infer<typeof WorkspaceTodoListRequestSchema>;
+export const WorkspaceTodoListResponseSchema = z.object({
+  type: z.literal("workspace.todo.list.response"),
+  payload: z.object({
+    requestId: z.string(),
+    items: z.array(WorkspaceTodoItemSchema),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTodoListResponse = z.infer<typeof WorkspaceTodoListResponseSchema>;
+
+export const WorkspaceTodoUpsertRequestSchema = z.object({
+  type: z.literal("workspace.todo.upsert.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  todoId: z.string().min(1).optional(),
+  expectedRevision: z.number().int().nonnegative().optional(),
+  title: z.string().min(1),
+  note: z.string().optional(),
+  checklist: z.array(WorkspaceTodoChecklistItemSchema).optional(),
+  dueAt: z.iso.datetime().nullable().optional(),
+  remindBeforeMinutes: z.number().int().nonnegative().nullable().optional(),
+  snoozedUntil: z.iso.datetime().nullable().optional(),
+  source: WorkspaceTodoSourceRefSchema.nullable().optional(),
+  assignedAgentId: z.string().min(1).nullable().optional(),
+});
+export type WorkspaceTodoUpsertRequest = z.infer<typeof WorkspaceTodoUpsertRequestSchema>;
+export const WorkspaceTodoUpsertResponseSchema = z.object({
+  type: z.literal("workspace.todo.upsert.response"),
+  payload: z.object({
+    requestId: z.string(),
+    item: WorkspaceTodoItemSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTodoUpsertResponse = z.infer<typeof WorkspaceTodoUpsertResponseSchema>;
+
+export const WorkspaceTodoSetStatusRequestSchema = z.object({
+  type: z.literal("workspace.todo.set_status.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  todoId: z.string().min(1),
+  expectedRevision: z.number().int().nonnegative(),
+  status: z.enum(["pending", "completed"]).optional(),
+  checklistItemId: z.string().min(1).optional(),
+  checklistCompleted: z.boolean().optional(),
+});
+export type WorkspaceTodoSetStatusRequest = z.infer<typeof WorkspaceTodoSetStatusRequestSchema>;
+export const WorkspaceTodoSetStatusResponseSchema = z.object({
+  type: z.literal("workspace.todo.set_status.response"),
+  payload: z.object({
+    requestId: z.string(),
+    item: WorkspaceTodoItemSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTodoSetStatusResponse = z.infer<typeof WorkspaceTodoSetStatusResponseSchema>;
+
+export const WorkspaceTodoDeleteRequestSchema = z.object({
+  type: z.literal("workspace.todo.delete.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  todoId: z.string().min(1),
+});
+export type WorkspaceTodoDeleteRequest = z.infer<typeof WorkspaceTodoDeleteRequestSchema>;
+export const WorkspaceTodoDeleteResponseSchema = z.object({
+  type: z.literal("workspace.todo.delete.response"),
+  payload: z.object({
+    requestId: z.string(),
+    todoId: z.string().min(1),
+    deleted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+export type WorkspaceTodoDeleteResponse = z.infer<typeof WorkspaceTodoDeleteResponseSchema>;
+
+// Broadcast only to sources advertising CLIENT_CAPS.workspaceTodos.
+export const WorkspaceTodoUpdatedMessageSchema = z.object({
+  type: z.literal("workspace.todo.updated"),
+  payload: z.object({
+    workspaceId: z.string().min(1),
+    item: WorkspaceTodoItemSchema.nullable(),
+    deletedTodoId: z.string().min(1).optional(),
+  }),
+});
+export type WorkspaceTodoUpdatedMessage = z.infer<typeof WorkspaceTodoUpdatedMessageSchema>;
+
+// Broadcast only to sources advertising CLIENT_CAPS.workspaceTodos.
+export const WorkspaceTodoDueTriggeredMessageSchema = z.object({
+  type: z.literal("workspace.todo.due_triggered"),
+  payload: z.object({
+    workspaceId: z.string().min(1),
+    workspaceTitle: z.string().optional(),
+    kind: z.enum(["remind_before", "due"]),
+    item: WorkspaceTodoItemSchema,
+    shouldNotify: z.boolean(),
+  }),
+});
+export type WorkspaceTodoDueTriggeredMessage = z.infer<
+  typeof WorkspaceTodoDueTriggeredMessageSchema
+>;
 
 const WorkspaceDeferralResultSchema = z.object({
   requestId: z.string(),
@@ -4713,6 +5057,15 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceDurableItemListRequestSchema,
   WorkspaceDurableItemDecideRequestSchema,
   WorkspaceTasksListRequestSchema,
+  WorkspaceTopicReplyRequestSchema,
+  WorkspaceTopicListEntriesRequestSchema,
+  WorkspaceTopicReadGetStateRequestSchema,
+  WorkspaceTopicReadMarkRequestSchema,
+  WorkspaceTopicReadMarkAllRequestSchema,
+  WorkspaceTodoListRequestSchema,
+  WorkspaceTodoUpsertRequestSchema,
+  WorkspaceTodoSetStatusRequestSchema,
+  WorkspaceTodoDeleteRequestSchema,
   WorkspaceDeferralSetRequestSchema,
   AgentLimitRecoveryRequestSchema,
   WorkspacePinSetRequestSchema,
@@ -5314,6 +5667,12 @@ export const ServerInfoStatusPayloadSchema = z
         topicPromptRetryV1: z.boolean().optional(),
         // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         workspaceDurableItemsV1: z.boolean().optional(),
+        // COMPAT(workspaceTopicThreads): added in v0.18.0, remove gate after 2027-06-01.
+        workspaceTopicThreads: z.boolean().optional(),
+        // COMPAT(workspaceTopicReadState): added in v0.18.0, remove gate after 2027-06-01.
+        workspaceTopicReadState: z.boolean().optional(),
+        // COMPAT(workspaceTodos): added in v0.18.0, remove gate after 2027-06-01.
+        workspaceTodos: z.boolean().optional(),
         // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         checkoutGitStagingV1: z.boolean().optional(),
         // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
@@ -9661,6 +10020,19 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceDurableItemListResponseSchema,
   WorkspaceDurableItemDecideResponseSchema,
   WorkspaceTasksListResponseSchema,
+  WorkspaceTopicReplyResponseSchema,
+  WorkspaceTopicListEntriesResponseSchema,
+  WorkspaceTopicThreadUpdatedMessageSchema,
+  WorkspaceTopicReadGetStateResponseSchema,
+  WorkspaceTopicReadMarkResponseSchema,
+  WorkspaceTopicReadMarkAllResponseSchema,
+  WorkspaceTopicReadUpdatedMessageSchema,
+  WorkspaceTodoListResponseSchema,
+  WorkspaceTodoUpsertResponseSchema,
+  WorkspaceTodoSetStatusResponseSchema,
+  WorkspaceTodoDeleteResponseSchema,
+  WorkspaceTodoUpdatedMessageSchema,
+  WorkspaceTodoDueTriggeredMessageSchema,
   WorkspaceDeferralSetResponseSchema,
   AgentLimitRecoveryResponseSchema,
   WorkspacePinSetResponseSchema,

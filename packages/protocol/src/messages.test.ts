@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { z } from "zod";
 import {
   getMainPriorModeIdFromLabels,
   isMainControlAgent,
@@ -19,6 +20,76 @@ import {
   WorkspaceProjectDescriptorPayloadSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+describe("workspace topic, read state and todo requests", () => {
+  const context = { workspaceId: "ws-1", mainAgentId: "main-1" };
+  const topic = { ...context, topicKey: "topic-1" };
+  const todo = { workspaceId: context.workspaceId, todoId: "todo-1" };
+  const requestId = "req-1";
+  const reply = {
+    type: "workspace.topic.reply.request",
+    ...topic,
+    requestId,
+    clientMessageId: "reply-1",
+    text: "Any update?",
+  };
+
+  test.each([
+    reply,
+    { type: "workspace.topic.list_entries.request", requestId, ...context },
+    { type: "workspace.topic_read.get_state.request", requestId, ...context },
+    { type: "workspace.topic_read.mark.request", requestId, ...topic, mode: "unread", seq: -1 },
+    { type: "workspace.topic_read.mark_all.request", requestId, epoch: null },
+    { type: "workspace.todo.list.request", requestId, statusFilter: "pending" },
+    { type: "workspace.todo.upsert.request", requestId, ...todo, title: "Review", dueAt: null },
+    {
+      type: "workspace.todo.set_status.request",
+      requestId,
+      ...todo,
+      expectedRevision: 0,
+      checklistItemId: "check-1",
+      checklistCompleted: false,
+    },
+    { type: "workspace.todo.delete.request", requestId, ...todo },
+  ])("accepts $type with top-level parameters", (request) => {
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  });
+
+  test("rejects nested request parameters and invalid route modes", () => {
+    const { type, ...payload } = reply;
+    expect(SessionInboundMessageSchema.safeParse({ type, payload }).success).toBe(false);
+    expect(SessionInboundMessageSchema.safeParse({ ...reply, routeMode: "remote" }).success).toBe(
+      false,
+    );
+  });
+
+  test("keeps the new wire schemas free of transforms, catch values and preprocessing", () => {
+    function assertStructuralSchema(node: unknown) {
+      if (node instanceof z.ZodType) {
+        expect(["transform", "catch", "pipe"]).not.toContain(node.def.type);
+        assertStructuralSchema(node.def);
+      } else if (node !== null && typeof node === "object") {
+        for (const child of Object.values(node)) {
+          assertStructuralSchema(child);
+        }
+      }
+    }
+
+    const schemas = [
+      ...SessionInboundMessageSchema.options,
+      ...SessionOutboundMessageSchema.options,
+    ];
+    for (const schema of schemas) {
+      if (
+        /^workspace\.(topic\.(reply|list_entries|thread)\.|topic_read\.|todo\.)/.test(
+          schema.shape.type.value,
+        )
+      ) {
+        assertStructuralSchema(schema);
+      }
+    }
+  });
+});
 
 function workspaceDescriptor(overrides: Record<string, unknown> = {}) {
   return {

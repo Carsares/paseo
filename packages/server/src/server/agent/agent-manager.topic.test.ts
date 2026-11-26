@@ -1318,6 +1318,19 @@ test("a team conclusion receipt only clears the matching main attention", async 
     attentionTimestamp: second,
   });
 
+  const liveMain = manager.getAgent(main.id);
+  if (!liveMain) throw new Error("Expected live main agent");
+  liveMain.pendingPermissions.set("pending-approval", {} as never);
+  await manager.clearTeamConclusionAttention(main.id, {
+    workspaceId: WORKSPACE_ID,
+    attentionTimestamp: second,
+  });
+  expect(await storage.get(main.id)).toMatchObject({
+    requiresAttention: true,
+    attentionTimestamp: second,
+  });
+  liveMain.pendingPermissions.clear();
+
   const childAttention = (await storage.get(child.id))?.attentionTimestamp;
   if (!childAttention) throw new Error("Expected separate child attention");
   await manager.clearTeamConclusionAttention(child.id, {

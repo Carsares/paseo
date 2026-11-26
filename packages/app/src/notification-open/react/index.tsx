@@ -5,6 +5,7 @@ import {
   navigateToWorkspace,
   useIsLastWorkspaceSelectionHydrated,
 } from "@/stores/navigation-active-workspace-store";
+import { buildTopicAgentKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { createNotificationOpenRouter } from "../model";
 import { createNotificationOpenSource } from "../source";
@@ -20,6 +21,19 @@ const notificationRouter = createNotificationOpenRouter({
       workspaceId,
       target: { kind: "terminal", terminalId },
     }),
+  openTodoDue: ({ serverId, workspaceId, agentId, topicKey }) => {
+    if (agentId && topicKey) {
+      const store = useTopicStreamViewStore.getState();
+      const agentKey = buildTopicAgentKey(serverId, agentId);
+      store.setViewMode(agentKey, "topics");
+      store.requestScrollToTopic(agentKey, topicKey, true);
+    }
+    if (agentId) {
+      navigateToAgent({ serverId, agentId, workspaceId, pin: true });
+    } else {
+      navigateToWorkspace({ serverId, workspaceId });
+    }
+  },
   openRoute: (route) => router.navigate(route as Href),
   whenReadyToNavigate: () =>
     ready

@@ -4,9 +4,23 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { getParentAddressFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { TFunction } from "i18next";
-import { SquarePen } from "lucide-react-native";
+import { SquarePen, X } from "lucide-react-native";
 import { AgentLimitRecovery } from "./agent-limit-recovery";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
+import {
+  TopicStreamList,
+  TopicStreamTopBar,
+  useTopicStreamMarkAllRead,
+} from "@/agent-stream/topic-card/topic-stream-list";
+import {
+  buildTopicAgentKey,
+  useTopicStreamViewStore,
+  type TopicStreamViewMode,
+} from "@/stores/topic-stream-view-store";
+import { TodoEditorSheet } from "@/todos/todo-editor-sheet";
+import { submitActiveTopicReply } from "@/agent-stream/topic-card/submit-topic-reply";
+import { PressHighlight } from "@/components/ui/press-highlight";
+import type { MessagePayload } from "@/composer/types";
 import React, {
   memo,
   type ReactNode,
@@ -739,6 +753,104 @@ function AgentPanelBody({
   );
 }
 
+function useSuppressTopicFocusClear(
+  serverId: string,
+  workspaceId: string,
+  agentId: string | undefined,
+): boolean {
+  const isTopicMainControl = useSessionStore((state) => {
+    const agent = resolveChatAgentFromSession(state, serverId, agentId);
+    return Boolean(agent && isWorkspaceRootAgent(agent, workspaceId) && isMainControlAgent(agent));
+  });
+  const supportsTopicReadState = useHostFeature(serverId, "workspaceTopicReadState");
+  const topicAgentKey = agentId ? buildTopicAgentKey(serverId, agentId) : null;
+  const topicViewMode = useTopicStreamViewStore((state) =>
+    topicAgentKey ? (state.viewModeByAgentKey[topicAgentKey] ?? "topics") : "topics",
+  );
+  return isTopicMainControl && supportsTopicReadState && topicViewMode === "topics";
+}
+
+function useMainControlTopicStreamControls(input: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  isMainControlStream: boolean;
+}) {
+  const { serverId, workspaceId, agentId, isMainControlStream } = input;
+  const mainControlAgentKey = buildTopicAgentKey(serverId, agentId);
+  const viewMode = useTopicStreamViewStore(
+    (state) => state.viewModeByAgentKey[mainControlAgentKey] ?? "topics",
+  );
+  const unreadOnly = useTopicStreamViewStore(
+    (state) => state.unreadOnlyByAgentKey[mainControlAgentKey] ?? false,
+  );
+  const setViewMode = useTopicStreamViewStore((state) => state.setViewMode);
+  const toggleUnreadOnly = useTopicStreamViewStore((state) => state.toggleUnreadOnly);
+  const openTodoEditor = useTopicStreamViewStore((state) => state.openTodoEditor);
+  const handleChangeViewMode = useCallback(
+    (mode: TopicStreamViewMode) => setViewMode(mainControlAgentKey, mode),
+    [mainControlAgentKey, setViewMode],
+  );
+  const handleToggleUnreadOnly = useCallback(
+    () => toggleUnreadOnly(mainControlAgentKey),
+    [mainControlAgentKey, toggleUnreadOnly],
+  );
+  const handleOpenAddTodo = useCallback(() => {
+    openTodoEditor({ serverId, workspaceId });
+  }, [openTodoEditor, serverId, workspaceId]);
+  const mainStreamTail = useAgentStreamTail(serverId, isMainControlStream ? agentId : undefined);
+  const mainStreamHead = useSessionStore((state) =>
+    isMainControlStream ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,
+  );
+  const { totalUnreadTopics, markAllRead } = useTopicStreamMarkAllRead({
+    serverId,
+    workspaceId,
+    mainAgentId: isMainControlStream ? agentId : null,
+    streamItems: mainStreamTail ?? EMPTY_STREAM_ITEMS,
+    streamHead: mainStreamHead ?? EMPTY_STREAM_ITEMS,
+  });
+  return {
+    viewMode,
+    unreadOnly,
+    useTopicCards: isMainControlStream && viewMode === "topics",
+    totalUnreadTopics,
+    handleChangeViewMode,
+    handleToggleUnreadOnly,
+    handleOpenAddTodo,
+    handleMarkAllTopicsRead: markAllRead,
+  };
+}
+
+function MainControlStreamHeaderBar({
+  enabled,
+  serverId,
+  workspaceId,
+  mainAgentId,
+  controls,
+}: {
+  enabled: boolean;
+  serverId: string;
+  workspaceId: string;
+  mainAgentId: string;
+  controls: ReturnType<typeof useMainControlTopicStreamControls>;
+}) {
+  if (!enabled) return null;
+  return (
+    <TopicStreamTopBar
+      serverId={serverId}
+      workspaceId={workspaceId}
+      mainAgentId={mainAgentId}
+      viewMode={controls.viewMode}
+      unreadOnly={controls.unreadOnly}
+      totalUnreadTopics={controls.totalUnreadTopics}
+      onChangeViewMode={controls.handleChangeViewMode}
+      onToggleUnreadOnly={controls.handleToggleUnreadOnly}
+      onMarkAllRead={controls.handleMarkAllTopicsRead}
+      onOpenAddTodo={controls.handleOpenAddTodo}
+    />
+  );
+}
+
 function ChatAgentContent({
   serverId,
   workspaceId,
@@ -847,6 +959,7 @@ function ChatAgentContent({
     },
     [toastApi],
   );
+  const suppressTopicFocusClear = useSuppressTopicFocusClear(serverId, workspaceId, agentId);
   const attentionController = useAgentAttentionClear({
     agentId,
     client,
@@ -856,6 +969,7 @@ function ChatAgentContent({
     attentionReason: agentState.attentionReason,
     isScreenFocused: isPaneFocused,
     focusRequest,
+    suppressFocusClear: suppressTopicFocusClear,
     onError: reportAttentionError,
   });
   const isArchivingCurrentAgent = Boolean(agentId && isArchivingAgent({ serverId, agentId }));
@@ -1113,6 +1227,23 @@ function ChatAgentContent({
   );
 }
 
+function resolveChatReadyFlags(input: {
+  mainAgentId: string | null;
+  draft: DraftConversation | null;
+  routeBottomAnchorReason: NonNullable<RouteBottomAnchorRequest>["reason"] | undefined;
+  hasCachedHistory: boolean;
+  showHistorySyncError: boolean;
+}) {
+  return {
+    isMainControlStream: input.mainAgentId !== null && !input.draft,
+    isInitialHistoryLoading:
+      input.routeBottomAnchorReason === "initial-entry" &&
+      !input.hasCachedHistory &&
+      !input.showHistorySyncError,
+    revealInitialHistory: input.hasCachedHistory || input.showHistorySyncError,
+  };
+}
+
 const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   serverId,
   workspaceId,
@@ -1270,8 +1401,25 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     ],
   );
   const parentCallout = parentAgentId ? (
-    <ParentAgentCallout serverId={serverId} parentAgentId={parentAgentId} />
+    <ParentAgentCallout serverId={serverId} parentAgentId={parentAgentId} childAgentId={agentId} />
   ) : null;
+  const { isMainControlStream, isInitialHistoryLoading, revealInitialHistory } =
+    resolveChatReadyFlags({
+      mainAgentId,
+      draft,
+      routeBottomAnchorReason: routeBottomAnchorRequest?.reason,
+      hasCachedHistory,
+      showHistorySyncError,
+    });
+  const topicControls = useMainControlTopicStreamControls({
+    serverId,
+    workspaceId,
+    agentId,
+    isMainControlStream,
+  });
+  const handleFocusCompactComposer = useCallback(() => {
+    composerEditingSession.focus();
+  }, [composerEditingSession]);
   const agentComposerSection = showsComposer ? (
     <RenderProfile id={`AgentComposerSection:${agentId}`}>
       <AgentLimitRecovery serverId={serverId} workspaceId={workspaceId} agentId={agentId} />
@@ -1285,10 +1433,12 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         isSubmitLoading={false}
         agentInputDraft={agentInputDraft}
         editingSession={composerEditingSession}
+        hidePendingInboxBar={topicControls.useTopicCards}
         onAttentionInputFocus={onAttentionInputFocus}
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={handleComposerHeightChange}
         onMessageSent={handleMessageSent}
+        onErrorToast={toastApi.error}
       />
     </RenderProfile>
   ) : (
@@ -1370,9 +1520,19 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const streamContent = (
     <View style={animatedStaticStyles.content}>
       {showsComposer ? null : <SheetAgentFacts serverId={serverId} agentId={agentId} />}
+      <MainControlStreamHeaderBar
+        enabled={isMainControlStream}
+        serverId={serverId}
+        workspaceId={workspaceId}
+        mainAgentId={agentId}
+        controls={topicControls}
+      />
       <RenderProfile id={`AgentStreamSection:${agentId}`}>
         <AgentStreamSection
           isSubagent={isSubagent}
+          useTopicCards={topicControls.useTopicCards}
+          isPaneFocused={isPaneFocused}
+          workspaceId={workspaceId}
           streamViewRef={streamViewRef}
           serverId={serverId}
           agentId={agentId}
@@ -1380,17 +1540,14 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           draft={draft}
           routeBottomAnchorRequest={routeBottomAnchorRequest}
           hasAppliedAuthoritativeHistory={hasAppliedAuthoritativeHistory}
-          isInitialHistoryLoading={
-            routeBottomAnchorRequest?.reason === "initial-entry" &&
-            !hasCachedHistory &&
-            !showHistorySyncError
-          }
-          revealInitialHistory={hasCachedHistory || showHistorySyncError}
+          isInitialHistoryLoading={isInitialHistoryLoading}
+          revealInitialHistory={revealInitialHistory}
           hasActiveComposer={hasActiveComposer}
           toast={toastApi}
           quoteTarget={quoteTarget}
           canSubmitSelection={canSubmitSelection}
           onOpenWorkspaceFile={onOpenWorkspaceFile}
+          onFocusCompactComposer={handleFocusCompactComposer}
         />
       </RenderProfile>
       <AgentDurableItems
@@ -1482,6 +1639,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         />
       ) : null}
       {chat}
+      <TodoEditorSheet serverId={serverId} workspaceId={workspaceId} />
     </ChatAgentReadyFrame>
   );
   return wrapAgentCommandProvider({
@@ -1643,6 +1801,9 @@ function SheetAgentFacts({ serverId, agentId }: { serverId: string; agentId: str
 
 const AgentStreamSection = memo(function AgentStreamSection({
   isSubagent,
+  useTopicCards = false,
+  isPaneFocused = true,
+  workspaceId = "",
   streamViewRef,
   serverId,
   agentId,
@@ -1657,8 +1818,12 @@ const AgentStreamSection = memo(function AgentStreamSection({
   quoteTarget,
   canSubmitSelection,
   onOpenWorkspaceFile,
+  onFocusCompactComposer,
 }: {
   isSubagent: boolean;
+  useTopicCards?: boolean;
+  isPaneFocused?: boolean;
+  workspaceId?: string;
   streamViewRef: React.RefObject<AgentStreamViewHandle | null>;
   serverId: string;
   agentId?: string;
@@ -1673,6 +1838,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   quoteTarget: ComposerQuoteTarget | null;
   canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
+  onFocusCompactComposer?: () => void;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
   // The track bar's space is reserved whenever the bar is mounted, pills or not: pills come and go
@@ -1684,6 +1850,9 @@ const AgentStreamSection = memo(function AgentStreamSection({
     ? resolveComposerTrackControlClearance(isCompactFormFactor)
     : 0;
   const streamItemsRaw = useAgentStreamTail(serverId, agentId);
+  const streamHeadRaw = useSessionStore((state) =>
+    useTopicCards && agentId ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,
+  );
   const pendingMessageSubmissions = useSessionStore(
     useShallow((state) =>
       agentId
@@ -1749,6 +1918,25 @@ const AgentStreamSection = memo(function AgentStreamSection({
   }
   if (!agent) {
     return null;
+  }
+  if (useTopicCards && workspaceId) {
+    return (
+      <ComposerQuoteProvider target={quoteTarget}>
+        <TopicStreamList
+          serverId={serverId}
+          workspaceId={workspaceId}
+          mainAgentId={agent.id}
+          streamItems={streamItems}
+          streamHead={streamHeadRaw ?? EMPTY_STREAM_ITEMS}
+          pendingPermissions={pendingPermissionList}
+          isTurnActive={turnPresentation.isActive}
+          isPaneFocused={isPaneFocused}
+          bottomClearance={bottomOverlayTailClearance}
+          onFocusCompactComposer={onFocusCompactComposer}
+          onErrorToast={toast.error}
+        />
+      </ComposerQuoteProvider>
+    );
   }
   return (
     <ComposerQuoteProvider target={quoteTarget}>
@@ -1824,10 +2012,12 @@ const AgentComposerSection = memo(function AgentComposerSection({
   isSubmitLoading,
   agentInputDraft,
   editingSession,
+  hidePendingInboxBar = false,
   onAttentionInputFocus,
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  onErrorToast,
 }: {
   agentId?: string;
   serverId: string;
@@ -1838,10 +2028,12 @@ const AgentComposerSection = memo(function AgentComposerSection({
   isSubmitLoading: boolean;
   agentInputDraft: AgentInputDraft;
   editingSession: ComposerEditingSession;
+  hidePendingInboxBar?: boolean;
   onAttentionInputFocus: () => void;
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  onErrorToast?: (message: string) => void;
 }) {
   if (!agentId) {
     return null;
@@ -1862,13 +2054,19 @@ const AgentComposerSection = memo(function AgentComposerSection({
       isSubmitLoading={isSubmitLoading}
       agentInputDraft={agentInputDraft}
       editingSession={editingSession}
+      hidePendingInboxBar={hidePendingInboxBar}
       onAttentionInputFocus={onAttentionInputFocus}
       onAttentionPromptSend={onAttentionPromptSend}
       onComposerHeightChange={onComposerHeightChange}
       onMessageSent={onMessageSent}
+      onErrorToast={onErrorToast}
     />
   );
 });
+
+const ThemedCloseIcon = withUnistyles(X, (theme: Theme) => ({
+  color: theme.colors.foregroundMuted,
+}));
 
 function ActiveAgentComposer({
   agentId,
@@ -1878,10 +2076,12 @@ function ActiveAgentComposer({
   isSubmitLoading,
   agentInputDraft,
   editingSession,
+  hidePendingInboxBar = false,
   onAttentionInputFocus,
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  onErrorToast,
 }: {
   agentId: string;
   serverId: string;
@@ -1890,10 +2090,12 @@ function ActiveAgentComposer({
   isSubmitLoading: boolean;
   agentInputDraft: AgentInputDraft;
   editingSession: ComposerEditingSession;
+  hidePendingInboxBar?: boolean;
   onAttentionInputFocus: () => void;
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  onErrorToast?: (message: string) => void;
 }) {
   const isComposerFullscreen = useComposerFullscreen(editingSession);
   const isCompactFormFactor = useIsCompactFormFactor();
@@ -2008,14 +2210,119 @@ function ActiveAgentComposer({
     ],
   );
 
+  const queryClient = useQueryClient();
+  const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
+  const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
+  const topicAgentKey = buildTopicAgentKey(serverId, agentId);
+  const activeReplyTopic = useTopicStreamViewStore(
+    (state) => state.activeReplyTopicByAgentKey[topicAgentKey] ?? null,
+  );
+  const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
+  const setActiveReplyRouteMode = useTopicStreamViewStore((state) => state.setActiveReplyRouteMode);
+  const setActiveReplySubmissionIntent = useTopicStreamViewStore(
+    (state) => state.setActiveReplySubmissionIntent,
+  );
+  const handleCancelReplyTopic = useCallback(() => {
+    setActiveReplyTopic(topicAgentKey, null);
+  }, [setActiveReplyTopic, topicAgentKey]);
+  const handleToggleReplyRouteMode = useCallback(() => {
+    if (!activeReplyTopic) return;
+    setActiveReplyRouteMode(topicAgentKey, activeReplyTopic.routeMode === "main" ? "auto" : "main");
+  }, [activeReplyTopic, setActiveReplyRouteMode, topicAgentKey]);
+  const handlePersistSubmissionIntent = useCallback(
+    (signature: string, clientMessageId: string) => {
+      setActiveReplySubmissionIntent(topicAgentKey, signature, clientMessageId);
+    },
+    [setActiveReplySubmissionIntent, topicAgentKey],
+  );
+  const handleSubmitTopicReply = useCallback(
+    async (payload: MessagePayload) => {
+      if (!activeReplyTopic) return;
+      try {
+        const sent = await submitActiveTopicReply({
+          queryClient,
+          serverId,
+          workspaceId,
+          agentId,
+          activeReplyTopic,
+          payload,
+          supportsTopicThreads,
+          supportsForgeAttachments,
+          disconnectedMessage: t("workspace.terminal.hostDisconnected"),
+          onPersistSubmissionIntent: handlePersistSubmissionIntent,
+        });
+        if (sent) {
+          setActiveReplyTopic(topicAgentKey, null);
+          onMessageSent();
+        }
+      } catch (err) {
+        onErrorToast?.(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [
+      activeReplyTopic,
+      agentId,
+      handlePersistSubmissionIntent,
+      onErrorToast,
+      onMessageSent,
+      queryClient,
+      serverId,
+      setActiveReplyTopic,
+      supportsForgeAttachments,
+      supportsTopicThreads,
+      t,
+      topicAgentKey,
+      workspaceId,
+    ],
+  );
+
   return (
     <View style={animatedStaticStyles.inputAreaWrapper} onLayout={onInputAreaLayout}>
       <PendingSubagentInboxBar
         key={JSON.stringify([serverId, agentId])}
         serverId={serverId}
         agentId={agentId}
-        hidden={isComposerFullscreen}
+        hidden={isComposerFullscreen || hidePendingInboxBar}
       />
+      {activeReplyTopic && !isComposerFullscreen ? (
+        <View style={styles.topicReplyContextRail} testID="compact-topic-reply-context">
+          <View style={styles.topicReplyContextBar}>
+            <Text style={styles.topicReplyContextText} numberOfLines={1}>
+              {t("topicWorkbench.topicStream.replyingContextBanner", {
+                preview: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
+              })}
+            </Text>
+            {activeReplyTopic.leadAgentId ? (
+              <PressHighlight
+                accessibilityRole="button"
+                onPress={handleToggleReplyRouteMode}
+                style={styles.topicReplyRoutePill}
+                testID="compact-topic-reply-route-toggle"
+              >
+                <Text style={styles.topicReplyRouteText}>
+                  {activeReplyTopic.routeMode === "main"
+                    ? t("topicWorkbench.topicStream.replyToMain")
+                    : t("topicWorkbench.topicStream.replyToLead", {
+                        name:
+                          activeReplyTopic.leadTitle ||
+                          t("topicWorkbench.topicStream.leadFallbackName"),
+                      })}
+                </Text>
+              </PressHighlight>
+            ) : null}
+            <PressHighlight
+              accessibilityRole="button"
+              accessibilityLabel={t("topicWorkbench.topicStream.cancelReplyContext")}
+              onPress={handleCancelReplyTopic}
+              style={styles.topicReplyCloseButton}
+              testID="compact-topic-reply-cancel"
+            >
+              <ThemedCloseIcon size={14} />
+            </PressHighlight>
+          </View>
+        </View>
+      ) : null}
       <Composer
         agentId={agentId}
         serverId={serverId}
@@ -2039,6 +2346,7 @@ function ActiveAgentComposer({
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={onComposerHeightChange}
         onMessageSent={onMessageSent}
+        onSubmitMessage={activeReplyTopic ? handleSubmitTopicReply : undefined}
         onClientSlashCommand={handleClientSlashCommand}
         allowSideChat={allowSideChat}
         isCompactLayout={isCompactComposerLayout}
@@ -2250,5 +2558,46 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.sm,
     color: theme.colors.foregroundMuted,
     textAlign: "center",
+  },
+  topicReplyContextRail: {
+    width: "100%",
+    alignItems: "center",
+    paddingHorizontal: theme.spacing[4],
+    paddingBottom: theme.spacing[1.5],
+  },
+  topicReplyContextBar: {
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    paddingHorizontal: theme.spacing[3],
+    paddingVertical: theme.spacing[1.5],
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.statusSuccess,
+    backgroundColor: theme.colors.surface1,
+  },
+  topicReplyContextText: {
+    flex: 1,
+    minWidth: 0,
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  topicReplyRoutePill: {
+    paddingHorizontal: theme.spacing[2],
+    paddingVertical: theme.spacing[0.5],
+    borderRadius: theme.borderRadius.full,
+    backgroundColor: theme.colors.surface2,
+  },
+  topicReplyRouteText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  topicReplyCloseButton: {
+    padding: theme.spacing[1],
+    borderRadius: theme.borderRadius.sm,
   },
 }));

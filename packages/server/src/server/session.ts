@@ -9,6 +9,8 @@ import type {
 } from "./agent/agent-messages/index.js";
 import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
 import { hasMandatoryPeerDispatchMarker } from "./agent/agent-messages/envelope.js";
+import { coversFinishedAttention } from "./topic-read-state/attention.js";
+import type { TopicThreadStore } from "./topic-threads/store.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
 import type { ConnectedHosts } from "./connected-hosts/index.js";
@@ -256,6 +258,15 @@ import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { listWorkspaceTaskSummaries } from "./task-ledger-rpc.js";
 import { handleDurableItemRequest } from "./durable-items/requests.js";
 import type { DurableItemStore } from "./durable-items/store.js";
+import { handleTopicReadRequest, type TopicReadRequest } from "./topic-read-state/requests.js";
+import type { TopicReadScope, TopicReadStateStore } from "./topic-read-state/store.js";
+import { handleTodoRequest, type TodoRequest } from "./todos/requests.js";
+import type { WorkspaceTodoStore } from "./todos/store.js";
+import type { TopicReplyRouter } from "./topic-threads/reply-router.js";
+import type {
+  WorkspaceTopicReadUpdatedMessage,
+  WorkspaceTodoUpdatedMessage,
+} from "@getpaseo/protocol/messages";
 import { listProjectSuggestions, ProjectSuggestionsRequestError } from "./project-suggestions.js";
 import {
   checkoutLiteFromGitSnapshot,
@@ -866,6 +877,8 @@ export interface SessionOptions {
   prepareLifecycleIntent?: (intent: SessionLifecycleIntent) => Promise<void>;
   publishWorkspaceArchiveUpdates?: (workspaceIds: Iterable<string>) => Promise<void>;
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
+  publishTopicReadUpdate?: (message: WorkspaceTopicReadUpdatedMessage) => void;
+  publishTodoUpdate?: (message: WorkspaceTodoUpdatedMessage) => void;
   publishScriptStatusUpdate?: (message: ScriptStatusUpdateMessage) => void;
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
@@ -881,6 +894,10 @@ export interface SessionOptions {
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   durableItems?: DurableItemStore;
+  topicReadState?: TopicReadStateStore;
+  todos?: WorkspaceTodoStore;
+  topicReplyRouter?: TopicReplyRouter;
+  topicThreadStore?: TopicThreadStore;
   workspaceBaseBranch?: WorkspaceBaseBranchService;
   directorySync?: DirectorySyncService;
   workspaceLabelService?: WorkspaceLabelService;
@@ -1243,6 +1260,12 @@ export class Session {
   private workspaceBaseBranch: WorkspaceBaseBranchService | undefined;
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushNotifications: PushNotifications;
+  private readonly topicReadState: TopicReadStateStore | undefined;
+  private readonly todos: WorkspaceTodoStore | undefined;
+  private readonly topicReplyRouter: TopicReplyRouter | undefined;
+  private readonly topicThreadStore: TopicThreadStore | undefined;
+  private readonly publishTopicReadUpdate: SessionOptions["publishTopicReadUpdate"];
+  private readonly publishTodoUpdate: SessionOptions["publishTodoUpdate"];
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
@@ -1390,6 +1413,12 @@ export class Session {
     this.hostSourceId = hostSource(options);
     this.durableItemPrincipalId = this.hostSourceId;
     this.durableItems = options.durableItems;
+    this.topicReadState = options.topicReadState;
+    this.todos = options.todos;
+    this.topicReplyRouter = options.topicReplyRouter;
+    this.topicThreadStore = options.topicThreadStore;
+    this.publishTopicReadUpdate = options.publishTopicReadUpdate;
+    this.publishTodoUpdate = options.publishTodoUpdate;
     this.connectedHostSession = createHostSession(options, this);
     this.connectedHosts = options.connectedHosts;
     this.onMessage = onMessage;
@@ -2300,6 +2329,34 @@ export class Session {
 
   public emitServerMessage(message: SessionOutboundMessage): void {
     this.emit(message);
+  }
+
+  public emitCapabilityMessage(
+    capability: ClientCapability,
+    message: SessionOutboundMessage,
+  ): void {
+    if (!this.authorization.allowsOutbound(message)) return;
+    if (this.clientSources.size === 0 || !this.onMessageToSource) {
+      if (this.supports(capability)) this.emit(message);
+      return;
+    }
+    for (const [source, { capabilities }] of this.clientSources) {
+      if (capabilities.has(capability)) this.onMessageToSource(source, message);
+    }
+  }
+
+  public emitCapabilityMessageToSource(
+    capability: ClientCapability,
+    source: object,
+    message: SessionOutboundMessage,
+  ): void {
+    if (!this.authorization.allowsOutbound(message)) return;
+    if (!this.supportsForSource(capability, source)) return;
+    if (this.clientSources.size === 0 || !this.onMessageToSource) {
+      this.emit(message);
+      return;
+    }
+    this.onMessageToSource(source, message);
   }
 
   /**
@@ -3321,12 +3378,153 @@ export class Session {
       return this.handleWorkspaceDeferralRequest(msg);
     }
     return (
+      this.dispatchWorkspaceTopicMessage(msg, source) ??
+      this.dispatchWorkspaceTopicReadMessage(msg, source) ??
+      this.dispatchWorkspaceTodoMessage(msg, source) ??
       this.dispatchWorkspaceStateMessage(msg) ??
       this.dispatchWorkspaceLabelMessage(msg) ??
       this.dispatchWorkspaceSetupMessage(msg) ??
       this.dispatchMetadataMessage(msg) ??
       this.dispatchWorkspaceAndProjectMessage(msg)
     );
+  }
+
+  private dispatchWorkspaceTopicMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    if (
+      msg.type !== "workspace.topic.reply.request" &&
+      msg.type !== "workspace.topic.list_entries.request"
+    )
+      return undefined;
+    if (!this.topicReplyRouter) throw new Error("Workspace topics are unavailable.");
+    const response =
+      msg.type === "workspace.topic.reply.request"
+        ? this.topicReplyRouter.reply(msg)
+        : this.topicReplyRouter.list(msg);
+    return response.then((value) => this.emitForSource(value, source));
+  }
+
+  private dispatchWorkspaceTopicReadMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    if (
+      msg.type !== "workspace.topic_read.get_state.request" &&
+      msg.type !== "workspace.topic_read.mark.request" &&
+      msg.type !== "workspace.topic_read.mark_all.request"
+    )
+      return undefined;
+    if (!this.topicReadState) throw new Error("Workspace topic read state is unavailable.");
+    return handleTopicReadRequest(msg as TopicReadRequest, {
+      store: this.topicReadState,
+      resolveScopes: (selector) => this.resolveTopicReadScopes(selector),
+      emitUpdated: (message) => this.publishTopicReadUpdate?.(message),
+      reconcileFinishedAttention: (snapshot) => this.reconcileFinishedAttention(snapshot),
+      onError: (error) => this.sessionLogger.warn({ err: error }, "Topic read update failed"),
+    }).then((response) => this.emitForSource(response, source));
+  }
+
+  private dispatchWorkspaceTodoMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    if (
+      msg.type !== "workspace.todo.list.request" &&
+      msg.type !== "workspace.todo.upsert.request" &&
+      msg.type !== "workspace.todo.set_status.request" &&
+      msg.type !== "workspace.todo.delete.request"
+    )
+      return undefined;
+    if (!this.todos) throw new Error("Workspace todos are unavailable.");
+    return handleTodoRequest(msg as TodoRequest, {
+      store: this.todos,
+      resolveWorkspaceIds: (workspaceId) => this.resolveTodoWorkspaceIds(workspaceId),
+      emitUpdated: (message) => this.publishTodoUpdate?.(message),
+      onError: (error) => this.sessionLogger.warn({ err: error }, "Todo update failed"),
+    }).then((response) => this.emitForSource(response, source));
+  }
+
+  private async resolveTopicReadScopes(
+    selector: Partial<Pick<TopicReadScope, "workspaceId" | "mainAgentId">>,
+  ): Promise<readonly TopicReadScope[]> {
+    const workspaces = await this.workspaceRegistry.listActive();
+    const scopes: TopicReadScope[] = [];
+    for (const workspace of workspaces) {
+      if (selector.workspaceId !== undefined && workspace.workspaceId !== selector.workspaceId)
+        continue;
+      if (!workspace.topic) continue;
+      const mainAgentId = (await this.describeWorkspaceMain(workspace)).topic?.mainAgentId;
+      if (!mainAgentId) continue;
+      if (selector.mainAgentId !== undefined && mainAgentId !== selector.mainAgentId) continue;
+      const head = this.agentManager.getLoadedTimelineHead(mainAgentId);
+      scopes.push({
+        workspaceId: workspace.workspaceId,
+        mainAgentId,
+        epoch: head?.epoch ?? null,
+        ...(head ? { headSeq: head.seq } : {}),
+      });
+    }
+    return scopes;
+  }
+
+  private async resolveTodoWorkspaceIds(
+    workspaceId: string | undefined,
+  ): Promise<readonly string[]> {
+    const workspaces = await this.workspaceRegistry.listActive();
+    const ids = workspaces.map((workspace) => workspace.workspaceId);
+    return workspaceId === undefined ? ids : ids.filter((id) => id === workspaceId);
+  }
+
+  private async reconcileFinishedAttention(
+    snapshot: WorkspaceTopicReadUpdatedMessage["payload"]["snapshot"],
+  ): Promise<void> {
+    const { mainAgentId, workspaceId } = snapshot;
+    const live = this.agentManager.getAgent(mainAgentId);
+    const stored = live ? null : await this.agentStorage.get(mainAgentId);
+    const agent = live ?? stored;
+    const attention = live?.attention ?? stored;
+    if (
+      !agent ||
+      !attention ||
+      ("archivedAt" in agent && agent.archivedAt) ||
+      !attention.requiresAttention ||
+      attention.attentionReason !== "finished"
+    )
+      return;
+    const currentAttentionTimestamp = live?.attention.requiresAttention
+      ? live.attention.attentionTimestamp.toISOString()
+      : stored?.attentionTimestamp;
+    const attentionAt = currentAttentionTimestamp ? Date.parse(currentAttentionTimestamp) : NaN;
+    if (!currentAttentionTimestamp || !Number.isFinite(attentionAt)) return;
+    if (!this.topicReadState) return;
+    await this.topicReadState.withState(snapshot, async (current) => {
+      await this.agentManager.clearTeamConclusionAttention(
+        mainAgentId,
+        { workspaceId, attentionTimestamp: currentAttentionTimestamp, reason: "finished" },
+        async () => {
+          const [tasks, thread] = await Promise.all([
+            this.taskLedger.list(workspaceId),
+            this.topicThreadStore?.list({ workspaceId, mainAgentId }) ?? [],
+          ]);
+          const timeline = live
+            ? this.agentManager.fetchTimeline(mainAgentId, { limit: 0 })
+            : stored && (await this.agentManager.readStoredTimeline(stored, { limit: 0 }));
+          if (!timeline) return false;
+          const completion = live?.lastTurnCompletion?.event;
+          return coversFinishedAttention({
+            snapshot: current,
+            epoch: timeline.epoch,
+            rows: timeline.rows,
+            tasks,
+            thread,
+            attentionAt,
+            completedTurnId: completion?.type === "turn_completed" ? completion.turnId : undefined,
+          });
+        },
+      );
+    });
   }
 
   private dispatchMetadataMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -4900,6 +5098,7 @@ export class Session {
 
   private async handleAgentInboxFlush({
     agentId,
+    taskId,
     requestId,
   }: Extract<SessionInboundMessage, { type: "agent.inbox.flush.request" }>): Promise<void> {
     let error: string | null = null;
@@ -4918,7 +5117,7 @@ export class Session {
       ) {
         throw new Error("Main Control inbox is unavailable.");
       }
-      this.agentMessages.flushInbox(agentId);
+      this.agentMessages.flushInbox(agentId, taskId);
     } catch (failure) {
       error = getErrorMessageOr(failure, "Failed to flush Main Control inbox");
     }

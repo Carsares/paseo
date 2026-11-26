@@ -1589,6 +1589,12 @@ class SummaryTimelineReadPool {
   }
 }
 
+interface TeamConclusionAttentionExpectation {
+  workspaceId: string;
+  attentionTimestamp: string;
+  reason?: "finished";
+}
+
 export class AgentManager {
   private readonly permissionSessionGenerations = new WeakMap<AgentSession, string>();
   private readonly timelinePrefixes: TimelinePrefixStore;
@@ -7396,16 +7402,18 @@ export class AgentManager {
 
   async clearTeamConclusionAttention(
     agentId: string,
-    expected: { workspaceId: string; attentionTimestamp: string },
+    expected: TeamConclusionAttentionExpectation,
+    checkCoverage?: () => Promise<boolean>,
   ): Promise<void> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.clearAgentAttentionUnlocked(agentId, expected),
-    );
+    return this.runLifecycleMutation(agentId, async () => {
+      if (checkCoverage && !(await checkCoverage())) return;
+      await this.clearAgentAttentionUnlocked(agentId, expected);
+    });
   }
 
   private matchesLiveTeamConclusion(
     agent: ManagedAgent,
-    expected: { workspaceId: string; attentionTimestamp: string },
+    expected: TeamConclusionAttentionExpectation,
   ): boolean {
     return (
       agent.workspaceId === expected.workspaceId &&
@@ -7416,13 +7424,14 @@ export class AgentManager {
       agent.pendingPermissions.size === 0 &&
       agent.attention.requiresAttention &&
       agent.attention.attentionReason !== "permission" &&
+      (expected.reason === undefined || agent.attention.attentionReason === expected.reason) &&
       agent.attention.attentionTimestamp.toISOString() === expected.attentionTimestamp
     );
   }
 
   private matchesStoredTeamConclusion(
     record: StoredAgentRecord,
-    expected: { workspaceId: string; attentionTimestamp: string },
+    expected: TeamConclusionAttentionExpectation,
   ): boolean {
     return (
       record.workspaceId === expected.workspaceId &&
@@ -7430,13 +7439,14 @@ export class AgentManager {
       !record.background &&
       (record.lastStatus === "idle" || record.lastStatus === "error") &&
       (record.attentionReason === "finished" || record.attentionReason === "error") &&
+      (expected.reason === undefined || record.attentionReason === expected.reason) &&
       record.attentionTimestamp === expected.attentionTimestamp
     );
   }
 
   private async clearAgentAttentionUnlocked(
     agentId: string,
-    expected?: { workspaceId: string; attentionTimestamp: string },
+    expected?: TeamConclusionAttentionExpectation,
   ): Promise<void> {
     if (expected) {
       const workspace = await this.workspaceRegistry?.get(expected.workspaceId);

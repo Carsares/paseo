@@ -5,12 +5,15 @@ import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
 import { ComposerTrackPill, ComposerTrackRow } from "@/composer/tracks";
 import { useRetainedPanelActive } from "@/components/retained-panel";
+import { usePaneContext } from "@/panels/pane-context";
 import { useHostFeature } from "@/runtime/host-features";
+import { openSubagentFromTopic } from "@/subagents/open-from-topic";
 import { useWorkspaceTasks } from "./query";
 
 interface WorkspaceTaskLedgerProps {
   serverId: string;
   workspaceId: string;
+  mainAgentId?: string | null;
 }
 
 const recentProgressKinds = [
@@ -28,14 +31,28 @@ const recentProgressKinds = [
   "archived",
 ] as const;
 
-export function WorkspaceTaskLedger({ serverId, workspaceId }: WorkspaceTaskLedgerProps) {
+export function WorkspaceTaskLedger({
+  serverId,
+  workspaceId,
+  mainAgentId,
+}: WorkspaceTaskLedgerProps) {
   // COMPAT(workspaceTaskLedger): added in v0.17.0, remove gate after 2027-05-24.
   const supported = useHostFeature(serverId, "workspaceTaskLedger");
   if (!supported || !workspaceId) return null;
-  return <WorkspaceTaskLedgerTrack serverId={serverId} workspaceId={workspaceId} />;
+  return (
+    <WorkspaceTaskLedgerTrack
+      serverId={serverId}
+      workspaceId={workspaceId}
+      mainAgentId={mainAgentId}
+    />
+  );
 }
 
-function WorkspaceTaskLedgerTrack({ serverId, workspaceId }: WorkspaceTaskLedgerProps) {
+function WorkspaceTaskLedgerTrack({
+  serverId,
+  workspaceId,
+  mainAgentId,
+}: WorkspaceTaskLedgerProps) {
   const { t, i18n } = useTranslation();
   const active = useRetainedPanelActive();
   const { query, available } = useWorkspaceTasks(serverId, workspaceId, active);
@@ -81,20 +98,64 @@ function WorkspaceTaskLedgerTrack({ serverId, workspaceId }: WorkspaceTaskLedger
         </ComposerTrackRow>
       ) : null}
       {tasks?.map((task) => (
-        <WorkspaceTaskRow key={task.taskId} task={task} />
+        <WorkspaceTaskRow
+          key={task.taskId}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          mainAgentId={mainAgentId}
+          task={task}
+        />
       ))}
     </ComposerTrackPill>
   );
 }
 
-function WorkspaceTaskRow({ task }: { task: WorkspaceTaskSummary }) {
+function WorkspaceTaskRow({
+  serverId,
+  workspaceId,
+  mainAgentId,
+  task,
+}: {
+  serverId: string;
+  workspaceId: string;
+  mainAgentId?: string | null;
+  task: WorkspaceTaskSummary;
+}) {
   const { t, i18n } = useTranslation();
+  const { tabId } = usePaneContext();
   const boundCount = new Intl.NumberFormat(i18n.resolvedLanguage).format(task.participants.length);
+  const leadAgentId = task.leadAgentId ?? task.participants[0]?.agentId ?? null;
+  const handleOpenLeadBeside = useCallback(() => {
+    if (!leadAgentId) return;
+    openSubagentFromTopic({
+      serverId,
+      workspaceId,
+      targetServerId: task.leadServerId,
+      targetAgentId: leadAgentId,
+      mainAgentId,
+      topicKey: `task:${task.taskId}`,
+      promptPreview: task.title,
+      parentTabId: tabId,
+      location: "side",
+    });
+  }, [
+    leadAgentId,
+    mainAgentId,
+    serverId,
+    tabId,
+    task.leadServerId,
+    task.taskId,
+    task.title,
+    workspaceId,
+  ]);
   // The progress event lacks a host ID and is displayed at task level.
   const recent = task.latestProgress;
   const progressKind = recentProgressKinds.find((kind) => kind === recent?.kind) ?? "updated";
   return (
-    <ComposerTrackRow>
+    <ComposerTrackRow
+      onPress={leadAgentId ? handleOpenLeadBeside : undefined}
+      accessibilityLabel={leadAgentId ? `${task.title}` : undefined}
+    >
       <View style={styles.row}>
         <Text style={styles.title}>{task.title}</Text>
         <Text style={styles.detail}>

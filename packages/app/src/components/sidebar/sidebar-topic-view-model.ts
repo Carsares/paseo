@@ -26,6 +26,8 @@ export interface TopicWorkspaceFacts {
   lastUserMessageAt: Date | null;
   completedAt: Date | null;
   pendingDurableCount: number;
+  pendingTodoCount?: number;
+  overdueTodoCount?: number;
   hasSubagentPendingPermission: boolean;
   hasActiveWorkspaceAgent: boolean;
 }
@@ -147,6 +149,8 @@ export function buildWorkspaceTopicFacts(input: {
   completedAtIso: string | undefined;
   lastWorkAtIso?: string;
   pendingDurableCount: number;
+  pendingTodoCount?: number;
+  overdueTodoCount?: number;
   latestPendingDurableCreatedAtMs?: number | null;
   isDispatchInProgress?: boolean;
 }): TopicWorkspaceFacts {
@@ -156,6 +160,8 @@ export function buildWorkspaceTopicFacts(input: {
     completedAtIso,
     lastWorkAtIso,
     pendingDurableCount,
+    pendingTodoCount = 0,
+    overdueTodoCount = 0,
     latestPendingDurableCreatedAtMs = null,
     isDispatchInProgress = false,
   } = input;
@@ -184,6 +190,8 @@ export function buildWorkspaceTopicFacts(input: {
       latestReactivationAtMs,
     }),
     pendingDurableCount,
+    pendingTodoCount,
+    overdueTodoCount,
     hasSubagentPendingPermission,
     hasActiveWorkspaceAgent,
   };

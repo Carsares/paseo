@@ -27,6 +27,7 @@ import { SidebarFilterEmptyState } from "@/components/sidebar/empty-states";
 import type { HostBadgeModel } from "@/hosts/appearance";
 import { isWeb as platformIsWeb, isNative as platformIsNative } from "@/constants/platform";
 import { useIsCompactFormFactor } from "@/constants/layout";
+import { HoverEnvelope } from "@/agent-stream/topic-card/hover-envelope";
 import { StyleSheet } from "react-native-unistyles";
 import { density, densityIconBox, densityIconProps } from "@/styles/density";
 import type { SidebarSurfaceBackdrop } from "@/styles/surface-backdrop";
@@ -513,8 +514,6 @@ function StatusGroupHeader({
   const handlePress = useCallback(() => {
     toggleWorkspaceGroupCollapsed(group.key);
   }, [group.key, toggleWorkspaceGroupCollapsed]);
-  const handleHoverIn = useCallback(() => setIsHovered(true), []);
-  const handleHoverOut = useCallback(() => setIsHovered(false), []);
   const rowStyle = useMemo(
     () => [styles.statusGroupRow, isHovered && styles.statusGroupRowHovered],
     [isHovered],
@@ -522,7 +521,7 @@ function StatusGroupHeader({
   const accessibilityState = useMemo(() => ({ expanded: !collapsed }), [collapsed]);
 
   return (
-    <View onPointerEnter={handleHoverIn} onPointerLeave={handleHoverOut}>
+    <HoverEnvelope onHoverChange={setIsHovered}>
       <Pressable
         accessibilityRole={platformIsWeb ? undefined : "button"}
         accessibilityLabel={t("sidebar.statusGroupAccessibility", { label: group.label })}
@@ -550,7 +549,7 @@ function StatusGroupHeader({
           </View>
         </View>
       </Pressable>
-    </View>
+    </HoverEnvelope>
   );
 }
 
@@ -705,7 +704,7 @@ function useTopicRowActions(
 
   const isTopic = Boolean(topicFacts?.isTopic);
   const isTopicCompleted = Boolean(topicFacts?.completedAt);
-  const pendingCount = topicFacts?.pendingDurableCount ?? 0;
+  const pendingCount = (topicFacts?.pendingDurableCount ?? 0) + (topicFacts?.pendingTodoCount ?? 0);
 
   return {
     onMarkCompleted: canOfferMarkTopicCompleted(workspace, topicFacts)

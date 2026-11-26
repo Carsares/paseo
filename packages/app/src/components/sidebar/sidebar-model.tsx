@@ -9,6 +9,8 @@ import React, {
 } from "react";
 import { useShallow } from "zustand/shallow";
 import { useGlobalDurableItems } from "@/durable-items/queries";
+import { countPendingTodosByWorkspace } from "@/todos/model";
+import { useGlobalTodos } from "@/todos/queries";
 import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
 import {
   useSidebarWorkspacesList,
@@ -291,6 +293,11 @@ export function SidebarModelProvider({
     ),
   );
   const { items: pendingDurableItems } = useGlobalDurableItems();
+  const { items: pendingTodoItems } = useGlobalTodos();
+  const pendingTodoStatsByIdentity = useMemo(
+    () => countPendingTodosByWorkspace(pendingTodoItems),
+    [pendingTodoItems],
+  );
   const pendingDurableStatsByIdentity = useMemo(() => {
     const stats = new Map<string, { count: number; latestCreatedAtMs: number | null }>();
     for (const { serverId, item } of pendingDurableItems) {
@@ -338,12 +345,15 @@ export function SidebarModelProvider({
       const activity = activityByServer[placement.serverId]?.get(placement.workspaceId);
       const identity = `${placement.serverId}\0${placement.workspaceId}`;
       const durableStats = pendingDurableStatsByIdentity.get(identity);
+      const todoStats = pendingTodoStatsByIdentity.get(identity);
       const facts = buildWorkspaceTopicFacts({
         workspace: descriptor,
         workspaceAgents: agentsByWorkspaceIdentity.get(identity) ?? [],
         completedAtIso: completedAtByWorkspaceKey[placement.workspaceKey],
         lastWorkAtIso: lastWorkAtByWorkspaceKey[placement.workspaceKey],
         pendingDurableCount: durableStats?.count ?? 0,
+        pendingTodoCount: todoStats?.pendingCount ?? 0,
+        overdueTodoCount: todoStats?.overdueCount ?? 0,
         latestPendingDurableCreatedAtMs: durableStats?.latestCreatedAtMs ?? null,
         isDispatchInProgress: activity?.status === "running",
       });
@@ -357,6 +367,7 @@ export function SidebarModelProvider({
     lastWorkAtByWorkspaceKey,
     list.workspacePlacements,
     pendingDurableStatsByIdentity,
+    pendingTodoStatsByIdentity,
     workspacesByServer,
   ]);
 

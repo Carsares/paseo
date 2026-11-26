@@ -232,6 +232,229 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+describe("workspace topics and todos", () => {
+  const workspaceId = "workspace-1";
+  const mainAgentId = "agent-1";
+  const topicKey = "topic-1";
+  const todoId = "todo-1";
+  const scope = { workspaceId, mainAgentId };
+  const topic = { ...scope, topicKey };
+  const todo = { workspaceId, todoId };
+  const reply = { ...topic, taskId: "task-1", clientMessageId: "reply-1", text: "Follow up" };
+  const mark = { ...topic, mode: "read", seq: 5 } as const;
+  const upsert = { ...todo, title: "Follow up", dueAt: null };
+  const setStatus = { ...todo, expectedRevision: 2, status: "completed" } as const;
+
+  async function connect(features?: Record<string, boolean>) {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "workspace-topics-and-todos",
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen({
+      features: features ?? {
+        workspaceTopicThreads: true,
+        workspaceTopicReadState: true,
+        workspaceTodos: true,
+      },
+    });
+    await connecting;
+    return { client, mock };
+  }
+
+  test.each([
+    {
+      operation: "workspace.topic.reply",
+      send: (client: DaemonClient) => client.replyWorkspaceTopic(reply),
+      input: reply,
+      result: { workspaceId, topicKey, routedTo: "main", targetAgentId: mainAgentId, entry: null },
+    },
+    {
+      operation: "workspace.topic.list_entries",
+      send: (client: DaemonClient) => client.listWorkspaceTopicEntries(topic),
+      input: topic,
+      result: { workspaceId, entries: [] },
+    },
+    {
+      operation: "workspace.topic_read.get_state",
+      send: (client: DaemonClient) => client.getWorkspaceTopicReadState(scope),
+      input: scope,
+      result: { snapshot: null },
+    },
+    {
+      operation: "workspace.topic_read.mark",
+      send: (client: DaemonClient) => client.markWorkspaceTopicRead(mark),
+      input: mark,
+      result: { snapshot: null },
+    },
+    {
+      operation: "workspace.topic_read.mark_all",
+      send: (client: DaemonClient) => client.markAllWorkspaceTopicsRead(),
+      input: {},
+      result: { snapshots: [] },
+    },
+    {
+      operation: "workspace.todo.list",
+      send: (client: DaemonClient) => client.listWorkspaceTodos(),
+      input: {},
+      result: { items: [] },
+    },
+    {
+      operation: "workspace.todo.upsert",
+      send: (client: DaemonClient) => client.upsertWorkspaceTodo(upsert),
+      input: upsert,
+      result: { item: null },
+    },
+    {
+      operation: "workspace.todo.set_status",
+      send: (client: DaemonClient) => client.setWorkspaceTodoStatus(setStatus),
+      input: setStatus,
+      result: { item: null },
+    },
+    {
+      operation: "workspace.todo.delete",
+      send: (client: DaemonClient) => client.deleteWorkspaceTodo(todo),
+      input: todo,
+      result: { todoId, deleted: true },
+    },
+  ])("serializes and correlates $operation", async ({ operation, send, input, result }) => {
+    const { client, mock } = await connect();
+    const pending = send(client);
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toEqual({
+      type: `${operation}.request`,
+      ...input,
+      requestId: expect.any(String),
+    });
+    const type = `${operation}.response`;
+    const payload = { requestId: request.requestId, ...result, error: null };
+    mock.triggerMessage(wrapSessionMessage({ type, payload: { ...payload, requestId: "other" } }));
+    mock.triggerMessage(wrapSessionMessage({ type, payload }));
+    await expect(pending).resolves.toEqual(payload);
+  });
+
+  test.each([undefined, "task-1"])("flushes the agent inbox with task %s", async (taskId) => {
+    const { client, mock } = await connect({ subagentInbox: true });
+    const pending =
+      taskId === undefined
+        ? client.flushAgentInbox(mainAgentId)
+        : client.flushAgentInbox(mainAgentId, { taskId });
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toEqual({
+      type: "agent.inbox.flush.request",
+      agentId: mainAgentId,
+      requestId: expect.any(String),
+      ...(taskId === undefined ? {} : { taskId }),
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.inbox.flush.response",
+        payload: { requestId: request.requestId, agentId: mainAgentId, success: true, error: null },
+      }),
+    );
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  test.each([
+    {
+      feature: "workspaceTopicThreads",
+      send: (client: DaemonClient) => client.listWorkspaceTopicEntries(topic),
+    },
+    {
+      feature: "workspaceTopicReadState",
+      send: (client: DaemonClient) => client.getWorkspaceTopicReadState(scope),
+    },
+    {
+      feature: "workspaceTodos",
+      send: (client: DaemonClient) => client.listWorkspaceTodos(),
+    },
+  ])("gates $feature RPCs on the host feature", async ({ feature, send }) => {
+    const { client, mock } = await connect({});
+    await expect(Promise.resolve().then(() => send(client))).rejects.toThrow(
+      `Update the host to use ${feature}.`,
+    );
+    expect(mock.sent).toHaveLength(0);
+  });
+
+  test("dispatches topic and todo event payloads until unsubscribed", async () => {
+    const { client, mock } = await connect();
+    const now = "2026-11-26T09:00:00.000Z";
+    const entry = {
+      ...topic,
+      entryId: "entry-1",
+      role: "agent_reply",
+      routedAgentId: mainAgentId,
+      text: "Done",
+      status: "completed",
+      seq: 5,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const snapshot = {
+      ...scope,
+      watermarkEpoch: null,
+      watermarkSeq: 5,
+      watermarkTimestampMs: Date.parse(now),
+      topics: [],
+      revision: 1,
+    };
+    const item = {
+      ...todo,
+      title: upsert.title,
+      status: "pending",
+      checklist: [],
+      dueAt: now,
+      remindBeforeMinutes: null,
+      snoozedUntil: null,
+      lastDueNotifiedAt: now,
+      source: null,
+      assignedAgentId: null,
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    };
+    const threadUpdated = vi.fn();
+    const readUpdated = vi.fn();
+    const todoUpdated = vi.fn();
+    const todoDue = vi.fn();
+    const events = [
+      {
+        message: { type: "workspace.topic.thread.updated", payload: { ...scope, entry } },
+        handler: threadUpdated,
+        unsubscribe: client.onWorkspaceTopicThreadUpdated(threadUpdated),
+      },
+      {
+        message: { type: "workspace.topic_read.updated", payload: { snapshot } },
+        handler: readUpdated,
+        unsubscribe: client.onWorkspaceTopicReadUpdated(readUpdated),
+      },
+      {
+        message: { type: "workspace.todo.updated", payload: { workspaceId, item } },
+        handler: todoUpdated,
+        unsubscribe: client.onWorkspaceTodoUpdated(todoUpdated),
+      },
+      {
+        message: {
+          type: "workspace.todo.due_triggered",
+          payload: { workspaceId, kind: "due", item, shouldNotify: true },
+        },
+        handler: todoDue,
+        unsubscribe: client.onWorkspaceTodoDueTriggered(todoDue),
+      },
+    ];
+    for (const { message } of events) mock.triggerMessage(wrapSessionMessage(message));
+    for (const { message, handler, unsubscribe } of events) {
+      unsubscribe();
+      mock.triggerMessage(wrapSessionMessage(message));
+      expect(handler.mock.calls).toEqual([[message.payload]]);
+    }
+  });
+});
+
 test.each([undefined, true])(
   "idle archive uses the wire guard only on a supported host (%s)",
   async (supported) => {
@@ -1692,6 +1915,9 @@ test("advertises client capabilities in hello", async () => {
       plugin_binary_payloads: true,
       workspace_setup_blocked: true,
       workspace_setup_observation: true,
+      workspace_topic_threads: true,
+      workspace_topic_read_state: true,
+      workspace_todos: true,
       hello_rejection: true,
       background_agents: true,
       browser_host: {

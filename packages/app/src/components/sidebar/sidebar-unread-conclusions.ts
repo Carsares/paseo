@@ -1,6 +1,18 @@
-import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import { getParentAddressFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
+import type { TopicThreadEntry } from "@getpaseo/protocol/messages";
+import { queryClient } from "@/data/query-client";
+import { hostSupportsFeature } from "@/runtime/host-features";
+import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { isWorkspaceRootAgent } from "@/subagents/policies";
-import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
+import {
+  selectAgentTimelineState,
+  useSessionStore,
+  type Agent,
+  type SessionState,
+  type WorkspaceDescriptor,
+} from "@/stores/session-store";
+import { markAllTopicsReadOnHost } from "@/topic-read/queries";
+import { workspaceTopicEntriesQueryKey } from "@/topic-threads/queries";
 import {
   normalizeWorkspaceOpaqueId,
   resolveWorkspaceMapKeyByIdentity,
@@ -248,4 +260,93 @@ export function areSidebarAttentionItemsEqual(
       item.timestampMs === other.timestampMs
     );
   });
+}
+
+function resolveObservedAgentWatermark(
+  session: SessionState | undefined,
+  serverId: string,
+  workspaceId: string,
+  agentId: string,
+  fallbackTimestampMs: number,
+): { epoch: string | null; maxSeq: number | null; maxTimestampMs: number } {
+  let epoch: string | null = null;
+  let maxSeq: number | null = null;
+  let maxTimestampMs = fallbackTimestampMs;
+
+  const timeline = selectAgentTimelineState(session, agentId);
+  if (timeline.status === "synced" && timeline.range) {
+    epoch = timeline.range.epoch;
+    maxSeq = timeline.range.endSeq;
+  }
+
+  const tail = session?.agentStreamTail.get(agentId);
+  const head = session?.agentStreamHead.get(agentId);
+  for (const list of [tail, head]) {
+    if (!list) continue;
+    for (const entry of list) {
+      const ts = entry.timestamp.getTime();
+      if (ts > maxTimestampMs) maxTimestampMs = ts;
+      if (entry.timelineCursor) {
+        if (entry.timelineCursor.epoch) epoch = entry.timelineCursor.epoch;
+        maxSeq =
+          maxSeq === null ? entry.timelineCursor.seq : Math.max(maxSeq, entry.timelineCursor.seq);
+      }
+    }
+  }
+
+  const cachedThreadEntries = queryClient.getQueryData<TopicThreadEntry[]>(
+    workspaceTopicEntriesQueryKey(serverId, workspaceId, agentId),
+  );
+  for (const entry of cachedThreadEntries ?? []) {
+    const entryTs = Date.parse(entry.updatedAt || entry.createdAt);
+    if (Number.isFinite(entryTs) && entryTs > maxTimestampMs) {
+      maxTimestampMs = entryTs;
+    }
+  }
+
+  return { epoch, maxSeq, maxTimestampMs };
+}
+
+/**
+ * Marks every read-only awareness item read on its own host without touching pending
+ * permissions, durable items, or workspace todos. For topic main sessions on hosts supporting
+ * `workspaceTopicReadState`, submits the client's real observed watermark snapshot per workspace
+ * instead of blindly calling `clearAgentAttention`, so unseen newer replies stay unread.
+ */
+export async function clearSidebarAttention(items: readonly SidebarAttentionItem[]): Promise<void> {
+  const runtime = getHostRuntimeStore();
+  const sessions = useSessionStore.getState().sessions;
+  const finishedItems = items.filter((item) => item.kind === "finished");
+
+  await Promise.allSettled(
+    finishedItems.map(async (item) => {
+      const session = sessions[item.serverId];
+      const agent = session?.agents.get(item.agentId) ?? session?.agentDetails.get(item.agentId);
+      const supportsTopicRead = hostSupportsFeature(session?.serverInfo, "workspaceTopicReadState");
+      const isTopicMain = Boolean(agent && isMainControlAgent(agent));
+
+      if (supportsTopicRead && isTopicMain) {
+        const watermark = resolveObservedAgentWatermark(
+          session,
+          item.serverId,
+          item.workspaceId,
+          item.agentId,
+          item.timestampMs,
+        );
+        await markAllTopicsReadOnHost({
+          queryClient,
+          serverId: item.serverId,
+          workspaceId: item.workspaceId,
+          mainAgentId: item.agentId,
+          epoch: watermark.epoch,
+          maxSeq: watermark.maxSeq,
+          maxTimestampMs: watermark.maxTimestampMs,
+        });
+        return;
+      }
+
+      const client = runtime.getSnapshot(item.serverId)?.client;
+      if (client) await client.clearAgentAttention(item.agentId);
+    }),
+  );
 }

@@ -12,6 +12,8 @@ export const AgentMessageSchema = z.object({
   }),
   text: z.string(),
   reportStatus: AgentReportStatusSchema.optional(),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
 });
 
 export type AgentMessage = z.infer<typeof AgentMessageSchema>;

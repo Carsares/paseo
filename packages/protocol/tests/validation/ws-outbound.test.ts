@@ -69,6 +69,108 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  describe("workspace topic, read state and todo messages", () => {
+    const timestamp = "2026-11-26T00:00:00.000Z";
+    const workspaceId = "ws-1";
+    const mainAgentId = "main-1";
+    const topicKey = "topic-1";
+    const entry = {
+      workspaceId,
+      mainAgentId,
+      topicKey,
+      entryId: "entry-1",
+      role: "agent_reply",
+      routedAgentId: "lead-1",
+      text: "Review complete.",
+      status: "completed",
+      seq: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const snapshot = {
+      workspaceId,
+      mainAgentId,
+      watermarkEpoch: null,
+      watermarkSeq: -1,
+      watermarkTimestampMs: 0,
+      topics: [
+        {
+          topicKey,
+          readUpToSeq: -1,
+          readUpToTimestampMs: 0,
+          markedUnreadAtMs: null,
+          updatedAt: timestamp,
+        },
+      ],
+      revision: 0,
+    };
+    const item = {
+      workspaceId,
+      todoId: "todo-1",
+      title: "Review",
+      status: "pending",
+      checklist: [{ itemId: "check-1", text: "Read the report", completed: false }],
+      dueAt: timestamp,
+      remindBeforeMinutes: null,
+      snoozedUntil: null,
+      lastDueNotifiedAt: null,
+      source: { mainAgentId, topicKey, topicTitlePreview: "Review" },
+      assignedAgentId: null,
+      revision: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: null,
+    };
+    const correlation = { requestId: "req-1", error: null };
+
+    it.each([
+      [
+        "workspace.topic.reply.response",
+        {
+          ...correlation,
+          workspaceId,
+          topicKey,
+          routedTo: "lead",
+          targetAgentId: "lead-1",
+          entry,
+        },
+      ],
+      ["workspace.topic.list_entries.response", { ...correlation, workspaceId, entries: [entry] }],
+      ["workspace.topic_read.get_state.response", { ...correlation, snapshot }],
+      ["workspace.topic_read.mark.response", { ...correlation, snapshot }],
+      ["workspace.topic_read.mark_all.response", { ...correlation, snapshots: [snapshot] }],
+      ["workspace.todo.list.response", { ...correlation, items: [item] }],
+      ["workspace.todo.upsert.response", { ...correlation, item }],
+      ["workspace.todo.set_status.response", { ...correlation, item }],
+      ["workspace.todo.delete.response", { ...correlation, todoId: item.todoId, deleted: true }],
+      ["workspace.topic.thread.updated", { workspaceId, mainAgentId, entry }],
+      ["workspace.topic_read.updated", { snapshot }],
+      ["workspace.todo.updated", { workspaceId, item: null, deletedTodoId: item.todoId }],
+      ["workspace.todo.due_triggered", { workspaceId, kind: "due", item, shouldNotify: true }],
+    ] as const)("validates %s in both outbound parsers", (type, payload) => {
+      const envelope = { type: "session", message: { type, payload } };
+      expect(WSOutboundMessageSchema.parse(envelope)).toEqual(envelope);
+      expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+    });
+
+    it("rejects an invalid nested deadline in both outbound parsers", () => {
+      const envelope = {
+        type: "session",
+        message: {
+          type: "workspace.todo.due_triggered",
+          payload: {
+            workspaceId,
+            item: { ...item, dueAt: "tomorrow" },
+            kind: "due",
+            shouldNotify: true,
+          },
+        },
+      };
+      expect(WSOutboundMessageSchema.safeParse(envelope).success).toBe(false);
+      expect(validateWSOutboundMessage(envelope).success).toBe(false);
+    });
+  });
+
   it("validates correlated workbench replies and their nested discriminated branches", () => {
     const decision = {
       type: "session",

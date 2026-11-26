@@ -58,6 +58,8 @@ export interface AgentSourceInfo {
   event: AgentMessage["event"];
   sender: AgentMessage["sender"];
   text: string;
+  taskId?: string;
+  rootMessageId?: string;
   reportStatus?: AgentMessage["reportStatus"];
   status: AgentSourceStatus;
 }
@@ -117,6 +119,8 @@ function sourceInfo(message: AgentMessage): AgentSourceInfo {
     event: message.event,
     sender: message.sender,
     text: message.text,
+    ...(message.taskId ? { taskId: message.taskId } : {}),
+    ...(message.rootMessageId ? { rootMessageId: message.rootMessageId } : {}),
     ...(message.reportStatus ? { reportStatus: message.reportStatus } : {}),
     status: resolveAgentSourceStatus(message),
   };

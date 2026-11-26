@@ -81,6 +81,8 @@ interface Receipt {
   dispatched: Promise<PromptDispatchDisposition>;
 }
 interface Admitted extends Message {
+  /** Withdrawal matches the sender's source; dispatch uses the admission snapshot. */
+  originalSource: AgentPromptSource;
   taskAdmission?: TaskDispatchAdmission;
   drainSteerDeclined?: boolean;
   dispatchFailure?: { error: unknown };
@@ -224,11 +226,17 @@ export interface AgentMessageDelivery {
    */
   enqueue(message: Message): Receipt;
   getInbox?(recipientId: string): InboxSummary | undefined;
-  flushInbox?(recipientId: string): void;
-  refreshInbox?(releaseRecipientId?: string): void;
+  flushInbox?(recipientId: string, taskId?: string): void;
+  refreshInbox?(releaseLegacyRecipientId?: string): void;
   withdrawInboxReport?(recipientId: string, messageId: string, sender?: ChildSource): void;
   classifyInbox?: Dependencies["classifyInbox"];
-  observeRemoteChild?(parentId: string, serverId: string, childId: string, active: boolean): void;
+  observeRemoteChild?(
+    parentId: string,
+    serverId: string,
+    childId: string,
+    active: boolean,
+    taskId?: string,
+  ): void;
   isRemoteFinishSuperseded?(address: ParentNotificationAddress, messageId: string): boolean;
   validateParentOwnership?(address: ParentNotificationAddress): Promise<void>;
   /**
@@ -339,7 +347,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   const inboxes = new Map<string, Inbox>();
   const releasing = new Map<string, Promise<void>>();
   const parentInboxes = new Map<string, Admitted[]>();
-  const parentInboxCaps = new Map<string, () => void>();
+  const parentInboxCaps = new Map<string, Map<string | undefined, () => void>>();
   const stopWrites = new Set<Promise<void>>();
   const outcomeWrites = new Set<Promise<void>>();
   const stopWaiters = new Set<(recipientId: string) => void>();
@@ -348,11 +356,31 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   let queuesDrainedOnClose = false;
   let closing: Promise<void> | undefined;
 
-  function clearParentInboxCap(recipientId: string): void {
-    const cancel = parentInboxCaps.get(recipientId);
-    if (!cancel) return;
-    parentInboxCaps.delete(recipientId);
-    cancel();
+  function inboxTaskId({ source }: Admitted): string | undefined {
+    return source.kind === "agent-message" ? source.taskId || undefined : undefined;
+  }
+
+  function syncParentInboxCaps(recipientId: string): void {
+    const pendingTasks = new Set(parentInboxes.get(recipientId)?.map(inboxTaskId));
+    const caps = parentInboxCaps.get(recipientId) ?? new Map();
+    for (const [taskId, cancel] of caps) {
+      if (!pendingTasks.has(taskId)) {
+        cancel();
+        caps.delete(taskId);
+      }
+    }
+    for (const taskId of pendingTasks) {
+      // A topic keeps its original deadline when another topic is flushed.
+      if (caps.has(taskId)) continue;
+      caps.set(
+        taskId,
+        schedule(MAX_SUBAGENT_INBOX_WAIT_MS, () => {
+          if (!closed) releaseInbox(recipientId, [], (message) => inboxTaskId(message) === taskId);
+        }),
+      );
+    }
+    if (caps.size) parentInboxCaps.set(recipientId, caps);
+    else parentInboxCaps.delete(recipientId);
   }
 
   const isRunning = (recipientId: string): boolean =>
@@ -458,7 +486,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     return {
       waitForForegroundConfirmation: handoffs.some((entry) => entry.waitForForegroundConfirmation),
       async begin() {
-        await checkMessages(messages, (message) => message.handoff?.begin())();
+        await checkMessages(messages, (message) => {
+          const prepareTask = message.taskAdmission?.beforeProviderDispatch;
+          return prepareTask
+            ? prepareTask().then(() => message.handoff?.begin())
+            : message.handoff?.begin();
+        })();
         await direct?.begin();
       },
       async declined() {
@@ -1001,25 +1034,38 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     inbox.cancelCap = schedule(MAX_COLLECTING_MS, () => attempt(item.recipientId));
   }
 
-  function releaseInbox(recipientId: string, arriving: Admitted[] = []): void {
-    clearParentInboxCap(recipientId);
+  function releaseInbox(
+    recipientId: string,
+    arriving: Admitted[] = [],
+    matches: (message: Admitted) => boolean = () => true,
+  ): void {
     const backlog = parentInboxes.get(recipientId);
-    parentInboxes.delete(recipientId);
-    for (const message of [...(backlog ?? []), ...arriving]) admit(message);
-    if (backlog) dependencies.onInboxChange?.(recipientId);
+    const released: Admitted[] = [];
+    const remaining: Admitted[] = [];
+    for (const message of backlog ?? []) {
+      (matches(message) ? released : remaining).push(message);
+    }
+    if (remaining.length) parentInboxes.set(recipientId, remaining);
+    else parentInboxes.delete(recipientId);
+    syncParentInboxCaps(recipientId);
+    for (const message of [...released, ...arriving]) admit(message);
+    if (released.length) dependencies.onInboxChange?.(recipientId);
   }
 
-  function refreshInbox(releaseRecipientId?: string): void {
+  function refreshInbox(releaseLegacyRecipientId?: string): void {
     if (closed || admissionPaused) return;
     for (const [recipientId, backlog] of parentInboxes) {
-      if (
-        recipientId === releaseRecipientId ||
-        backlog.some(
-          ({ source }) =>
-            isChildSource(source) && !dependencies.shouldHoldInbox?.(recipientId, source),
-        )
-      )
-        releaseInbox(recipientId);
+      const readyTasks = new Set<string | undefined>();
+      if (recipientId === releaseLegacyRecipientId) readyTasks.add(undefined);
+      for (const message of backlog) {
+        const taskId = inboxTaskId(message);
+        if (readyTasks.has(taskId)) continue;
+        const { source } = message;
+        if (isChildSource(source) && !dependencies.shouldHoldInbox?.(recipientId, source))
+          readyTasks.add(taskId);
+      }
+      if (readyTasks.size)
+        releaseInbox(recipientId, [], (message) => readyTasks.has(inboxTaskId(message)));
     }
   }
 
@@ -1188,10 +1234,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (parent && removedParent.length) {
       const remaining = parent.filter((message) => !removedParent.includes(message));
       if (remaining.length) parentInboxes.set(recipientId, remaining);
-      else {
-        parentInboxes.delete(recipientId);
-        clearParentInboxCap(recipientId);
-      }
+      else parentInboxes.delete(recipientId);
+      syncParentInboxCaps(recipientId);
       for (const message of removedParent) {
         message.state = "withdrawn";
         message.reject(new DOMException("Agent message withdrawn", "AbortError"));
@@ -1257,15 +1301,22 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
               ...(source.kind === "agent-message" && source.reportStatus
                 ? { reportStatus: source.reportStatus }
                 : {}),
+              ...(source.kind === "agent-message" && source.taskId
+                ? { taskId: source.taskId }
+                : {}),
+              ...(source.kind === "agent-message" && source.rootMessageId
+                ? { rootMessageId: source.rootMessageId }
+                : {}),
             },
           ];
         }),
       };
     },
-    flushInbox: (recipientId) => {
+    flushInbox: (recipientId, taskId) => {
       if (closed || admissionPaused)
         throw new AgentMessageAdmissionError("Agent message delivery is stopping");
-      releaseInbox(recipientId);
+      if (taskId === undefined) releaseInbox(recipientId);
+      else releaseInbox(recipientId, [], (message) => inboxTaskId(message) === taskId);
     },
     refreshInbox,
     withdrawInboxReport: (recipientId, messageId, sender) => {
@@ -1280,7 +1331,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       );
     },
     withdrawPending: (recipientId, matches) =>
-      withdrawPending(recipientId, (message) => matches(message.source)),
+      withdrawPending(recipientId, (message) => matches(message.originalSource)),
     hasPending(recipientId) {
       const inbox = inboxes.get(recipientId);
       return (
@@ -1318,14 +1369,17 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const taskAdmission = message.handoff?.waitForForegroundConfirmation
         ? attachTaskDispatchMessage(message.recipientId, receipt.messageId)
         : undefined;
+      const source = { ...message.source };
       const combinedValidation = combineDispatchValidators(
         message.recipientId,
-        message.source,
+        source,
         message.prompt,
         message.validateDispatch,
       );
       const item: Admitted = {
         ...message,
+        source,
+        originalSource: message.source,
         validateDispatch: combinedValidation.validateDispatch,
         beginDispatchAttempt: combinedValidation.beginDispatchAttempt,
         peerTurnAuthorization: combinedValidation.peerTurnAuthorization,
@@ -1344,26 +1398,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       bindValidationLifecycle(item, combinedValidation);
       if (
         message.subagentInbox === "ordinary" &&
-        isChildSource(message.source) &&
-        dependencies.shouldHoldInbox?.(message.recipientId, message.source)
+        isChildSource(source) &&
+        dependencies.shouldHoldInbox?.(message.recipientId, source)
       ) {
         const existing = parentInboxes.get(message.recipientId);
         const backlog = existing ?? [];
         backlog.push(item);
         parentInboxes.set(message.recipientId, backlog);
-        if (!existing) {
-          parentInboxCaps.set(
-            message.recipientId,
-            schedule(MAX_SUBAGENT_INBOX_WAIT_MS, () => {
-              parentInboxCaps.delete(message.recipientId);
-              if (closed) return;
-              releaseInbox(message.recipientId);
-            }),
-          );
-        }
+        syncParentInboxCaps(message.recipientId);
         dependencies.onInboxChange?.(message.recipientId);
-      } else if (message.subagentInbox) releaseInbox(message.recipientId, [item]);
-      else admit(item);
+      } else if (message.subagentInbox) {
+        const taskId = inboxTaskId(item);
+        releaseInbox(message.recipientId, [item], (pending) => inboxTaskId(pending) === taskId);
+      } else admit(item);
       return receipt;
     },
     sendDirect<Result extends PromptDispatchResult>(
@@ -1486,7 +1533,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const receipts: Promise<unknown>[] = [];
       const deferred =
         options?.deferWith ?? new AgentMessageAdmissionError("Inbox retained for restart");
-      for (const cancel of parentInboxCaps.values()) cancel();
+      for (const caps of parentInboxCaps.values()) {
+        for (const cancel of caps.values()) cancel();
+      }
       parentInboxCaps.clear();
       for (const backlog of parentInboxes.values())
         for (const message of backlog) {

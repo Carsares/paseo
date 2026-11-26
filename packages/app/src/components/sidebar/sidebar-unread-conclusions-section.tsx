@@ -4,13 +4,16 @@ import { Text, View } from "react-native";
 import { Check, CheckCheck } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useStoreWithEqualityFn } from "zustand/traditional";
+import { HoverEnvelope } from "@/agent-stream/topic-card/hover-envelope";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
 import {
   areSidebarAttentionItemsEqual,
+  clearSidebarAttention,
   selectSidebarUnreadConclusions,
   type SidebarAttentionItem,
 } from "@/components/sidebar/sidebar-unread-conclusions";
+export { clearSidebarAttention };
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import { mutedIconColorMapping } from "@/components/ui/icon-button-chrome";
 import { PressHighlight } from "@/components/ui/press-highlight";
@@ -22,7 +25,6 @@ import { useSidebarRowItems } from "@/components/sidebar/display-preferences/mod
 import { HostBadge } from "@/hosts/host-badge";
 import { useHostBadges } from "@/hosts/use-host-badges";
 import type { HostBadgeModel } from "@/hosts/appearance";
-import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import { density, densityIconBox } from "@/styles/density";
@@ -43,20 +45,6 @@ export function useSidebarUnreadConclusions(): SidebarAttentionItem[] {
     useSessionStore,
     (state) => selectSidebarUnreadConclusions(state.sessions),
     areSidebarAttentionItemsEqual,
-  );
-}
-
-/**
- * Marks every item read on its own host. One host being offline or rejecting the call must not
- * stop the others, so each call settles independently.
- */
-export async function clearSidebarAttention(items: readonly SidebarAttentionItem[]): Promise<void> {
-  const runtime = getHostRuntimeStore();
-  await Promise.allSettled(
-    items.map(async (item) => {
-      const client = runtime.getSnapshot(item.serverId)?.client;
-      if (client) await client.clearAgentAttention(item.agentId);
-    }),
   );
 }
 
@@ -174,8 +162,6 @@ const UnreadConclusionRow = memo(function UnreadConclusionRow({
   const isCompact = useIsCompactFormFactor();
   const [isHovered, setIsHovered] = useState(false);
   const [isActionFocused, setIsActionFocused] = useState(false);
-  const handlePointerEnter = useCallback(() => setIsHovered(true), []);
-  const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const handleActionFocus = useCallback(() => setIsActionFocused(true), []);
   const handleActionBlur = useCallback(() => setIsActionFocused(false), []);
   const rowKey = `${item.serverId}-${item.agentId}`;
@@ -200,10 +186,9 @@ const UnreadConclusionRow = memo(function UnreadConclusionRow({
   const actionVisible = isHovered || isActionFocused || isNative || isCompact;
 
   return (
-    <View
+    <HoverEnvelope
       style={styles.rowContainer}
-      onPointerEnter={handlePointerEnter}
-      onPointerLeave={handlePointerLeave}
+      onHoverChange={setIsHovered}
       testID={`sidebar-unread-conclusion-row-${rowKey}`}
     >
       <PressHighlight
@@ -252,7 +237,7 @@ const UnreadConclusionRow = memo(function UnreadConclusionRow({
           />
         </ToolbarButton>
       </View>
-    </View>
+    </HoverEnvelope>
   );
 });
 

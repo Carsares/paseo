@@ -10,6 +10,9 @@ import {
   type WorkspaceTask,
 } from "./index.js";
 import { taskReuseDecision } from "./reuse.js";
+import { listWorkspaceTaskSummaries } from "../../task-ledger-rpc.js";
+import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { createPersistedWorkspaceRecord } from "../../workspace-registry.js";
 
 const workspaceId = "workspace-a";
 let root: string;
@@ -27,6 +30,58 @@ afterEach(async () => {
 });
 
 describe("WorkspaceTaskLedgerStore", () => {
+  it("round-trips topic fields and projects them through the task RPC alongside legacy tasks", async () => {
+    const legacy = await store.upsert(workspaceId, { taskId: "legacy", title: "Legacy" });
+    const fields = {
+      rootMessageId: "root-message",
+      leadAgentId: "lead",
+      leadServerId: "host",
+      conclusionMessageId: "conclusion",
+      latestReplyPreview: "initial preview",
+    };
+    await store.upsert(workspaceId, { taskId: "topic", title: "Topic", ...fields });
+    await store.upsert(
+      workspaceId,
+      {
+        taskId: "topic",
+        title: "Topic after rebinding",
+        rootMessageId: "follow-up-message",
+      },
+      [taskEvent("lead", "dispatched", 0, "running")],
+    );
+    await store.updateLatestReplyPreview(workspaceId, "topic", "new preview");
+    await store.updateLatestReplyPreview(workspaceId, "missing", "ignore");
+
+    const reader = new WorkspaceTaskLedgerStore(paseoHome);
+    expect(await reader.list(workspaceId)).toMatchObject([
+      { taskId: legacy.taskId, title: legacy.title, createdAt: legacy.createdAt },
+      { ...fields, latestReplyPreview: "new preview" },
+    ]);
+    const result = await listWorkspaceTaskSummaries(
+      { type: "workspace.tasks.list.request", requestId: "request", workspaceId },
+      {
+        workspaceRegistry: {
+          get: async () =>
+            createPersistedWorkspaceRecord({
+              workspaceId,
+              projectId: "project",
+              cwd: root,
+              kind: "local_checkout",
+              displayName: "Workspace",
+              createdAt: legacy.createdAt,
+              updatedAt: legacy.updatedAt,
+            }),
+        },
+        taskLedger: reader,
+        logger: createTestLogger(),
+      },
+    );
+    expect(result.payload.tasks).toMatchObject([
+      { taskId: "topic", ...fields, latestReplyPreview: "new preview" },
+      { taskId: legacy.taskId },
+    ]);
+    expect(result.payload.tasks[1]?.rootMessageId).toBeUndefined();
+  });
   it("serializes concurrent writes from different instances to the same ledger", async () => {
     await mkdir(paseoHome);
     const alias = join(root, "alias");

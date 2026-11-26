@@ -1146,20 +1146,38 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "user_message" }>) => {
         const sourcePresentation = getAgentSourcePresentation(item);
         const { nestedItemIds } = presentation.turns;
-        const message = (
+        if (sourcePresentation || item.sender) {
+          return (
+            <View
+              style={stylesheet.subagentReportCard}
+              testID={`timeline-subagent-report-${item.id}`}
+            >
+              {sourcePresentation?.isGroupStart && !nestedItemIds.has(item.id) ? (
+                <AgentSourceHeader
+                  group={sourcePresentation.group}
+                  fallbackServerId={resolvedServerId}
+                  mainAgentId={agentId}
+                  workspaceId={context.workspaceId ?? undefined}
+                />
+              ) : null}
+              <Text style={stylesheet.subagentReportText}>{item.text}</Text>
+            </View>
+          );
+        }
+        return (
           <UserMessage
             itemId={item.id}
             serverId={resolvedServerId}
             agentId={agentId}
             messageId={item.messageId}
             message={item.text}
-            sender={sourcePresentation ? undefined : item.sender}
+            sender={item.sender}
             images={item.images}
             attachments={item.attachments}
             timestamp={item.timestamp.getTime()}
             capabilities={context.capabilities}
             client={client}
-            isFirstInGroup={sourcePresentation ? false : layoutItem.isFirstInUserGroup}
+            isFirstInGroup={layoutItem.isFirstInUserGroup}
             isLastInGroup={layoutItem.isLastInUserGroup}
             isPending={
               item.clientMessageId !== undefined &&
@@ -1167,19 +1185,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             }
           />
         );
-        if (!sourcePresentation?.isGroupStart || nestedItemIds.has(item.id)) return message;
-        return (
-          <>
-            <AgentSourceHeader
-              group={sourcePresentation.group}
-              fallbackServerId={resolvedServerId}
-            />
-            {message}
-          </>
-        );
       },
       [
         context.capabilities,
+        context.workspaceId,
         agentId,
         client,
         pendingClientMessageIds,
@@ -2291,6 +2300,23 @@ const stylesheet = StyleSheet.create((theme) => ({
   },
   scrollToBottomIcon: {
     color: theme.colors.foreground,
+  },
+  subagentReportCard: {
+    width: "100%",
+    alignSelf: "flex-start",
+    gap: theme.spacing[2],
+    padding: theme.spacing[3],
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.border,
+    borderLeftWidth: 3,
+    borderLeftColor: theme.colors.borderAccent,
+    backgroundColor: theme.colors.surface1,
+  },
+  subagentReportText: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.sm,
+    lineHeight: theme.lineHeight.content,
   },
 }));
 

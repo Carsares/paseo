@@ -4,14 +4,14 @@ import { persist, type StateStorage } from "zustand/middleware";
 import { z } from "zod";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 
-export type TeamDirectoryTab = "messages" | "agents";
+export type TeamDirectoryTab = "messages" | "todos" | "agents";
 export type TeamDirectoryAgentGroupMode = "activity" | "attribute";
 
 const TEAM_DIRECTORY_VIEW_STORAGE_KEY = "team-directory-view";
 const TEAM_DIRECTORY_VIEW_STORE_VERSION = 1;
 
 const TeamDirectoryViewPersistedSchema = z.strictObject({
-  activeTab: z.enum(["messages", "agents"]).optional(),
+  activeTab: z.enum(["messages", "todos", "agents"]).optional(),
   agentGroupMode: z.enum(["activity", "attribute"]).optional(),
 });
 

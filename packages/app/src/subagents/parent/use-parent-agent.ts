@@ -3,12 +3,15 @@ import { useAgentDescriptor } from "@/agent-presentation";
 import type { PanelDescriptor } from "@/panels/panel-registry";
 import { useLeaveSheet } from "@/screens/workspace/sheet-pane";
 import { useSessionStore } from "@/stores/session-store";
+import { buildTopicAgentKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
+import { returnFromSubagentToTopic } from "@/subagents/open-from-topic";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 
 export interface ParentAgent {
   /** The parent's title, or null while it has none — callers fall back to a generic name. */
   label: string | null;
+  topicPreview: string | null;
   icon: PanelDescriptor["icon"];
   statusBucket: SidebarStateBucket | null;
   open: () => void;
@@ -24,18 +27,41 @@ export function useParentAgentId(serverId: string, agentId: string): string | nu
 }
 
 /** The parent as its own tab presents it, and the way back to it. */
-export function useParentAgent(serverId: string, parentAgentId: string): ParentAgent {
+export function useParentAgent(
+  serverId: string,
+  parentAgentId: string,
+  childAgentId?: string | null,
+): ParentAgent {
   const descriptor = useAgentDescriptor({ kind: "agent", agentId: parentAgentId }, { serverId });
   const leaveSheet = useLeaveSheet();
+  const returnAnchor = useTopicStreamViewStore((state) =>
+    childAgentId
+      ? (state.returnTopicAnchorByAgentKey[buildTopicAgentKey(serverId, childAgentId)] ?? null)
+      : null,
+  );
   // Going back to the parent leaves the sheet the child is shown in. When the child was chosen
-  // from the parent's list, closing the sheet already uncovers the parent; otherwise the parent
-  // may live anywhere, even another workspace, and navigateToAgent opens it wherever it is.
+  // from a topic card, also restore the scroll anchor on the originating topic card.
   const open = useCallback(() => {
+    if (childAgentId && returnAnchor) {
+      if (leaveSheet({ kind: "agent", agentId: parentAgentId })) {
+        const mainKey = buildTopicAgentKey(returnAnchor.serverId, returnAnchor.mainAgentId);
+        const store = useTopicStreamViewStore.getState();
+        store.setViewMode(mainKey, "topics");
+        store.requestScrollToTopic(mainKey, returnAnchor.topicKey, true, {
+          taskId: returnAnchor.taskId,
+          rootMessageId: returnAnchor.rootMessageId,
+        });
+        store.setReturnTopicAnchor(buildTopicAgentKey(serverId, childAgentId), null);
+        return;
+      }
+      if (returnFromSubagentToTopic(serverId, childAgentId)) return;
+    }
     if (leaveSheet({ kind: "agent", agentId: parentAgentId })) return;
     navigateToAgent({ serverId, agentId: parentAgentId });
-  }, [leaveSheet, parentAgentId, serverId]);
+  }, [childAgentId, leaveSheet, parentAgentId, returnAnchor, serverId]);
   return {
     label: descriptor.label || null,
+    topicPreview: returnAnchor?.promptPreview || null,
     icon: descriptor.icon,
     statusBucket: descriptor.statusBucket,
     open,

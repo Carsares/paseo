@@ -8,6 +8,7 @@ import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery, AgentPromptSource } from "../agent-messages/index.js";
 import { resolveReportTitle } from "../report-title.js";
 import { getParentAddressFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { TASK_ID_LABEL } from "../hierarchy-policy.js";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
 import { decodeParentReportIdentity, encodeParentReportIdentity } from "./report-identity.js";
@@ -36,6 +37,8 @@ export interface FinishSubscription {
   /** Carries the suppression across a crash between the two stores. */
   supersedesFinished?: string[];
   reportTurnId?: string;
+  taskId?: string;
+  rootMessageId?: string;
 }
 export interface FinishSubscriptionStore {
   list(): Promise<FinishSubscription[]>;
@@ -92,6 +95,8 @@ export interface FinishSubscriptions {
       title?: string;
       summary: string;
       turnId?: string;
+      taskId?: string;
+      rootMessageId?: string;
     },
   ): Promise<string>;
   confirmParentReport(
@@ -138,7 +143,12 @@ const REPORT_PAGE_SIZE = 8;
 
 function remoteReportId(record: FinishSubscription): string {
   return record.report?.parentReportStatus
-    ? encodeParentReportIdentity(record.id, record.supersedesFinished ?? [], record.reportTurnId)
+    ? encodeParentReportIdentity(
+        record.id,
+        record.supersedesFinished ?? [],
+        record.reportTurnId,
+        record,
+      )
     : record.id;
 }
 
@@ -906,6 +916,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
                     child.status === "initializing" ||
                     child.activeTurn),
                 ),
+                child?.labels?.[TASK_ID_LABEL] || undefined,
               );
             };
             let disconnect!: (error: unknown) => void;
@@ -1289,7 +1300,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         await deps.followups.watches.put(record);
         startFollowupWatch(record);
       }),
-    queueParentReport: (address, { status, title, summary, turnId }) =>
+    queueParentReport: (address, { status, title, summary, turnId, taskId, rootMessageId }) =>
       serialize(async () => {
         if (closed || !deps.followups) throw new Error("Parent report delivery is unavailable");
         const id = randomUUID();
@@ -1314,6 +1325,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           id,
           report,
           reportTurnId: turnId,
+          ...(taskId ? { taskId } : {}),
+          ...(rootMessageId ? { rootMessageId } : {}),
           supersedesFinished: covered.map((entry) => entry.id),
         };
         await serializeReports(async () => {

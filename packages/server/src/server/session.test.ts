@@ -1,3 +1,4 @@
+import { TopicReadStateStore } from "./topic-read-state/store.js";
 import {
   createWorkspaceRuntimeStore,
   type WorkspaceRuntimeStore,
@@ -151,6 +152,21 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  reconcileFinishedAttention(snapshot: {
+    workspaceId: string;
+    mainAgentId: string;
+    watermarkEpoch: string | null;
+    watermarkSeq: number;
+    watermarkTimestampMs: number;
+    topics: Array<{
+      topicKey: string;
+      readUpToSeq: number;
+      readUpToTimestampMs: number;
+      markedUnreadAtMs: number | null;
+      updatedAt: string;
+    }>;
+    revision: number;
+  }): Promise<void>;
 }
 
 function asSessionInternals(session: Session): SessionHandlerInternals {
@@ -385,6 +401,7 @@ interface SessionForTestOptions {
   stt?: SessionOptions["stt"];
   voice?: SessionOptions["voice"];
   paseoHome?: string;
+  topicReadState?: TopicReadStateStore;
   serverId?: SessionOptions["serverId"];
   daemonVersion?: SessionOptions["daemonVersion"];
   daemonRuntimeConfig?: SessionOptions["daemonRuntimeConfig"];
@@ -459,6 +476,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
     paseoHome: options.paseoHome ?? "/tmp/paseo-home",
+    topicReadState: options.topicReadState,
     agentManager:
       options.agentManager instanceof AgentManager
         ? options.agentManager
@@ -3413,7 +3431,7 @@ test("creation preserves the human first prompt while assigning validated local 
     });
     const suppliedLabels = {
       [PARENT_AGENT_ID_LABEL]: "forged",
-      [PARENT_SERVER_ID_LABEL]: "other-host",
+      [PARENT_SERVER_ID_LABEL]: "local-host",
       [WORKSPACE_ROLE_LABEL]: "main",
       [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
       [getOpenAgentTabLabel("client")]: "true",
@@ -9976,5 +9994,91 @@ test.each([
   } finally {
     await session.cleanup();
     providerSnapshotManager.destroy();
+  }
+});
+
+test("clears finished attention only after each card is read through the current conclusion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "paseo-topic-attention-"));
+  const timestamp = "2026-11-26T09:00:00.000Z";
+  const scope = { workspaceId: "workspace-1", mainAgentId: "main-1", epoch: "epoch", headSeq: 4 };
+  const store = new TopicReadStateStore(join(home, "topic-read-state"));
+  const rows = [
+    {
+      seqEnd: 1,
+      timestamp,
+      turnId: "first",
+      item: { type: "user_message", messageId: "a", text: "A" },
+    },
+    {
+      seqEnd: 2,
+      timestamp,
+      turnId: "first",
+      item: { type: "assistant_message", text: "Answer A" },
+    },
+    {
+      seqEnd: 3,
+      timestamp,
+      turnId: "latest",
+      item: { type: "user_message", messageId: "b", text: "B" },
+    },
+    {
+      seqEnd: 4,
+      timestamp,
+      turnId: "latest",
+      item: { type: "assistant_message", text: "Answer B" },
+    },
+  ];
+  let reason: "finished" | "permission" = "finished";
+  const clear = vi.fn();
+  const session = createSessionForTest({
+    paseoHome: home,
+    topicReadState: store,
+    agentManager: {
+      getAgent: vi.fn(() => ({
+        internal: false,
+        workspaceId: scope.workspaceId,
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+        attention: {
+          requiresAttention: true,
+          attentionReason: reason,
+          attentionTimestamp: new Date(Date.parse(timestamp) + 1),
+        },
+        lastTurnCompletion: { event: { type: "turn_completed", turnId: "latest" } },
+      })),
+      fetchTimeline: vi.fn(() => ({ epoch: scope.epoch, rows })),
+      clearTeamConclusionAttention: vi.fn(async (_id, expected, check) => {
+        if (await check()) clear(expected);
+      }),
+    },
+  });
+  const reconcile = (snapshot: Awaited<ReturnType<typeof store.getState>>) =>
+    asSessionInternals(session).reconcileFinishedAttention(snapshot);
+  const mark = (topicKey: string, seq: number, mode: "read" | "unread" = "read") =>
+    store.mark(scope, { ...scope, mode, topicKey, seq, timestampMs: Date.parse(timestamp) });
+
+  try {
+    const { snapshot: bRead } = await mark("msg:b", 4);
+    await reconcile(bRead);
+    expect(clear).not.toHaveBeenCalled();
+    const { snapshot: allRead } = await mark("msg:a", 2);
+    await mark("msg:b", 4, "unread");
+    await reconcile(allRead);
+    expect(clear).not.toHaveBeenCalled();
+    await reconcile((await mark("msg:b", 3)).snapshot);
+    expect(clear).not.toHaveBeenCalled();
+    const { snapshot: latestRead } = await mark("msg:b", 4);
+    reason = "permission";
+    await reconcile(latestRead);
+    expect(clear).not.toHaveBeenCalled();
+    reason = "finished";
+    await reconcile(latestRead);
+    expect(clear).toHaveBeenCalledExactlyOnceWith({
+      workspaceId: scope.workspaceId,
+      attentionTimestamp: "2026-11-26T09:00:00.001Z",
+      reason: "finished",
+    });
+  } finally {
+    await session.cleanup();
+    rmSync(home, { recursive: true, force: true });
   }
 });

@@ -21,12 +21,14 @@ const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foregrou
 export function ParentAgentPill({
   serverId,
   parentAgentId,
+  childAgentId,
 }: {
   serverId: string;
   parentAgentId: string;
+  childAgentId?: string | null;
 }): ReactElement {
   const { t } = useTranslation();
-  const parent = useParentAgent(serverId, parentAgentId);
+  const parent = useParentAgent(serverId, parentAgentId, childAgentId);
   const [isHovered, setIsHovered] = useState(false);
   const handleHoverIn = useCallback(() => setIsHovered(true), []);
   const handleHoverOut = useCallback(() => setIsHovered(false), []);
@@ -38,7 +40,9 @@ export function ParentAgentPill({
     () => [composerPillStyles.label, styles.label, isHovered && composerPillStyles.labelActive],
     [isHovered],
   );
-  const label = parent.label ?? t("subagents.parent.backToParent");
+  const label = parent.topicPreview
+    ? t("topicWorkbench.topicStream.returnToTopic", { preview: parent.topicPreview })
+    : (parent.label ?? t("subagents.parent.backToParent"));
 
   return (
     <PressHighlight

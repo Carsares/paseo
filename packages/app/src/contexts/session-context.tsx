@@ -48,6 +48,9 @@ import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
 import { resyncProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
+import { applyWorkspaceTodoUpdateToCache } from "@/todos/queries";
+import { applyTopicReadSnapshotToCache } from "@/topic-read/queries";
+import { applyTopicThreadEntryToCache } from "@/topic-threads/queries";
 
 // Re-export types from session-store and draft-store for backward compatibility
 export type { DraftInput } from "@/stores/draft-store";
@@ -660,6 +663,47 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       });
     });
 
+    const unsubTopicThreadUpdated = client.onWorkspaceTopicThreadUpdated((payload) => {
+      applyTopicThreadEntryToCache(queryClient, serverId, payload);
+    });
+
+    const unsubTopicReadUpdated = client.onWorkspaceTopicReadUpdated((payload) => {
+      applyTopicReadSnapshotToCache(queryClient, serverId, payload.snapshot);
+    });
+
+    const unsubTodoUpdated = client.onWorkspaceTodoUpdated((payload) => {
+      applyWorkspaceTodoUpdateToCache(queryClient, serverId, payload);
+    });
+
+    const unsubTodoDueTriggered = client.onWorkspaceTodoDueTriggered((payload) => {
+      applyWorkspaceTodoUpdateToCache(queryClient, serverId, {
+        workspaceId: payload.workspaceId,
+        item: payload.item,
+      });
+      if (!payload.shouldNotify) {
+        return;
+      }
+      const title =
+        payload.kind === "remind_before"
+          ? t("topicWorkbench.todos.remindNotificationTitle", { title: payload.item.title })
+          : t("topicWorkbench.todos.dueNotificationTitle", { title: payload.item.title });
+      const body =
+        payload.item.source?.topicTitlePreview || payload.workspaceTitle || payload.item.note || "";
+      toast.show(title);
+      void sendOsNotification({
+        title,
+        body,
+        data: {
+          serverId,
+          workspaceId: payload.workspaceId,
+          todoId: payload.item.todoId,
+          reason: "todo_due",
+          ...(payload.item.source?.mainAgentId ? { agentId: payload.item.source.mainAgentId } : {}),
+          ...(payload.item.source?.topicKey ? { topicKey: payload.item.source.topicKey } : {}),
+        },
+      });
+    });
+
     return () => {
       void feeds
         .release()
@@ -675,6 +719,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       unsubTranscription();
       unsubVoiceInputState();
       unsubTerminalAttention();
+      unsubTopicThreadUpdated();
+      unsubTopicReadUpdated();
+      unsubTodoUpdated();
+      unsubTodoDueTriggered();
     };
   }, [
     client,
@@ -690,6 +738,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     notifyAgentAttention,
     updateSessionServerInfo,
     toast,
+    t,
     voiceRuntime,
     voiceAudioEngine,
   ]);

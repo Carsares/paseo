@@ -6,6 +6,7 @@ import {
   type SendDirectPromptParams,
 } from "../agent-prompt.js";
 import { AgentRunState, type ForegroundPromptStart } from "../agent-run-state.js";
+import { runWithTaskDispatchAdmission } from "../task-ledger/admission.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
 import { expect, test, vi } from "vitest";
@@ -55,7 +56,7 @@ function createClock() {
   };
 }
 
-function inboxScenario() {
+function inboxScenario(activeChildrenByTask?: ReadonlyMap<string | undefined, Set<string>>) {
   const clock = createClock();
   const workers = new Set(["first", "second"]);
   const changes = vi.fn();
@@ -71,7 +72,11 @@ function inboxScenario() {
   let notify: (agentId: string, releaseInbox?: boolean) => void = () => {};
   const delivery = createAgentMessageDelivery({
     schedule: clock.schedule,
-    shouldHoldInbox: (_, source) => [...workers].some((worker) => worker !== source?.agentId),
+    shouldHoldInbox: (_, source) => {
+      const taskId = source?.kind === "agent-message" ? source.taskId : undefined;
+      const activeChildren = activeChildrenByTask ? activeChildrenByTask.get(taskId) : workers;
+      return [...(activeChildren ?? [])].some((worker) => worker !== source?.agentId);
+    },
     onInboxChange: changes,
     isRunning: () => parentRunning,
     subscribe: (listener) => {
@@ -122,6 +127,200 @@ test("each report projects its own status, with legacy reports left unannotated"
   expect(timeline[1]).toMatchObject({ agentMessage: { reportStatus: "blocked" } });
   expect(timeline[2]).not.toHaveProperty("agentMessage.reportStatus");
   expect(message("legacy")).not.toContain("report-status");
+});
+
+test("flushes one tagged task without resetting other tasks or the legacy inbox", async () => {
+  const scenario = inboxScenario();
+  const report = (agentId: string, taskId: string) =>
+    scenario.report(agentId, {
+      source: {
+        kind: "agent-message",
+        agentId,
+        reportStatus: "completed",
+        taskId,
+        rootMessageId: 'root<&>"',
+      },
+    });
+  const first = report("first", "task-a");
+  scenario.clock.advance(5_000);
+  const second = report("second", "task-b");
+  scenario.clock.advance(5_000);
+  const legacy = scenario.report("legacy");
+  expect(scenario.delivery.getInbox?.("main")?.items).toMatchObject([
+    { taskId: "task-a", rootMessageId: 'root<&>"' },
+    { taskId: "task-b" },
+    { agentId: "legacy" },
+  ]);
+  scenario.delivery.flushInbox?.("main", "unknown");
+  expect(scenario.delivery.getInbox?.("main")?.count).toBe(3);
+  scenario.delivery.flushInbox?.("main", "task-a");
+  scenario.clock.advance(2_000);
+  await first.dispatched;
+  const [request] = scenario.dispatch.mock.calls[0]!;
+  expect(request.messageIds).toEqual(["first"]);
+  expect(typeof request.prompt).toBe("string");
+  expect(
+    projectAgentMessages({ type: "user_message", text: String(request.prompt) }),
+  ).toMatchObject([{ agentMessage: { taskId: "task-a", rootMessageId: 'root<&>"' } }]);
+
+  scenario.clock.advance(22_999);
+  expect(scenario.delivery.getInbox?.("main")?.count).toBe(2);
+  scenario.clock.advance(1);
+  expect(scenario.delivery.getInbox?.("main")?.items).toMatchObject([{ agentId: "legacy" }]);
+  scenario.clock.advance(2_000);
+  await second.dispatched;
+  expect(scenario.dispatch.mock.calls[1]?.[0].messageIds).toEqual(["second"]);
+
+  scenario.delivery.flushInbox?.("main");
+  scenario.clock.advance(2_000);
+  await legacy.dispatched;
+  expect(scenario.delivery.getInbox?.("main")).toBeUndefined();
+  expect(scenario.dispatch.mock.calls[2]?.[0].messageIds).toEqual(["legacy"]);
+  await scenario.delivery.close();
+});
+
+test("retains a queued report's original routing fields when the sender reuses its source object", async () => {
+  const scenario = inboxScenario();
+  const source = {
+    kind: "agent-message" as const,
+    agentId: "first",
+    taskId: "original-task",
+    rootMessageId: "original-root",
+  };
+  const receipt = scenario.report("first", { source });
+  source.taskId = "another-task";
+  source.rootMessageId = "another-root";
+  scenario.delivery.flushInbox?.("main", "another-task");
+  expect(scenario.delivery.getInbox?.("main")?.items).toMatchObject([
+    { taskId: "original-task", rootMessageId: "original-root" },
+  ]);
+  scenario.delivery.flushInbox?.("main", "original-task");
+  scenario.clock.advance(2_000);
+  await expect(receipt.dispatched).resolves.toBe("turn_started");
+  expect(
+    parseAgentMessage(String(scenario.dispatch.mock.calls[0]?.[0].prompt))?.source,
+  ).toMatchObject({
+    taskId: "original-task",
+    rootMessageId: "original-root",
+  });
+  await scenario.delivery.close();
+});
+
+test("state changes release only ready tasks and keep the legacy inbox independent", async () => {
+  const activeA = new Set(["worker-a"]);
+  const scenario = inboxScenario(
+    new Map([
+      ["task-a", activeA],
+      ["task-b", new Set(["worker-b"])],
+      [undefined, new Set(["worker-legacy"])],
+    ]),
+  );
+  const first = scenario.report("first", {
+    source: { kind: "agent-message", agentId: "first", taskId: "task-a" },
+  });
+  const second = scenario.report("second", {
+    source: { kind: "agent-message", agentId: "second", taskId: "task-b" },
+  });
+  const legacy = scenario.report("legacy");
+  const heldIds = () => scenario.delivery.getInbox?.("main")?.items.map(({ agentId }) => agentId);
+  expect(heldIds()).toEqual(["first", "second", "legacy"]);
+
+  activeA.clear();
+  scenario.notify("worker-a");
+  expect(heldIds()).toEqual(["second", "legacy"]);
+  scenario.clock.advance(2_000);
+  await expect(first.dispatched).resolves.toBe("turn_started");
+  expect(scenario.dispatch.mock.calls.map(([batch]) => batch.messageIds)).toEqual([["first"]]);
+
+  scenario.notify("main", true);
+  expect(heldIds()).toEqual(["second"]);
+  scenario.clock.advance(2_000);
+  await expect(legacy.dispatched).resolves.toBe("turn_started");
+  expect(scenario.dispatch.mock.calls[1]?.[0].messageIds).toEqual(["legacy"]);
+
+  activeA.add("worker-a");
+  const followup = scenario.report("followup", {
+    source: { kind: "agent-message", agentId: "followup", taskId: "task-a" },
+  });
+  expect(heldIds()).toEqual(["second", "followup"]);
+  scenario.delivery.flushInbox?.("main");
+  expect(heldIds()).toBeUndefined();
+  scenario.clock.advance(2_000);
+  await Promise.all([second.dispatched, followup.dispatched]);
+  expect(scenario.dispatch.mock.calls[2]?.[0].messageIds).toEqual(["second", "followup"]);
+  await scenario.delivery.close();
+});
+
+test.each(["ordinary", "urgent"] as const)(
+  "an arriving %s report releases only its own task",
+  async (subagentInbox) => {
+    const scenario = inboxScenario(
+      new Map([
+        ["task-a", new Set(["worker-a"])],
+        ["task-b", new Set(["worker-b"])],
+        [undefined, new Set(["worker-legacy"])],
+      ]),
+    );
+    const first = scenario.report("first", {
+      source: { kind: "agent-message", agentId: "first", taskId: "task-a" },
+    });
+    const second = scenario.report("second", {
+      source: { kind: "agent-message", agentId: "second", taskId: "task-b" },
+    });
+    const legacy = scenario.report("legacy");
+    const arrival = scenario.report("worker-a", {
+      subagentInbox,
+      source: { kind: "agent-message", agentId: "worker-a", taskId: "task-a" },
+    });
+
+    expect(scenario.delivery.getInbox?.("main")?.items.map(({ agentId }) => agentId)).toEqual([
+      "second",
+      "legacy",
+    ]);
+    scenario.clock.advance(2_000);
+    await Promise.all([first.dispatched, arrival.dispatched]);
+    expect(scenario.dispatch.mock.calls.map(([batch]) => batch.messageIds)).toEqual([
+      ["first", "worker-a"],
+    ]);
+
+    scenario.delivery.flushInbox?.("main");
+    scenario.clock.advance(2_000);
+    await Promise.all([second.dispatched, legacy.dispatched]);
+    await scenario.delivery.close();
+  },
+);
+
+test("prepares task labels at confirmed handoff rather than while reserving the turn", async () => {
+  const clock = createClock();
+  const prepareTask = vi.fn(async () => {});
+  const handoff = vi.fn(async () => {
+    expect(prepareTask).toHaveBeenCalledTimes(1);
+  });
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    dispatch: async (request) => {
+      await request.beforeProviderDispatch();
+      expect(prepareTask).not.toHaveBeenCalled();
+      expect(request.admit()).toBe(true);
+      await request.handoff?.begin();
+      return "turn_started";
+    },
+    onError: () => {},
+  });
+  const receipt = runWithTaskDispatchAdmission(
+    { agentId: "lead", beforeProviderDispatch: prepareTask },
+    () =>
+      delivery.enqueue({
+        recipientId: "lead",
+        source: { kind: "agent-message", agentId: "main" },
+        prompt: "Review the task",
+        handoff: { waitForForegroundConfirmation: true, begin: handoff, declined: async () => {} },
+      }),
+  );
+  clock.advance(2_000);
+  await expect(receipt.dispatched).resolves.toBe("turn_started");
+  expect(handoff).toHaveBeenCalledTimes(1);
+  await delivery.close();
 });
 
 test("only another running child holds a report and terminal state releases the ordered batch", async () => {

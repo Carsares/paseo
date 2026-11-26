@@ -108,6 +108,8 @@ export interface UserMessageItem {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  /** Set when this message's turn ended via `turn_canceled`. */
+  turnCanceled?: true;
 }
 
 export interface UserMessageInput {
@@ -120,6 +122,8 @@ export interface UserMessageInput {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  /** Set when this message's turn ended via `turn_canceled`. */
+  turnCanceled?: true;
 }
 
 export function createUserMessage(input: UserMessageInput): UserMessageItem {
@@ -796,6 +800,8 @@ export interface AssistantMessageItem {
   timestamp: Date;
   /** Set when this message carries its turn's footer. */
   turnMetrics?: AgentMetric[];
+  /** Set when this message's turn ended via `turn_canceled`. */
+  turnCanceled?: true;
   /** Display-only fields, assigned after source-item plugin transforms. */
 }
 
@@ -814,6 +820,8 @@ export interface ThoughtItem {
   text: string;
   timestamp: Date;
   status: ThoughtStatus;
+  /** Set when this thought's turn ended via `turn_canceled`. */
+  turnCanceled?: true;
 }
 
 export type OrchestratorToolCallStatus = "executing" | "completed" | "failed";
@@ -852,6 +860,8 @@ export interface ToolCallItem {
   payload: ToolCallPayload;
   /** Set when this call carries its turn's footer. */
   turnMetrics?: AgentMetric[];
+  /** Set when this tool call's turn ended via `turn_canceled`. */
+  turnCanceled?: true;
 }
 
 export type AgentToolCallItem = ToolCallItem & {
@@ -1691,6 +1701,36 @@ function reduceTimelineEvent(
   }
 }
 
+function stampTurnCanceled(items: StreamItem[], turnId: string | undefined): StreamItem[] {
+  if (items.length === 0) return items;
+  let targetIndex = -1;
+  if (turnId !== undefined) {
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      if (items[i]?.turnId === turnId) {
+        targetIndex = i;
+        break;
+      }
+    }
+  }
+  if (targetIndex < 0) {
+    targetIndex = items.length - 1;
+  }
+  const target = items[targetIndex];
+  if (
+    !target ||
+    (target.kind !== "user_message" &&
+      target.kind !== "assistant_message" &&
+      target.kind !== "thought" &&
+      target.kind !== "tool_call") ||
+    target.turnCanceled === true
+  ) {
+    return items;
+  }
+  const next = [...items];
+  next[targetIndex] = { ...target, turnCanceled: true };
+  return next;
+}
+
 /**
  * Reduce a single AgentManager stream event into the UI timeline
  */
@@ -1719,10 +1759,11 @@ export function reduceStreamUpdate(
     }
     case "turn_completed":
       return stampCompletedTurnMetrics(finalizeActiveThoughts(state), event.metrics, event.turnId);
+    case "turn_canceled":
+      return stampTurnCanceled(finalizeActiveThoughts(state), event.turnId);
     case "thread_started":
     case "turn_started":
     case "turn_failed":
-    case "turn_canceled":
     case "permission_requested":
     case "permission_resolved":
     case "attention_required":

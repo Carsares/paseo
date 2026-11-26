@@ -48,6 +48,11 @@ export const WorkspaceTaskUpsertSchema = z.object({
   closure: TaskClosureSchema.optional(),
   handoffSummary: z.string().optional(),
   blockingQuestion: z.string().optional(),
+  rootMessageId: z.string().min(1).optional(),
+  leadAgentId: z.string().min(1).optional(),
+  leadServerId: z.string().min(1).optional(),
+  conclusionMessageId: z.string().min(1).optional(),
+  latestReplyPreview: z.string().optional(),
 });
 
 const boundedText = (bytes: number) =>
@@ -55,7 +60,14 @@ const boundedText = (bytes: number) =>
     .string()
     .refine((text) => Buffer.byteLength(text) <= bytes, `Must be at most ${bytes} UTF-8 bytes`);
 
-export const WorkspaceTaskToolInputSchema = WorkspaceTaskUpsertSchema.omit({ participants: true })
+export const WorkspaceTaskToolInputSchema = WorkspaceTaskUpsertSchema.omit({
+  participants: true,
+  rootMessageId: true,
+  leadAgentId: true,
+  leadServerId: true,
+  conclusionMessageId: true,
+  latestReplyPreview: true,
+})
   .extend({
     taskId: boundedText(128).pipe(z.string().min(1)),
     title: boundedText(512).pipe(TaskTitleSchema).optional(),
@@ -158,6 +170,11 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     closure,
     handoffSummary,
     blockingQuestion,
+    rootMessageId,
+    leadAgentId,
+    leadServerId,
+    conclusionMessageId,
+    latestReplyPreview,
     createdAt = now,
   } = current ?? {};
   return WorkspaceTaskSchema.parse({
@@ -169,6 +186,11 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     closure: mergeClosure(closure, update.closure),
     handoffSummary: update.handoffSummary ?? handoffSummary,
     blockingQuestion: update.blockingQuestion ?? blockingQuestion,
+    rootMessageId: update.rootMessageId ?? rootMessageId,
+    leadAgentId: update.leadAgentId ?? leadAgentId,
+    leadServerId: update.leadServerId ?? leadServerId,
+    conclusionMessageId: update.conclusionMessageId ?? conclusionMessageId,
+    latestReplyPreview: update.latestReplyPreview ?? latestReplyPreview,
     events: current?.events,
     recentAgentStates: current?.recentAgentStates,
     createdAt,
@@ -227,10 +249,15 @@ export class WorkspaceTaskLedgerStore {
       const current = tasks.find((task) => task.taskId === update.taskId);
       // A queued binding can settle after a human closes the task. Reopening
       // or changing its closure is an explicit upsert, outside dispatch.
-      const patch =
-        bindingEvents.length && current && terminalStatuses.has(current.status)
-          ? { ...update, status: undefined, closure: undefined }
-          : update;
+      const patch = bindingEvents.length
+        ? {
+            ...update,
+            ...(current && terminalStatuses.has(current.status)
+              ? { status: undefined, closure: undefined }
+              : {}),
+            rootMessageId: current?.rootMessageId ?? update.rootMessageId,
+          }
+        : update;
       const next = applyTaskEvents(
         mergeTask(current, patch),
         orderTaskEvents(bindingEvents, retainedTaskEvents(tasks)),
@@ -246,6 +273,17 @@ export class WorkspaceTaskLedgerStore {
         .toReversed();
       await writeJsonFileAtomic(file, retained);
       return next;
+    });
+  }
+
+  async updateLatestReplyPreview(workspaceId: string, taskId: string, text: string): Promise<void> {
+    const file = this.filePath(workspaceId);
+    await serializeFile(file, async () => {
+      const tasks = await readTasks(file);
+      const current = tasks.find((task) => task.taskId === taskId);
+      if (!current) return;
+      current.latestReplyPreview = text;
+      await writeJsonFileAtomic(file, tasks);
     });
   }
 

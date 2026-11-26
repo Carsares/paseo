@@ -4,6 +4,14 @@ import type { NotificationOpenSource, NotificationTap } from "./source";
 export const WEB_NOTIFICATION_CLICK_EVENT = "paseo:web-notification-click";
 
 export type NotificationOpenTarget =
+  | {
+      kind: "todo_due";
+      serverId: string;
+      workspaceId: string;
+      agentId?: string;
+      topicKey?: string;
+      todoId?: string;
+    }
   | { kind: "agent"; serverId: string; agentId: string }
   | { kind: "terminal"; serverId: string; workspaceId: string; terminalId: string }
   | { kind: "host"; serverId: string };
@@ -18,6 +26,20 @@ export function parseNotificationOpenTarget(data: unknown): NotificationOpenTarg
   const serverId = readId(data, "serverId");
   if (!serverId) return null;
   const workspaceId = readId(data, "workspaceId");
+  const reason = readId(data, "reason");
+  if (reason === "todo_due" && workspaceId) {
+    const agentId = readId(data, "agentId");
+    const topicKey = readId(data, "topicKey");
+    const todoId = readId(data, "todoId");
+    return {
+      kind: "todo_due",
+      serverId,
+      workspaceId,
+      ...(agentId ? { agentId } : {}),
+      ...(topicKey ? { topicKey } : {}),
+      ...(todoId ? { todoId } : {}),
+    };
+  }
   const terminalId = readId(data, "terminalId");
   if (workspaceId && terminalId) return { kind: "terminal", serverId, workspaceId, terminalId };
   const agentId = readId(data, "agentId");
@@ -30,6 +52,7 @@ interface NotificationOpenRouterDeps {
   openAgent: (target: { serverId: string; agentId: string }) => void;
   openRoute: (route: string) => void;
   openTerminal: (target: Extract<NotificationOpenTarget, { kind: "terminal" }>) => void;
+  openTodoDue?: (target: Extract<NotificationOpenTarget, { kind: "todo_due" }>) => void;
   whenReadyToNavigate: () => Promise<void>;
 }
 
@@ -41,7 +64,13 @@ export function createNotificationOpenRouter(deps: NotificationOpenRouterDeps) {
     handledIds.add(tap.id);
     await deps.whenReadyToNavigate();
     const target = parseNotificationOpenTarget(tap.data);
-    if (target?.kind === "agent") {
+    if (target?.kind === "todo_due") {
+      if (deps.openTodoDue) {
+        deps.openTodoDue(target);
+      } else if (target.agentId) {
+        deps.openAgent({ serverId: target.serverId, agentId: target.agentId });
+      }
+    } else if (target?.kind === "agent") {
       deps.openAgent({ serverId: target.serverId, agentId: target.agentId });
     } else if (target?.kind === "terminal") {
       deps.openTerminal(target);

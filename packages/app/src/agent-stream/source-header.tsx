@@ -1,4 +1,4 @@
-import { ExternalLink, Quote } from "lucide-react-native";
+import { Columns2, Quote } from "lucide-react-native";
 import { createContext, memo, useCallback, useContext, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
@@ -7,8 +7,10 @@ import { useComposerQuote } from "@/assistant-selection-copy/composer-quote";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
+import { useOptionalPaneContext } from "@/panels/pane-context";
 import { useSessionStore } from "@/stores/session-store";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
+import { openSubagentFromTopic } from "@/subagents/open-from-topic";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { useDisclosureHold } from "./disclosure";
 import {
@@ -24,7 +26,7 @@ import {
   stripReplyTemplate,
 } from "./reply-quote";
 
-const ThemedExternalLink = withUnistyles(ExternalLink);
+const ThemedColumns2 = withUnistyles(Columns2);
 const ThemedQuote = withUnistyles(Quote);
 const mutedIconProps = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const expandedAccessibilityState = { expanded: true };
@@ -77,19 +79,70 @@ interface SourceDetailsToggle {
   onToggle: () => void;
 }
 
+function resolveSourceTopicKey(source: AgentSourceInfo): string | undefined {
+  if (source.taskId) return `task:${source.taskId}`;
+  if (source.rootMessageId) return `msg:${source.rootMessageId}`;
+  return undefined;
+}
+
+function resolveSourceOpenParams(input: {
+  source: AgentSourceInfo;
+  host: string;
+  fallbackServerId?: string;
+  mainAgentId?: string;
+  workspaceId?: string;
+  parentTabId?: string | null;
+  title: string;
+  paneContext: ReturnType<typeof useOptionalPaneContext>;
+}) {
+  const {
+    source,
+    host,
+    fallbackServerId,
+    mainAgentId,
+    workspaceId,
+    parentTabId,
+    title,
+    paneContext,
+  } = input;
+  const session = useSessionStore.getState().sessions[host];
+  const targetAgent =
+    session?.agents.get(source.sender.id) ?? session?.agentDetails.get(source.sender.id);
+  const resolvedWorkspaceId = workspaceId ?? targetAgent?.workspaceId ?? paneContext?.workspaceId;
+  const paneAgentId = paneContext?.target.kind === "agent" ? paneContext.target.agentId : undefined;
+  const resolvedMainAgentId = mainAgentId ?? paneAgentId ?? targetAgent?.parentAgentId ?? undefined;
+  return {
+    resolvedWorkspaceId,
+    serverId: fallbackServerId ?? host,
+    targetServerId: host,
+    targetAgentId: source.sender.id,
+    mainAgentId: resolvedMainAgentId,
+    topicKey: resolveSourceTopicKey(source),
+    promptPreview: extractSubagentPreviewText(source.text).slice(0, 60) || title,
+    parentTabId: parentTabId ?? paneContext?.tabId ?? null,
+  };
+}
+
 const SourceEntry = memo(function SourceEntry({
   source,
   fallbackServerId,
+  mainAgentId,
+  workspaceId,
+  parentTabId,
   showPreview,
   details,
 }: {
   source: AgentSourceInfo;
   fallbackServerId?: string;
+  mainAgentId?: string;
+  workspaceId?: string;
+  parentTabId?: string | null;
   showPreview: boolean;
   details?: SourceDetailsToggle;
 }) {
   const { t } = useTranslation();
   const composerQuote = useComposerQuote();
+  const paneContext = useOptionalPaneContext();
   const host = source.sender.serverId ?? fallbackServerId;
   const id = source.sender.id;
   const liveTitle = useSessionStore((state) => {
@@ -107,8 +160,43 @@ const SourceEntry = memo(function SourceEntry({
     [composerQuote, source.text],
   );
   const openSource = useCallback(() => {
-    if (host) navigateToAgent({ serverId: host, agentId: id });
-  }, [host, id]);
+    if (!host) return;
+    const params = resolveSourceOpenParams({
+      source,
+      host,
+      fallbackServerId,
+      mainAgentId,
+      workspaceId,
+      parentTabId,
+      title,
+      paneContext,
+    });
+    if (params.resolvedWorkspaceId) {
+      openSubagentFromTopic({
+        serverId: params.serverId,
+        workspaceId: params.resolvedWorkspaceId,
+        targetServerId: params.targetServerId,
+        targetAgentId: params.targetAgentId,
+        mainAgentId: params.mainAgentId,
+        topicKey: params.topicKey,
+        promptPreview: params.promptPreview,
+        parentTabId: params.parentTabId,
+        location: "side",
+      });
+      return;
+    }
+    navigateToAgent({ serverId: host, agentId: id });
+  }, [
+    fallbackServerId,
+    host,
+    id,
+    mainAgentId,
+    paneContext,
+    parentTabId,
+    source,
+    title,
+    workspaceId,
+  ]);
   const quoteReply = useCallback(() => {
     const quote = extractReplyQuoteSummary(source.text, { sourceTitle: title });
     if (quote) composerQuote?.addQuote({ quote, label: title });
@@ -139,7 +227,7 @@ const SourceEntry = memo(function SourceEntry({
             disabled={!host}
             testID="agent-source-tag"
           >
-            <ThemedExternalLink size={ICON_SIZE.sm} uniProps={mutedIconProps} />
+            <ThemedColumns2 size={ICON_SIZE.sm} uniProps={mutedIconProps} />
           </ToolbarButton>
           {details ? (
             <Button
@@ -177,11 +265,17 @@ const SourceEntry = memo(function SourceEntry({
 export function AgentSourceHeader({
   group,
   fallbackServerId,
+  mainAgentId,
+  workspaceId,
+  parentTabId,
   expanded,
   onExpandedChange,
 }: {
   group: AgentSourceGroup;
   fallbackServerId?: string;
+  mainAgentId?: string;
+  workspaceId?: string;
+  parentTabId?: string | null;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
 }) {
@@ -210,6 +304,9 @@ export function AgentSourceHeader({
           key={agentSourceKey(source)}
           source={source}
           fallbackServerId={fallbackServerId}
+          mainAgentId={mainAgentId}
+          workspaceId={workspaceId}
+          parentTabId={parentTabId}
           showPreview={showPreview}
           details={index === 0 ? details : undefined}
         />
@@ -231,8 +328,8 @@ const styles = StyleSheet.create((theme) => ({
     paddingVertical: theme.spacing[2],
   },
   inlineCard: {
-    alignSelf: "flex-end",
-    maxWidth: "85%",
+    alignSelf: "flex-start",
+    width: "100%",
   },
   unreadBar: {
     backgroundColor: theme.colors.statusSuccess,

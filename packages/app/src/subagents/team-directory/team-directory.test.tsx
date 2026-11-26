@@ -39,30 +39,41 @@ const runtime = vi.hoisted(() => ({
   archiveAgentSnapshot: vi.fn(),
 }));
 
-vi.mock("@/utils/app-visibility", () => ({ getIsAppActivelyVisible: () => true }));
+vi.mock("@/utils/app-visibility", () => ({
+  getIsAppVisible: () => true,
+  getIsAppActivelyVisible: () => true,
+}));
 
 vi.mock("lucide-react-native", async (original) => {
   const icons = await original<typeof import("lucide-react-native")>();
   const Icon = () => null;
-  return {
-    ...icons,
-    Archive: icons.Archive ?? Icon,
-    Check: icons.Check ?? Icon,
-    CheckCheck: icons.CheckCheck ?? Icon,
-    ChevronDown: icons.ChevronDown ?? Icon,
-    ChevronRight: icons.ChevronRight ?? Icon,
-    Columns2: icons.Columns2 ?? Icon,
-    ExternalLink: icons.ExternalLink ?? Icon,
-    MoreVertical: icons.MoreVertical ?? Icon,
-    PanelLeftClose: icons.PanelLeftClose ?? Icon,
-    Plus: icons.Plus ?? Icon,
-    RotateCcw: icons.RotateCcw ?? Icon,
-    Send: icons.Send ?? Icon,
-    Trash2: icons.Trash2 ?? Icon,
-    Unlink: icons.Unlink ?? Icon,
-    UserMinus: icons.UserMinus ?? Icon,
-    UserPlus: icons.UserPlus ?? Icon,
-  };
+  const mocked: Record<string, unknown> = { ...icons };
+  for (const name of [
+    "Archive",
+    "Bot",
+    "Check",
+    "CheckCheck",
+    "ChevronDown",
+    "ChevronRight",
+    "Clock",
+    "Columns2",
+    "CornerUpLeft",
+    "ExternalLink",
+    "MoreVertical",
+    "PanelLeftClose",
+    "Pencil",
+    "Plus",
+    "RotateCcw",
+    "Send",
+    "Square",
+    "Trash2",
+    "Unlink",
+    "UserMinus",
+    "UserPlus",
+  ]) {
+    mocked[name] = mocked[name] ?? Icon;
+  }
+  return mocked;
 });
 vi.mock("react-i18next", async (original) => ({
   ...(await original<typeof import("react-i18next")>()),
@@ -449,3 +460,41 @@ it.each(["clearOnUserInteraction", "clearOnPromptSend"] as const)(
     expect(onError).not.toHaveBeenCalled();
   },
 );
+
+it("renders three directory tabs (messages, todos, agents) and switches to todos view", () => {
+  useTeamDirectoryViewStore.getState().setActiveTab("messages");
+  setupDirectory({ supportsIdleArchive: true });
+
+  expect(screen.getByTestId("team-directory-tab-messages")).toBeTruthy();
+  expect(screen.getByTestId("team-directory-tab-todos")).toBeTruthy();
+  expect(screen.getByTestId("team-directory-tab-agents")).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("team-directory-tab-todos"));
+  expect(screen.getByTestId("team-directory-todos-view")).toBeTruthy();
+});
+
+it("suppressFocusClear prevents focusing main control from wiping topic unread state", () => {
+  const clearAgentAttention = vi.fn(async () => {});
+  const client = { clearAgentAttention } as unknown as DaemonClient;
+  const { result } = renderHook(() =>
+    useAgentAttentionClear({
+      agentId: "main-1",
+      client,
+      isConnected: true,
+      isAgentDataReady: true,
+      requiresAttention: true,
+      attentionReason: "finished",
+      isScreenFocused: true,
+      focusRequest: null,
+      suppressFocusClear: true,
+      onError: vi.fn(),
+    }),
+  );
+
+  act(() => {
+    result.current.clearOnInputFocus();
+    result.current.clearOnUserInteraction();
+    result.current.clearOnPromptSend();
+  });
+  expect(clearAgentAttention).not.toHaveBeenCalled();
+});

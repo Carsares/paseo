@@ -24,6 +24,7 @@ import {
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
+import { HoverEnvelope } from "@/agent-stream/topic-card/hover-envelope";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
 import { useRetainedPanelActive } from "@/components/retained-panel";
@@ -82,6 +83,8 @@ import { useArchiveSubagent } from "../use-archive-subagent";
 import { useDetachSubagent } from "../use-detach-subagent";
 import { selectTeamDirectoryMessages } from "./messages-model";
 import { DirectoryMessagesView } from "./messages-view";
+import { DirectoryTodosView } from "./todos-view";
+import { useWorkspaceTodos } from "@/todos/queries";
 import {
   isDirectlyCleanableTaskMember,
   selectTeamActivityGroups,
@@ -156,6 +159,92 @@ interface MemberRowActionHandlers {
   onArchive: (address: AgentAddress) => void;
   onDetach: (address: AgentAddress) => void;
   onResidentAction: ReturnType<typeof useOpenResidentDialog>;
+}
+
+function DirectoryTabBody({
+  activeTab,
+  serverId,
+  workspaceId,
+  mainAgentId,
+  readScopeKey,
+  client,
+  messagesProjection,
+  durableItems,
+  onFocusAgentById,
+  agentsContent,
+}: {
+  activeTab: TeamDirectoryTab;
+  serverId: string;
+  workspaceId: string;
+  mainAgentId: string | null;
+  readScopeKey: string;
+  client: ReturnType<typeof useHostRuntimeClient>;
+  messagesProjection: ReturnType<typeof selectTeamDirectoryMessages>;
+  durableItems: readonly WorkspaceDurableItem[];
+  onFocusAgentById: (agentId: string) => void;
+  agentsContent: React.ReactNode;
+}) {
+  if (activeTab === "messages") {
+    return (
+      <DirectoryMessagesView
+        serverId={serverId}
+        workspaceId={workspaceId}
+        mainAgentId={mainAgentId}
+        readScopeKey={readScopeKey}
+        client={client}
+        projection={messagesProjection}
+        onFocusAgentById={onFocusAgentById}
+      />
+    );
+  }
+  if (activeTab === "todos") {
+    return (
+      <DirectoryTodosView
+        serverId={serverId}
+        workspaceId={workspaceId}
+        mainAgentId={mainAgentId}
+        client={client}
+        durableItems={durableItems}
+        onFocusAgentById={onFocusAgentById}
+      />
+    );
+  }
+  return agentsContent;
+}
+
+function buildDirectoryTabOptions(input: {
+  unreadCount: number;
+  totalTodosTabCount: number;
+  runningCount: number;
+  t: TFunction;
+}): SegmentedControlOption<TeamDirectoryTab>[] {
+  const { unreadCount, totalTodosTabCount, runningCount, t } = input;
+  return [
+    {
+      value: "messages",
+      label:
+        unreadCount > 0
+          ? t("topicWorkbench.directory.tabMessagesCount", { count: unreadCount })
+          : t("topicWorkbench.directory.tabMessages"),
+      testID: "team-directory-tab-messages",
+    },
+    {
+      value: "todos",
+      label:
+        totalTodosTabCount > 0
+          ? t("topicWorkbench.directory.tabTodosCount", { count: totalTodosTabCount })
+          : t("topicWorkbench.directory.tabTodos"),
+      testID: "team-directory-tab-todos",
+    },
+    {
+      value: "agents",
+      label:
+        runningCount > 0
+          ? t("topicWorkbench.directory.tabAgentsCount", { count: runningCount })
+          : t("topicWorkbench.directory.tabAgents"),
+      testID: "team-directory-tab-agents",
+    },
+  ];
 }
 
 function allowsTopicMainResetPermissions(
@@ -939,28 +1028,17 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
     ],
   );
 
+  const { pendingCount: pendingTodoCount } = useWorkspaceTodos(serverId, workspaceId);
+  const pendingDurableCount = useMemo(
+    () => durableItems.filter((item) => item.status === "pending").length,
+    [durableItems],
+  );
+  const totalTodosTabCount = pendingTodoCount + pendingDurableCount;
   const unreadCount = messagesProjection.unread.length;
   const runningCount = directory.summary.runningCount;
   const tabOptions = useMemo<SegmentedControlOption<TeamDirectoryTab>[]>(
-    () => [
-      {
-        value: "messages",
-        label:
-          unreadCount > 0
-            ? t("topicWorkbench.directory.tabMessagesCount", { count: unreadCount })
-            : t("topicWorkbench.directory.tabMessages"),
-        testID: "team-directory-tab-messages",
-      },
-      {
-        value: "agents",
-        label:
-          runningCount > 0
-            ? t("topicWorkbench.directory.tabAgentsCount", { count: runningCount })
-            : t("topicWorkbench.directory.tabAgents"),
-        testID: "team-directory-tab-agents",
-      },
-    ],
-    [runningCount, t, unreadCount],
+    () => buildDirectoryTabOptions({ unreadCount, totalTodosTabCount, runningCount, t }),
+    [runningCount, t, totalTodosTabCount, unreadCount],
   );
 
   const groupModeOptions = useMemo<SegmentedControlOption<TeamDirectoryAgentGroupMode>[]>(
@@ -1007,83 +1085,84 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
 
       <ScrollView keyboardShouldPersistTaps="handled" style={styles.scroll}>
         <View style={styles.list}>
-          {activeTab === "messages" ? (
-            <DirectoryMessagesView
-              serverId={serverId}
-              workspaceId={workspaceId}
-              mainAgentId={mainAgentId}
-              readScopeKey={readScopeKey}
-              client={client}
-              projection={messagesProjection}
-              onFocusAgentById={handleFocusAgentById}
-            />
-          ) : (
-            <>
-              <View style={styles.groupSwitcherRow}>
-                <SegmentedControl
-                  size="sm"
-                  options={groupModeOptions}
-                  value={agentGroupMode}
-                  onValueChange={setAgentGroupMode}
-                  testID="team-directory-agent-group-mode"
-                />
-              </View>
+          <DirectoryTabBody
+            activeTab={activeTab}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            mainAgentId={mainAgentId}
+            readScopeKey={readScopeKey}
+            client={client}
+            messagesProjection={messagesProjection}
+            durableItems={durableItems}
+            onFocusAgentById={handleFocusAgentById}
+            agentsContent={
+              <>
+                <View style={styles.groupSwitcherRow}>
+                  <SegmentedControl
+                    size="sm"
+                    options={groupModeOptions}
+                    value={agentGroupMode}
+                    onValueChange={setAgentGroupMode}
+                    testID="team-directory-agent-group-mode"
+                  />
+                </View>
 
-              {agentGroupMode === "activity" ? (
-                <DirectoryActivityModeContent
-                  directory={directory}
-                  activityGroups={activityGroups}
-                  isTopicWorkspace={isTopicWorkspace}
-                  focusedProviderSubagentId={focusedProviderSubagentId}
-                  inactiveExpanded={activityInactiveExpanded}
-                  onToggleInactive={toggleActivityInactive}
-                  supportsIdleArchive={supportsIdleArchive}
-                  cleanupStatus={cleanupStatus}
-                  onCleanupPress={handleCleanupPress}
-                  onCreateResident={createResidentAction}
-                  onActivatePreset={handleActivatePreset}
-                  onOpenProviderSubrun={onOpenProviderSubrun}
-                  onAskFirstQuestion={onAskFirstQuestion}
+                {agentGroupMode === "activity" ? (
+                  <DirectoryActivityModeContent
+                    directory={directory}
+                    activityGroups={activityGroups}
+                    isTopicWorkspace={isTopicWorkspace}
+                    focusedProviderSubagentId={focusedProviderSubagentId}
+                    inactiveExpanded={activityInactiveExpanded}
+                    onToggleInactive={toggleActivityInactive}
+                    supportsIdleArchive={supportsIdleArchive}
+                    cleanupStatus={cleanupStatus}
+                    onCleanupPress={handleCleanupPress}
+                    onCreateResident={createResidentAction}
+                    onActivatePreset={handleActivatePreset}
+                    onOpenProviderSubrun={onOpenProviderSubrun}
+                    onAskFirstQuestion={onAskFirstQuestion}
+                    rowActions={rowActions}
+                  />
+                ) : (
+                  <DirectoryAttributeModeContent
+                    directory={directory}
+                    attributeGroups={attributeGroups}
+                    isTopicWorkspace={isTopicWorkspace}
+                    focusedProviderSubagentId={focusedProviderSubagentId}
+                    l1InactiveExpanded={l1InactiveExpanded}
+                    onToggleL1Inactive={toggleL1Inactive}
+                    l2InactiveExpanded={l2InactiveExpanded}
+                    onToggleL2Inactive={toggleL2Inactive}
+                    supportsIdleArchive={supportsIdleArchive}
+                    cleanupStatus={cleanupStatus}
+                    onCleanupPress={handleCleanupPress}
+                    onCreateResident={createResidentAction}
+                    onActivatePreset={handleActivatePreset}
+                    onOpenProviderSubrun={onOpenProviderSubrun}
+                    onAskFirstQuestion={onAskFirstQuestion}
+                    rowActions={rowActions}
+                  />
+                )}
+
+                <DirectoryHistorySection
+                  expanded={historyExpanded}
+                  onToggle={toggleHistory}
+                  members={directory.historyMembers}
+                  hasLoadedOnce={history.hasLoadedOnce}
+                  hasMore={history.hasMore}
+                  isLoading={history.isLoading}
+                  isLoadingMore={history.isLoadingMore}
+                  isError={history.isError}
+                  supportsWorkspaceHistory={history.supportsWorkspaceHistory}
+                  onLoadMore={history.loadMore}
+                  onRetry={history.refetch}
+                  groupMode={agentGroupMode}
                   rowActions={rowActions}
                 />
-              ) : (
-                <DirectoryAttributeModeContent
-                  directory={directory}
-                  attributeGroups={attributeGroups}
-                  isTopicWorkspace={isTopicWorkspace}
-                  focusedProviderSubagentId={focusedProviderSubagentId}
-                  l1InactiveExpanded={l1InactiveExpanded}
-                  onToggleL1Inactive={toggleL1Inactive}
-                  l2InactiveExpanded={l2InactiveExpanded}
-                  onToggleL2Inactive={toggleL2Inactive}
-                  supportsIdleArchive={supportsIdleArchive}
-                  cleanupStatus={cleanupStatus}
-                  onCleanupPress={handleCleanupPress}
-                  onCreateResident={createResidentAction}
-                  onActivatePreset={handleActivatePreset}
-                  onOpenProviderSubrun={onOpenProviderSubrun}
-                  onAskFirstQuestion={onAskFirstQuestion}
-                  rowActions={rowActions}
-                />
-              )}
-
-              <DirectoryHistorySection
-                expanded={historyExpanded}
-                onToggle={toggleHistory}
-                members={directory.historyMembers}
-                hasLoadedOnce={history.hasLoadedOnce}
-                hasMore={history.hasMore}
-                isLoading={history.isLoading}
-                isLoadingMore={history.isLoadingMore}
-                isError={history.isError}
-                supportsWorkspaceHistory={history.supportsWorkspaceHistory}
-                onLoadMore={history.loadMore}
-                onRetry={history.refetch}
-                groupMode={agentGroupMode}
-                rowActions={rowActions}
-              />
-            </>
-          )}
+              </>
+            }
+          />
         </View>
       </ScrollView>
     </View>
@@ -1838,8 +1917,6 @@ const TeamMemberRow = memo(function TeamMemberRow({
   const isCompact = useIsCompactFormFactor();
   const isFocused = node.serverId === serverId && node.agentId === focusedAgentId;
   const [isHovered, setIsHovered] = useState(false);
-  const handlePointerEnter = useCallback(() => setIsHovered(true), []);
-  const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const { showKebab, menuProps } = useOpenKebabMenuVisibility(isHovered || isNative || isCompact);
 
   const label = node.residentRole ?? node.title;
@@ -1884,14 +1961,13 @@ const TeamMemberRow = memo(function TeamMemberRow({
     : `${label}, ${statusText}`;
 
   return (
-    <View
+    <HoverEnvelope
       style={[
         styles.rowContainer,
         isHovered && !isFocused && styles.rowHovered,
         isFocused && styles.rowFocused,
       ]}
-      onPointerEnter={handlePointerEnter}
-      onPointerLeave={handlePointerLeave}
+      onHoverChange={setIsHovered}
     >
       <PressHighlight
         testID={`team-directory-row-${node.agentId}`}
@@ -1942,7 +2018,7 @@ const TeamMemberRow = memo(function TeamMemberRow({
         onArchive={handleArchive}
         onResidentAction={onResidentAction}
       />
-    </View>
+    </HoverEnvelope>
   );
 });
 

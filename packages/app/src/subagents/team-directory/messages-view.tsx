@@ -1,8 +1,10 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCheck, Send } from "lucide-react-native";
 import { memo, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
+import { HoverEnvelope } from "@/agent-stream/topic-card/hover-envelope";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
@@ -11,6 +13,7 @@ import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
 import { DurableItemCard } from "@/durable-items/card";
 import { useTopicInboxReadStore } from "@/stores/topic-inbox-read-store";
+import { markAllTopicsReadOnHost } from "@/topic-read/queries";
 import type { Theme } from "@/styles/theme";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { getStatusDotColor } from "@/utils/status-dot-color";
@@ -57,6 +60,7 @@ export const DirectoryMessagesView = memo(function DirectoryMessagesView({
   onFocusAgentById,
 }: DirectoryMessagesViewProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const markItemRead = useTopicInboxReadStore((state) => state.markItemRead);
   const markAllRead = useTopicInboxReadStore((state) => state.markAllRead);
   const jumpStore = useOptionalTeamMessageJumpStore();
@@ -95,14 +99,30 @@ export const DirectoryMessagesView = memo(function DirectoryMessagesView({
   const hasMarkableUnread = (projection.markAllSnapshot.itemIds?.length ?? 0) > 0;
   const onMarkAllPress = useCallback(() => {
     markAllRead(readScopeKey, projection.markAllSnapshot);
+    if (mainAgentId) {
+      void markAllTopicsReadOnHost({
+        queryClient,
+        serverId,
+        workspaceId,
+        mainAgentId,
+        epoch: projection.markAllSnapshot.epoch ?? null,
+        maxSeq: projection.markAllSnapshot.maxSeq ?? null,
+        maxTimestampMs: projection.markAllSnapshot.maxTimestampMs ?? null,
+        fallbackItemIds: projection.markAllSnapshot.itemIds,
+      }).catch(() => undefined);
+    }
     const conclusion = projection.unread.find((item) => item.kind === "main_conclusion");
     if (conclusion) clearConclusionAttention(conclusion);
   }, [
     clearConclusionAttention,
+    mainAgentId,
     markAllRead,
     projection.markAllSnapshot,
     projection.unread,
+    queryClient,
     readScopeKey,
+    serverId,
+    workspaceId,
   ]);
 
   const handleMarkSingleRead = useCallback(
@@ -233,8 +253,6 @@ const MessageItemRow = memo(function MessageItemRow({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const [isHovered, setIsHovered] = useState(false);
-  const handlePointerEnter = useCallback(() => setIsHovered(true), []);
-  const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const handlePress = useCallback(() => onPress(item), [item, onPress]);
   const handleMarkRead = useCallback(() => onMarkRead?.(item), [item, onMarkRead]);
   const handleCloseDurable = useCallback(() => onPress(item), [item, onPress]);
@@ -247,10 +265,9 @@ const MessageItemRow = memo(function MessageItemRow({
 
   return (
     <View style={styles.itemBlock}>
-      <View
+      <HoverEnvelope
         style={[styles.rowOuter, isHovered && styles.rowOuterHovered]}
-        onPointerEnter={handlePointerEnter}
-        onPointerLeave={handlePointerLeave}
+        onHoverChange={setIsHovered}
       >
         <PressHighlight
           accessibilityRole="button"
@@ -293,7 +310,7 @@ const MessageItemRow = memo(function MessageItemRow({
             </ToolbarButton>
           </View>
         ) : null}
-      </View>
+      </HoverEnvelope>
       {expandedDurable && item.durableItem ? (
         <View style={styles.durableDetail}>
           <DurableItemCard serverId={serverId} item={item.durableItem} />

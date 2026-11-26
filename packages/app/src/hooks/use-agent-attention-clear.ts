@@ -18,6 +18,8 @@ interface UseAgentAttentionClearParams {
   attentionReason: AttentionReason;
   isScreenFocused: boolean;
   focusRequest: object | null;
+  /** When true (topic-stream main control with per-topic read state), focus does not wipe unread attention. */
+  suppressFocusClear?: boolean;
   onError: (error: unknown) => void;
 }
 
@@ -36,6 +38,7 @@ export function useAgentAttentionClear({
   attentionReason,
   isScreenFocused,
   focusRequest,
+  suppressFocusClear = false,
   onError,
 }: UseAgentAttentionClearParams): AgentAttentionClearController {
   const jumpStore = useOptionalTeamMessageJumpStore();
@@ -93,7 +96,8 @@ export function useAgentAttentionClear({
     if (focused && agentId && jumpStore?.consumeNavigationFocus(agentId)) {
       navigationFocusAgent.current = agentId;
     }
-    const suppressFocus = Boolean(agentId && navigationFocusAgent.current === agentId);
+    const suppressFocus =
+      suppressFocusClear || Boolean(agentId && navigationFocusAgent.current === agentId);
     controller.update({
       focused,
       ready: suppressFocus || Boolean(client && agentId && isConnected && isAgentDataReady),
@@ -112,10 +116,12 @@ export function useAgentAttentionClear({
     requiresAttention,
     attentionReason,
     focusRequest,
+    suppressFocusClear,
     jumpStore,
   ]);
 
   const clearOnInteraction = useStableEvent(() => {
+    if (suppressFocusClear) return;
     controller.update({
       focused: isScreenFocused && isAppVisible,
       ready: Boolean(client && agentId && isConnected && isAgentDataReady),
@@ -125,7 +131,12 @@ export function useAgentAttentionClear({
     });
     controller.focus();
   });
+  const clearOnPromptSend = useStableEvent(() => {
+    if (suppressFocusClear) return;
+    clearOnInteraction();
+  });
   const clearOnInputFocus = useStableEvent(() => {
+    if (suppressFocusClear) return;
     if (
       agentId &&
       (navigationFocusAgent.current === agentId || jumpStore?.consumeNavigationFocus(agentId))
@@ -138,6 +149,6 @@ export function useAgentAttentionClear({
   return {
     clearOnInputFocus,
     clearOnUserInteraction: clearOnInteraction,
-    clearOnPromptSend: clearOnInteraction,
+    clearOnPromptSend,
   };
 }

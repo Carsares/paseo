@@ -5,6 +5,8 @@ const supersessionSchema = z.object({
   id: z.string().uuid(),
   finishedIds: z.array(z.string().startsWith("automatic-parent:")).max(64),
   turnId: z.string().optional(),
+  taskId: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
 });
 
 /** Push and pull share this opaque ID, including when either peer runs an older daemon. */
@@ -12,9 +14,14 @@ export function encodeParentReportIdentity(
   id: string,
   finishedIds: string[],
   turnId: string | undefined,
+  topic?: { taskId?: string; rootMessageId?: string },
 ): string {
-  if (!finishedIds.length && !turnId) return id;
-  return prefix + JSON.stringify({ id, finishedIds: finishedIds.slice(0, 64), turnId });
+  const { taskId, rootMessageId } = topic ?? {};
+  if (!finishedIds.length && !turnId && !taskId && !rootMessageId) return id;
+  return (
+    prefix +
+    JSON.stringify({ id, finishedIds: finishedIds.slice(0, 64), turnId, taskId, rootMessageId })
+  );
 }
 
 export function decodeParentReportIdentity(id: string): z.infer<typeof supersessionSchema> {

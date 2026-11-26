@@ -979,3 +979,88 @@ test(
   },
   TEST_TIMEOUT,
 );
+
+test(
+  "keeps Main Control attention until both topic cards have been read over WebSocket",
+  async (context) => {
+    const daemon = await startDaemon(context);
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION);
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Read both conclusions",
+        topic: { summary: "Read both conclusions" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    await openInteractiveAgent(socket, mainAgentId);
+    const manager = daemon.daemon.agentManager;
+    const mark = async (messageId: string, turnId: string, reportCallId?: string) => {
+      const { rows } = manager.fetchTimeline(mainAgentId, { limit: 0 });
+      const reply = rows.findLast((row) =>
+        reportCallId
+          ? row.item.type === "tool_call" && row.item.callId === reportCallId
+          : row.turnId === turnId && row.item.type === "assistant_message",
+      );
+      if (!reply) throw new Error(`No assistant reply for ${messageId}`);
+      const { payload } = await request(
+        socket,
+        {
+          type: "workspace.topic_read.mark.request",
+          workspaceId: topic.workspace.id,
+          mainAgentId,
+          topicKey: `msg:${messageId}`,
+          mode: "read",
+          seq: reply.seqEnd,
+          timestampMs: Date.parse(reply.timestamp),
+        },
+        "workspace.topic_read.mark.response",
+      );
+      expect(payload.error).toBeNull();
+    };
+    const run = async (clientMessageId: string, reportFor?: string) => {
+      for await (const event of manager.streamAgent(mainAgentId, clientMessageId, {
+        clientMessageId,
+      })) {
+        if (reportFor && event.type === "turn_started") {
+          await manager.appendTimelineItem(mainAgentId, {
+            type: "tool_call",
+            callId: "cross-turn-report-a",
+            name: "agent_message",
+            status: "completed",
+            error: null,
+            detail: { type: "plain_text", text: "A's specialist report" },
+            agentMessage: {
+              event: "message",
+              sender: { id: "specialist-a" },
+              rootMessageId: reportFor,
+              text: "A's specialist report",
+            },
+          });
+        }
+      }
+      const user = manager
+        .fetchTimeline(mainAgentId, { limit: 0 })
+        .rows.find(
+          ({ item }) => item.type === "user_message" && item.clientMessageId === clientMessageId,
+        );
+      if (!user?.turnId || user.item.type !== "user_message") throw new Error("Missing turn ID");
+      return { root: user.item.messageId ?? clientMessageId, turnId: user.turnId };
+    };
+    const a = await run("read-a");
+    const b = await run("read-b", a.root);
+    expect(manager.getAgent(mainAgentId)?.attention).toMatchObject({
+      requiresAttention: true,
+      attentionReason: "finished",
+    });
+    await mark(b.root, b.turnId);
+    expect(manager.getAgent(mainAgentId)?.attention.requiresAttention).toBe(true);
+    await mark(a.root, a.turnId);
+    expect(manager.getAgent(mainAgentId)?.attention.requiresAttention).toBe(true);
+    await mark(a.root, a.turnId, "cross-turn-report-a");
+    expect(manager.getAgent(mainAgentId)?.attention).toEqual({ requiresAttention: false });
+  },
+  TEST_TIMEOUT,
+);

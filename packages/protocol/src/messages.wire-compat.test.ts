@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
+import { AgentMessageSchema } from "./agent-message.js";
 import {
+  AgentInboxFlushRequestSchema,
   AgentProfileSchema,
   MutableDaemonConfigSchema,
   MutableDaemonConfigPatchSchema,
@@ -28,8 +30,111 @@ import {
   WorkspaceBaseBranchSetRequestSchema,
   WorkspaceBaseBranchSetResponseSchema,
   WorkspaceCreateRequestSchema,
+  PendingSubagentInboxItemSchema,
+  WorkspaceDurableItemSchema,
+  WorkspaceTaskSummarySchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("topic bindings extend legacy reports, inbox items, flush requests and task summaries", () => {
+  const binding = { taskId: "task-1", rootMessageId: "prompt-1" };
+  const report = { event: "finished", sender: { id: "child" }, text: "Report" };
+  const inboxItem = { agentId: "child", event: "finished", reportStatus: "completed" };
+  const flush = { type: "agent.inbox.flush.request", agentId: "parent", requestId: "flush-1" };
+  const timestamp = "2026-11-26T00:00:00.000Z";
+  const task = {
+    taskId: binding.taskId,
+    title: "Inspect startup",
+    status: "in_progress",
+    tier: "T1",
+    participants: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const taskDetails = {
+    rootMessageId: binding.rootMessageId,
+    leadAgentId: "child",
+    leadServerId: "host-1",
+    conclusionMessageId: "reply-1",
+    latestReplyPreview: "",
+  };
+  const taskWithDetails = { ...task, ...taskDetails };
+
+  expect(AgentMessageSchema.parse(report)).toEqual(report);
+  expect(AgentMessageSchema.parse({ ...report, ...binding })).toEqual({ ...report, ...binding });
+  expect(
+    AgentMessageSchema.omit({ taskId: true, rootMessageId: true }).parse({ ...report, ...binding }),
+  ).toEqual(report);
+  expect(PendingSubagentInboxItemSchema.parse(inboxItem)).toEqual(inboxItem);
+  expect(PendingSubagentInboxItemSchema.parse({ ...inboxItem, ...binding })).toEqual({
+    ...inboxItem,
+    ...binding,
+  });
+  expect(
+    PendingSubagentInboxItemSchema.omit({ taskId: true, rootMessageId: true }).parse({
+      ...inboxItem,
+      ...binding,
+    }),
+  ).toEqual(inboxItem);
+  expect(SessionInboundMessageSchema.parse(flush)).toEqual(flush);
+  expect(SessionInboundMessageSchema.parse({ ...flush, taskId: binding.taskId })).toEqual({
+    ...flush,
+    taskId: binding.taskId,
+  });
+  expect(
+    AgentInboxFlushRequestSchema.omit({ taskId: true }).parse({ ...flush, taskId: binding.taskId }),
+  ).toEqual(flush);
+  expect(SessionInboundMessageSchema.safeParse({ ...flush, taskId: "" }).success).toBe(false);
+  expect(WorkspaceTaskSummarySchema.parse(task)).toEqual(task);
+  expect(WorkspaceTaskSummarySchema.parse(taskWithDetails)).toEqual(taskWithDetails);
+  expect(
+    WorkspaceTaskSummarySchema.omit({
+      rootMessageId: true,
+      leadAgentId: true,
+      leadServerId: true,
+      conclusionMessageId: true,
+      latestReplyPreview: true,
+    }).parse(taskWithDetails),
+  ).toEqual(task);
+
+  const durableItem = {
+    workspaceId: "ws-1",
+    requestId: "durable-1",
+    sourceAgentId: "agent-1",
+    sourceTurnId: "turn-1",
+    kind: "authorization" as const,
+    title: "Approve change",
+    evidence: [],
+    revision: 0,
+    createdAt: timestamp,
+    status: "pending" as const,
+  };
+  expect(WorkspaceDurableItemSchema.parse(durableItem)).toEqual(durableItem);
+  expect(WorkspaceDurableItemSchema.safeParse({ ...durableItem, kind: "todo" }).success).toBe(
+    false,
+  );
+});
+
+test("topic feature flags survive status validation and stay optional for older hosts", () => {
+  const oldFeatures = { agentCreateAsMain: true };
+  const legacyInfo = { status: "server_info", serverId: "host", features: oldFeatures };
+  const features = {
+    ...oldFeatures,
+    workspaceTopicThreads: true,
+    workspaceTopicReadState: false,
+    workspaceTodos: true,
+  };
+  const info = { ...legacyInfo, features };
+  expect(ServerInfoStatusPayloadSchema.parse(legacyInfo).features).toEqual(oldFeatures);
+  expect(ServerInfoStatusPayloadSchema.parse(info).features).toEqual(features);
+  expect(z.object({ agentCreateAsMain: z.boolean() }).parse(features)).toEqual(oldFeatures);
+  const envelope = { type: "session", message: { type: "status", payload: info } };
+  expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  expect(
+    ServerInfoStatusPayloadSchema.safeParse({ ...info, features: { workspaceTodos: "true" } })
+      .success,
+  ).toBe(false);
+});
 
 test("idle archive extends the current archive request and host feature shapes", () => {
   const legacyRequest = {

@@ -1328,9 +1328,17 @@ test("push and pull confirm the same report while its push is still pending", as
     title: "Child",
     summary: "Ready",
     turnId: "turn-1",
+    taskId: "task-1",
+    rootMessageId: "root-1",
   });
   const pushedId = await pushed.promise;
-  expect(decodeParentReportIdentity(pushedId)).toEqual({ id, turnId: "turn-1", finishedIds: [] });
+  expect(decodeParentReportIdentity(pushedId)).toEqual({
+    id,
+    turnId: "turn-1",
+    finishedIds: [],
+    taskId: "task-1",
+    rootMessageId: "root-1",
+  });
   const pulled = await service.pullReports(address, [], true, "active", true);
   expect(pulled.reports).toMatchObject([{ id: pushedId }]);
   expect(await service.confirmParentReport(pair, pushedId)).toBe(true);

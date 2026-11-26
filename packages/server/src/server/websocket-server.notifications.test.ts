@@ -13,6 +13,7 @@ import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
 import type { PushNotificationSender, PushPayload } from "./push/index.js";
 import type { WorkspaceAutoName } from "./workspace-auto-name.js";
+import type { ClaimedTodoDeadline } from "./todos/store.js";
 
 const WORKSPACE_ID = "workspace-1";
 
@@ -47,6 +48,7 @@ import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 
 interface WebSocketServerInternals {
   sessions: Map<unknown, unknown>;
+  handleTodoDue(trigger: ClaimedTodoDeadline): Promise<void>;
   broadcastAgentAttention(params: {
     agentId: string;
     reason: string;
@@ -88,6 +90,7 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
   const agentManager = {
     subscribe: vi.fn(() => () => {}),
     onStop: () => () => {},
+    configureRewindCheckpoints: vi.fn(),
     setAgentAttentionCallback: vi.fn(),
     getAgent: vi.fn(() => ({ workspaceId: WORKSPACE_ID, pendingPermissions: new Map() })),
     getLastAssistantMessage: vi.fn(async () => null),
@@ -175,11 +178,13 @@ function createSessionWithActivity(
     appVisibilityChangedAt?: Date;
   } | null,
   subscribed = true,
+  workspaceTodos = false,
 ) {
   return {
     getClientActivity: vi.fn(() => activity),
     supports: () => false,
-    supportsForSource: () => false,
+    supportsForSource: () => workspaceTodos,
+    getPermissions: () => ["workspace.read"],
     subscribesToAgent: vi.fn(async () => subscribed),
   };
 }
@@ -193,18 +198,31 @@ function connectClient(
     appVisible: boolean;
     appVisibilityChangedAt?: Date;
   } | null,
-  options: { subscribed?: boolean } = {},
+  options: { subscribed?: boolean; workspaceTodos?: boolean; workspaceRead?: boolean } = {},
 ) {
   const ws = createOpenSocket();
   const delivery = new SessionDelivery(() => {});
   delivery.attach(ws, false);
+  const session = {
+    ...createSessionWithActivity(
+      activity,
+      options.subscribed ?? true,
+      options.workspaceTodos ?? false,
+    ),
+    getPermissions: () => (options.workspaceRead === false ? [] : ["workspace.read"]),
+    emitCapabilityMessageToSource: vi.fn(
+      (_capability: string, source: object, message: unknown) => {
+        (source as ReturnType<typeof createOpenSocket>).send(
+          JSON.stringify({ type: "session", message }),
+        );
+      },
+    ),
+    delivery,
+    wantsSourceNotification: () => true,
+  };
   asInternals<WebSocketServerInternals>(server).sessions.set(ws, {
     kind: "trusted",
-    session: {
-      ...createSessionWithActivity(activity, options.subscribed ?? true),
-      delivery,
-      wantsSourceNotification: () => true,
-    },
+    session,
     clientId: "client-test",
     appVersion: null,
     connectionLogger: createLogger(),
@@ -372,6 +390,123 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
     expect(readAttentionRequiredMessage(ws).shouldNotify).toBe(false);
     expect(pushNotifications.sent).toEqual([]);
   });
+
+  it("routes a todo due notification to one present client and does not push", async () => {
+    const { server, pushNotifications } = createServer();
+    const now = Date.now();
+    const recentWs = connectClient(
+      server,
+      {
+        deviceType: "web",
+        appVisible: false,
+        focusedAgentId: null,
+        lastActivityAt: new Date(now - 5_000),
+      },
+      { workspaceTodos: true },
+    );
+    const staleWs = connectClient(
+      server,
+      {
+        deviceType: "mobile",
+        appVisible: false,
+        focusedAgentId: null,
+        lastActivityAt: new Date(now - 300_000),
+      },
+      { workspaceTodos: true },
+    );
+    const focusedButIneligible = {
+      deviceType: "web" as const,
+      appVisible: true,
+      focusedAgentId: "main-1",
+      lastActivityAt: new Date(now),
+    };
+    const legacy = connectClient(server, focusedButIneligible);
+    const restricted = connectClient(server, focusedButIneligible, {
+      workspaceTodos: true,
+      workspaceRead: false,
+    });
+
+    await asInternals<WebSocketServerInternals>(server).handleTodoDue({
+      kind: "due",
+      item: {
+        todoId: "todo-1",
+        workspaceId: WORKSPACE_ID,
+        title: "Review the result",
+        status: "pending",
+        checklist: [],
+        dueAt: new Date(now - 1_000).toISOString(),
+        remindBeforeMinutes: null,
+        snoozedUntil: null,
+        lastDueNotifiedAt: null,
+        source: {
+          mainAgentId: "main-1",
+          topicKey: "topic-1",
+          topicTitlePreview: "Review thread",
+        },
+        assignedAgentId: null,
+        revision: 1,
+        createdAt: new Date(now - 10_000).toISOString(),
+        updatedAt: new Date(now - 10_000).toISOString(),
+        completedAt: null,
+      },
+    });
+
+    const readTodoMessage = (ws: ReturnType<typeof createOpenSocket>) => {
+      const raw = ws.send.mock.calls[0]?.[0];
+      expect(typeof raw).toBe("string");
+      if (typeof raw !== "string") throw new Error("Expected todo session frame");
+      return JSON.parse(raw).message;
+    };
+    expect(readTodoMessage(recentWs).payload.shouldNotify).toBe(true);
+    expect(readTodoMessage(staleWs).payload.shouldNotify).toBe(false);
+    expect(legacy.send).not.toHaveBeenCalled();
+    expect(restricted.send).not.toHaveBeenCalled();
+    expect(pushNotifications.sent).toEqual([]);
+  });
+
+  it.each([{ mainAgentId: "main-2", topicKey: "task-2", topicTitlePreview: "Release task" }, null])(
+    "pushes the complete mobile routing contract for a todo with source %j",
+    async (source) => {
+      const { server, pushNotifications } = createServer();
+      await asInternals<WebSocketServerInternals>(server).handleTodoDue({
+        kind: "remind_before",
+        item: {
+          todoId: "todo-2",
+          workspaceId: WORKSPACE_ID,
+          title: "Prepare the release",
+          status: "pending",
+          checklist: [],
+          dueAt: "2026-11-26T10:00:00.000Z",
+          remindBeforeMinutes: 15,
+          snoozedUntil: null,
+          lastDueNotifiedAt: null,
+          source,
+          assignedAgentId: null,
+          revision: 3,
+          createdAt: "2026-11-26T09:00:00.000Z",
+          updatedAt: "2026-11-26T09:30:00.000Z",
+          completedAt: null,
+        },
+      });
+
+      expect(pushNotifications.sent).toEqual([
+        {
+          title: "Todo reminder",
+          body: "Prepare the release",
+          data: {
+            serverId: "srv-test",
+            reason: "todo_due",
+            type: "workspace.todo.due_triggered",
+            workspaceId: WORKSPACE_ID,
+            todoId: "todo-2",
+            agentId: source?.mainAgentId ?? "",
+            topicKey: source?.topicKey ?? "",
+          },
+        },
+      ]);
+    },
+  );
+
   it("notifies once while an agent's finish stays unread", async () => {
     const { server, pushNotifications } = createServer();
     const broadcast = (attentionTimestamp: Date) =>

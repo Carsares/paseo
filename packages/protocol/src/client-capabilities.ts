@@ -60,6 +60,9 @@ export const CLIENT_CAPS = {
   // An agent sender's steer means wait-for-turn-end from clients without it, because older
   // CLIs and connected hosts send an explicit steer for every default agent send.
   agentActiveTurnBehaviors: "agent_active_turn_behaviors",
+  workspaceTopicThreads: "workspace_topic_threads",
+  workspaceTopicReadState: "workspace_topic_read_state",
+  workspaceTodos: "workspace_todos",
 } as const;
 
 export type ClientCapability = (typeof CLIENT_CAPS)[keyof typeof CLIENT_CAPS];

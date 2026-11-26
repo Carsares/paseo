@@ -10,9 +10,85 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { expect, test } from "vitest";
 import type { AgentManager } from "./agent/agent-manager.js";
+import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
 import { createJsonFinishSubscriptionStore } from "./agent/finish-subscriptions/internal/json-store.js";
 import { DaemonClient, createTestPaseoDaemon } from "./test-utils/index.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
+
+test("a busy child only holds reports for its own task in the parent inbox", async () => {
+  const release = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const handle = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      async beforeTurnComplete(prompt) {
+        if (prompt !== "Hold task A") return;
+        started.resolve();
+        await release.promise;
+      },
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+  const tools: Client[] = [];
+  try {
+    await client.connect();
+    const { agentManager, agentStorage } = handle.daemon;
+    const config = { provider: "codex" as const, cwd: handle.staticDir };
+    const parent = await client.createAgent(config);
+    const workspaceId = (await agentStorage.get(parent.id))!.workspaceId;
+    await agentManager.setAgentMainControl(parent.id, true);
+    const createChild = (taskId?: string) =>
+      agentManager.createAgent(config, undefined, {
+        workspaceId,
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: parent.id,
+          [PARENT_REPORTING_LABEL]: "explicit",
+          ...(taskId ? { [TASK_ID_LABEL]: taskId } : {}),
+        },
+      });
+    const busy = await createChild("task-a");
+    await client.sendMessage(busy.id, "Hold task A");
+    await started.promise;
+    const report = async (taskId: string | undefined, summary: string) => {
+      const child = await createChild(taskId);
+      const tool = new Client({ name: child.id, version: "1" });
+      tools.push(tool);
+      await tool.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${handle.port}/mcp/agents?callerAgentId=${child.id}`),
+        ),
+      );
+      const result = await tool.callTool({
+        name: "report_to_parent",
+        arguments: { status: "completed", summary },
+      });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      return child.id;
+    };
+    const inbox = async () => (await client.fetchAgent(parent.id))?.agent.pendingSubagentInbox;
+    const fromA = await report("task-a", "Held result for A");
+    await expect
+      .poll(inbox)
+      .toMatchObject({ count: 1, items: [{ agentId: fromA, taskId: "task-a" }] });
+    const fromB = await report("task-b", "Independent result for B");
+    const legacy = await report(undefined, "Independent unbound result");
+    const delivered = () =>
+      agentManager
+        .getTimeline(parent.id)
+        .flatMap((item) =>
+          item.type === "tool_call" && item.agentMessage ? [item.agentMessage.sender.id] : [],
+        );
+    await expect.poll(delivered, { timeout: 8_000 }).toEqual([fromB, legacy]);
+    expect(await inbox()).toMatchObject({ count: 1, items: [{ agentId: fromA }] });
+    expect(agentManager.hasInFlightRun(busy.id)).toBe(true);
+    await client.flushAgentInbox(parent.id);
+    await expect.poll(delivered, { timeout: 8_000 }).toEqual([fromB, legacy, fromA]);
+  } finally {
+    release.resolve();
+    await Promise.allSettled(tools.map((tool) => tool.close()));
+    await client.close();
+    await handle.close();
+  }
+}, 15_000);
 
 test.each(["reparent", "handoff", "resident conversion"] as const)(
   "retires the parent's automatic completion subscription after %s",

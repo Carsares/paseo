@@ -192,6 +192,8 @@ import {
   readAgentHierarchyPath,
   RESERVED_HIERARCHY_LABELS_ERROR,
   requiresSingleHopOrchestration,
+  TASK_ID_LABEL,
+  TOPIC_ROOT_MESSAGE_ID_LABEL,
   validateCanSpawnChild,
   validateSingleHopOrchestration,
   type HierarchyAgent,
@@ -3408,7 +3410,7 @@ function createToolCatalog(
     }
     // Local host operations can call this handler without going through the outer tool parser.
     input = WorkspaceTaskToolInputSchema.parse(input);
-    const workspaceId = await withTaskLedger(undefined, async (ledger, id) => {
+    const { workspaceId, existingRoot } = await withTaskLedger(undefined, async (ledger, id) => {
       const current = (await ledger.list(id)).find((task) => task.taskId === input.taskId);
       if (!current && input.title === undefined) {
         throw new PaseoToolInputError("A title is required to create a workspace task.");
@@ -3421,8 +3423,24 @@ function createToolCatalog(
           "A workspace task with failed verification cannot be completed.",
         );
       }
-      return id;
+      return { workspaceId: id, existingRoot: current?.rootMessageId };
     });
+    const caller = agentManager.getAgent(callerAgentId!);
+    const turnId = caller?.activeForegroundTurnId ?? caller?.activeTurnId;
+    const rootRow =
+      !existingRoot && turnId
+        ? (await agentManager.getTimelineRows(callerAgentId!)).find(
+            ({ item, turnId: rowTurn }) =>
+              rowTurn === turnId &&
+              item.type === "user_message" &&
+              isLocalHumanTimelineMessage(item.text),
+          )
+        : undefined;
+    const rootMessageId =
+      existingRoot ??
+      (rootRow?.item.type === "user_message"
+        ? (rootRow.item.messageId ?? rootRow.item.clientMessageId)
+        : undefined);
     const localServer = options.serverId ?? "self";
     const admission: TaskDispatchAdmission = {};
     const checkCaller = agentManager.taskDispatchCaller(callerAgentId!, workspaceId);
@@ -3452,6 +3470,9 @@ function createToolCatalog(
       run<T>(operation: () => T, messageId?: string) {
         admission.messageId = messageId;
         return runWithTaskDispatchAdmission(admission, operation);
+      },
+      prepareRecipient(agentId: string) {
+        admission.beforeProviderDispatch = () => this.labelTarget(agentId);
       },
       async validateDispatch(agentId: string) {
         try {
@@ -3494,6 +3515,23 @@ function createToolCatalog(
           throw new TaskDispatchRejectedError(error.message);
         }
       },
+      async labelTarget(agentId: string) {
+        await this.validateDispatch(agentId);
+        const target = agentManager.getAgent(agentId);
+        // A replacement checks its handoff before canceling, then again before its new
+        // provider turn. Keep the old turn's labels until that turn actually ends.
+        if (!target || target.activeForegroundTurnId || target.activeTurnId) return;
+        if (
+          target.labels?.[TASK_ID_LABEL] === input.taskId &&
+          (target.labels?.[TOPIC_ROOT_MESSAGE_ID_LABEL] ?? "") === (rootMessageId ?? "")
+        )
+          return;
+        await agentManager.setLabels(agentId, {
+          [TASK_ID_LABEL]: input.taskId,
+          [TOPIC_ROOT_MESSAGE_ID_LABEL]: rootMessageId ?? "",
+        });
+        admission.assertCurrent?.();
+      },
       close() {
         capture?.close();
       },
@@ -3523,7 +3561,13 @@ function createToolCatalog(
             }
             const task = await ledger.upsert(
               id,
-              { ...input, participants: [{ agentId, boundBy: callerId }] },
+              {
+                ...input,
+                rootMessageId,
+                leadAgentId: agentId,
+                leadServerId: options.serverId,
+                participants: [{ agentId, boundBy: callerId }],
+              },
               events,
             );
             return { taskId: task.taskId };
@@ -4503,7 +4547,7 @@ function createToolCatalog(
               validateInitialPromptDispatch:
                 taskBinding || activePeerTurn
                   ? async (createdAgentId) => {
-                      await taskBinding?.validateDispatch(createdAgentId);
+                      await taskBinding?.labelTarget(createdAgentId);
                       if (activePeerTurn) {
                         const [firstCorrelationId] = activePeerTurn.correlationIds;
                         if (firstCorrelationId) {
@@ -5308,6 +5352,7 @@ function createToolCatalog(
       throw new PaseoToolInputError("Task binding requires a local direct subagent.");
     }
     await taskBinding?.validateDispatch(agentId);
+    taskBinding?.prepareRecipient(agentId);
     const notifying = notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels);
     const safePrompt = neutralizePeerWorkspacePromptMarker(prompt);
     const activePeerTurn = getActivePeerTurnContext(senderId);
@@ -6782,6 +6827,22 @@ function createToolCatalog(
     );
   }
 
+  async function reportTopic(
+    workspaceId: HierarchyAgent["workspaceId"],
+    labels: HierarchyAgent["labels"],
+    localParentId?: string,
+  ) {
+    let taskLabels = labels;
+    if (!labels?.[TASK_ID_LABEL] && localParentId) {
+      const parent = await readHierarchyAgent(localParentId);
+      taskLabels = parent?.workspaceId === workspaceId ? parent?.labels : undefined;
+    }
+    return {
+      taskId: taskLabels?.[TASK_ID_LABEL] || undefined,
+      rootMessageId: taskLabels?.[TOPIC_ROOT_MESSAGE_ID_LABEL] || undefined,
+    };
+  }
+
   registerTool(
     "reset_agent_session",
     {
@@ -6874,20 +6935,28 @@ function createToolCatalog(
         throw new PaseoToolInputError("Only subagents with a direct parent can report.");
       }
       await requireParentReportTarget(parent, localServer);
+      const isLocal = parent.serverId === localServer;
+      const topic = await reportTopic(
+        caller.workspaceId,
+        taskReport?.agent.labels ?? caller.labels,
+        isLocal ? parent.agentId : undefined,
+      );
+      const report = {
+        status,
+        summary: neutralizePeerWorkspacePromptMarker(summary),
+        title: resolveReportTitle(callerAgentId, caller.title),
+        turnId,
+        ...topic,
+      };
       const messageId = await finishSubscriptions().queueParentReport(
         {
           childAgentId: callerAgentId,
           callerAgentId: parent.agentId,
-          ...(parent.serverId === localServer ? {} : { callerServerId: parent.serverId }),
+          ...(isLocal ? {} : { callerServerId: parent.serverId }),
         },
-        {
-          status,
-          summary: neutralizePeerWorkspacePromptMarker(summary),
-          title: resolveReportTitle(callerAgentId, caller.title),
-          turnId,
-        },
+        report,
       );
-      if (options.verifiedCallerAgentId === callerAgentId && parent.serverId === localServer) {
+      if (options.verifiedCallerAgentId === callerAgentId && isLocal) {
         await agentManager.recordTaskParentReport(callerAgentId, messageId, status, taskReport);
       }
       return {

@@ -19,6 +19,8 @@ const recordsSchema = z.array(
     suppressFinished: z.boolean().optional(),
     supersedesFinished: z.array(z.string()).optional(),
     reportTurnId: z.string().optional(),
+    taskId: z.string().min(1).optional(),
+    rootMessageId: z.string().min(1).optional(),
   }),
 );
 

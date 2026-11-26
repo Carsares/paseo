@@ -5,6 +5,7 @@ export interface TaskDispatchAdmission {
   agentId?: string;
   messageId?: string;
   assertCurrent?: () => void;
+  beforeProviderDispatch?: () => Promise<void>;
 }
 
 // The durable queue uses a different async caller when it drains. Delivery

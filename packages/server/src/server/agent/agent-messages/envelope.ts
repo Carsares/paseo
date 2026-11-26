@@ -58,6 +58,8 @@ const sourceSchema = z.discriminatedUnion("kind", [
     serverId: z.string().min(1).optional(),
     title: z.string().min(1).optional(),
     reportStatus: z.enum(["completed", "blocked"]).optional(),
+    taskId: z.string().min(1).optional(),
+    rootMessageId: z.string().min(1).optional(),
   }),
   z.object({
     kind: z.literal("peer-workspace-message"),
@@ -804,7 +806,11 @@ export function formatAgentMessage(rawMessage: AgentMessage, recipientId?: strin
     source?.kind === "agent-message" && source.reportStatus
       ? ` report-status="${source.reportStatus}"`
       : "";
-  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}${status}>\n${escapeXml(text)}\n</paseo-system>`;
+  const topic =
+    source?.kind === "agent-message"
+      ? xmlAttr("task-id", source.taskId) + xmlAttr("root-message-id", source.rootMessageId)
+      : "";
+  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}${status}${topic}>\n${escapeXml(text)}\n</paseo-system>`;
 }
 
 function parsePeerWorkspaceEnvelope(
@@ -870,6 +876,10 @@ export function parseAgentMessage(text: string): AgentMessage | null {
     title: attributes.get("source-agent-title"),
     url: attributes.get("source-url"),
     ...(attributes.has("report-status") ? { reportStatus: attributes.get("report-status") } : {}),
+    ...(attributes.has("task-id") ? { taskId: attributes.get("task-id") } : {}),
+    ...(attributes.has("root-message-id")
+      ? { rootMessageId: attributes.get("root-message-id") }
+      : {}),
   });
   if (!source.success) return null;
   return { id, source: source.data, text: body };
@@ -1119,6 +1129,15 @@ export function projectedPeerMessagePrefix(
   );
 }
 
+function reportMetadata(source: Extract<AgentPromptSource, { kind: "agent-message" }>) {
+  const { reportStatus, taskId, rootMessageId } = source;
+  return {
+    ...(reportStatus ? { reportStatus } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
+  };
+}
+
 function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null {
   if (item.type !== "user_message") return item;
   const message = parseAgentMessage(item.text);
@@ -1196,9 +1215,7 @@ function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null 
         ...(source.title ? { title: source.title } : {}),
       },
       text: message.text,
-      ...(source.kind === "agent-message" && source.reportStatus
-        ? { reportStatus: source.reportStatus }
-        : {}),
+      ...(source.kind === "agent-message" ? reportMetadata(source) : {}),
     },
     // COMPAT(agentMessageToolEnvelope): added in v0.11.1; remove after 2027-04-08
     // once clients can accept a dedicated timeline variant. Older clients still

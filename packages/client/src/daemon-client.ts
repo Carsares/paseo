@@ -123,6 +123,19 @@ import type {
   ArchiveWorkspaceResponseMessage,
   WorkspaceSetupStatusResponseMessage,
   WorkspaceTaskSummary,
+  WorkspaceTopicReplyRequest,
+  WorkspaceTopicListEntriesRequest,
+  WorkspaceTopicReadGetStateRequest,
+  WorkspaceTopicReadMarkRequest,
+  WorkspaceTopicReadMarkAllRequest,
+  WorkspaceTodoListRequest,
+  WorkspaceTodoUpsertRequest,
+  WorkspaceTodoSetStatusRequest,
+  WorkspaceTodoDeleteRequest,
+  WorkspaceTopicThreadUpdatedMessage,
+  WorkspaceTopicReadUpdatedMessage,
+  WorkspaceTodoUpdatedMessage,
+  WorkspaceTodoDueTriggeredMessage,
   ListCommandsResponse,
   ListProviderFeaturesResponseMessage,
   ProviderControlsListResponseMessage,
@@ -1196,6 +1209,9 @@ type WorkbenchOperation<T = WorkbenchRequest["type"]> = T extends `${infer Opera
 type WorkbenchFeature =
   | "topicWorkbenchV1"
   | "workspaceDurableItemsV1"
+  | "workspaceTopicThreads"
+  | "workspaceTopicReadState"
+  | "workspaceTodos"
   | "checkoutGitStagingV1"
   | "checkoutGitGraphV1"
   | "checkoutGitRebaseV1"
@@ -2298,6 +2314,30 @@ export class DaemonClient {
       unsubscribeLegacy();
       unsubscribeDedicated();
     };
+  }
+
+  onWorkspaceTopicThreadUpdated(
+    handler: (payload: WorkspaceTopicThreadUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.topic.thread.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceTopicReadUpdated(
+    handler: (payload: WorkspaceTopicReadUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.topic_read.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceTodoUpdated(
+    handler: (payload: WorkspaceTodoUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.todo.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceTodoDueTriggered(
+    handler: (payload: WorkspaceTodoDueTriggeredMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.todo.due_triggered", (message) => handler(message.payload));
   }
 
   // ============================================================================
@@ -4796,14 +4836,18 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
-  async flushAgentInbox(agentId: string): Promise<void> {
+  async flushAgentInbox(agentId: string, options?: { taskId?: string }): Promise<void> {
     if (!this.isConnected || !this.lastServerInfoMessage) throw this.unavailableError();
     // COMPAT(subagentInbox): added in v0.17.0, remove gate once the host floor includes it.
     if (this.lastServerInfoMessage.features?.subagentInbox !== true) {
       throw new Error("Update the Paseo host to flush the agent inbox.");
     }
     const { success, error } = await this.sendCorrelatedSessionRequest({
-      message: { type: "agent.inbox.flush.request", agentId },
+      message: {
+        type: "agent.inbox.flush.request",
+        agentId,
+        ...(options?.taskId === undefined ? {} : { taskId: options.taskId }),
+      },
       responseType: "agent.inbox.flush.response",
       selectPayload: (payload) => (payload.agentId === agentId ? payload : null),
     });
@@ -6089,6 +6133,69 @@ export class DaemonClient {
     options: WorkbenchRequestOptions<"workspace.topic.update">,
   ): Promise<WorkbenchResponsePayload<"workspace.topic.update">> {
     return this.sendWorkbenchRequest("workspace.topic.update", "topicWorkbenchV1", options);
+  }
+
+  replyWorkspaceTopic(input: Omit<WorkspaceTopicReplyRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTopicThreads");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic.reply.response">({
+      message: { ...input, type: "workspace.topic.reply.request" },
+    });
+  }
+
+  listWorkspaceTopicEntries(input: Omit<WorkspaceTopicListEntriesRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTopicThreads");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic.list_entries.response">({
+      message: { ...input, type: "workspace.topic.list_entries.request" },
+    });
+  }
+
+  getWorkspaceTopicReadState(input: Omit<WorkspaceTopicReadGetStateRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTopicReadState");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic_read.get_state.response">({
+      message: { ...input, type: "workspace.topic_read.get_state.request" },
+    });
+  }
+
+  markWorkspaceTopicRead(input: Omit<WorkspaceTopicReadMarkRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTopicReadState");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic_read.mark.response">({
+      message: { ...input, type: "workspace.topic_read.mark.request" },
+    });
+  }
+
+  markAllWorkspaceTopicsRead(input?: Omit<WorkspaceTopicReadMarkAllRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTopicReadState");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic_read.mark_all.response">({
+      message: { ...input, type: "workspace.topic_read.mark_all.request" },
+    });
+  }
+
+  listWorkspaceTodos(input?: Omit<WorkspaceTodoListRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTodos");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.todo.list.response">({
+      message: { ...input, type: "workspace.todo.list.request" },
+    });
+  }
+
+  upsertWorkspaceTodo(input: Omit<WorkspaceTodoUpsertRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTodos");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.todo.upsert.response">({
+      message: { ...input, type: "workspace.todo.upsert.request" },
+    });
+  }
+
+  setWorkspaceTodoStatus(input: Omit<WorkspaceTodoSetStatusRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTodos");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.todo.set_status.response">({
+      message: { ...input, type: "workspace.todo.set_status.request" },
+    });
+  }
+
+  deleteWorkspaceTodo(input: Omit<WorkspaceTodoDeleteRequest, "type" | "requestId">) {
+    this.requireWorkbenchFeature("workspaceTodos");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.todo.delete.response">({
+      message: { ...input, type: "workspace.todo.delete.request" },
+    });
   }
 
   listWorkspaceDurableItems(

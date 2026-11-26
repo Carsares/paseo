@@ -30,12 +30,17 @@ const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foregrou
 export function ParentAgentCallout({
   serverId,
   parentAgentId,
+  childAgentId,
 }: {
   serverId: string;
   parentAgentId: string;
+  childAgentId?: string | null;
 }): ReactElement {
   const { t } = useTranslation();
-  const parent = useParentAgent(serverId, parentAgentId);
+  const parent = useParentAgent(serverId, parentAgentId, childAgentId);
+  const titleText = parent.topicPreview
+    ? t("topicWorkbench.topicStream.returnToTopic", { preview: parent.topicPreview })
+    : (parent.label ?? t("subagents.parent.parentAgent"));
 
   return (
     <View style={styles.rail} dataSet={CHAT_COLUMN_RAIL_DATASET}>
@@ -44,7 +49,7 @@ export function ParentAgentCallout({
           <ThemedParentIcon icon={parent.icon} size={ICON_SIZE} uniProps={foregroundColorMapping} />
         </StatusIcon>
         <Text style={styles.title} numberOfLines={1}>
-          {parent.label ?? t("subagents.parent.parentAgent")}
+          {titleText}
         </Text>
         <Button
           variant="secondary"

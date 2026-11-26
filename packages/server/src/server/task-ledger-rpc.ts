@@ -43,6 +43,11 @@ function taskSummary(task: WorkspaceTask): WorkspaceTaskSummary {
     verificationState: task.closure?.verification?.state,
     recentAgentStates: task.recentAgentStates?.map(summarizeEvent),
     latestProgress: latest ? summarizeEvent(latest) : undefined,
+    rootMessageId: task.rootMessageId,
+    leadAgentId: task.leadAgentId,
+    leadServerId: task.leadServerId,
+    conclusionMessageId: task.conclusionMessageId,
+    latestReplyPreview: task.latestReplyPreview,
   };
 }
 
