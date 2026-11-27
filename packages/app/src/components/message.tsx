@@ -4,6 +4,8 @@ import { useAssistantMessageExpansion } from "@/components/assistant-message-exp
 import { Button } from "@/components/ui/button";
 import { MessagePreview, MessageSender } from "@/components/user-message";
 import { UserMessageBody } from "@/components/user-message/message-body";
+import { getUserMessageDisplayText } from "@/components/user-message/display-text";
+import { useMessageImageReader } from "@/components/user-message/image-reader";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getAgentAttachmentPillContent } from "@/attachments/attachment-pill-content";
 import {
@@ -43,6 +45,8 @@ import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import type {
   AgentCapabilityFlags,
   AgentMetric,
+  MessageImageAttachment,
+  TimelineTopicAttribution,
   ToolCallDetail,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
@@ -109,10 +113,13 @@ interface UserMessageProps {
   itemId: string;
   sender?: AgentMessage["sender"];
   serverId?: string;
+  workspaceId?: string;
   agentId?: string;
   messageId?: string;
   message: string;
   images?: UserMessageImageAttachment[];
+  imageAttachments?: readonly MessageImageAttachment[];
+  topicAttribution?: TimelineTopicAttribution;
   attachments?: AgentAttachment[];
   timestamp: number;
   capabilities?: AgentCapabilityFlags;
@@ -407,6 +414,9 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     gap: theme.spacing[2],
     marginTop: theme.spacing[2],
   },
+  trailingRowLeft: {
+    alignSelf: "flex-start",
+  },
   trailingRowHidden: {
     opacity: 0,
   },
@@ -460,27 +470,40 @@ const MESSAGE_TEXT_DATASET = { messageText: "true" };
 function UserMessageBubble({
   itemId,
   serverId,
+  workspaceId,
+  client,
   message,
   images,
+  imageAttachments,
   attachments,
   isAlignedLeft,
   hasText,
-}: Pick<UserMessageProps, "itemId" | "serverId" | "message"> & {
+}: Pick<
+  UserMessageProps,
+  "itemId" | "serverId" | "workspaceId" | "client" | "message" | "imageAttachments"
+> & {
   images: UserMessageImageAttachment[];
   attachments: AgentAttachment[];
   isAlignedLeft: boolean;
   hasText: boolean;
 }) {
   const hasAttachments = attachments.length > 0;
+  const imageReader = useMessageImageReader(
+    client,
+    imageAttachments?.length ? serverId : undefined,
+    workspaceId,
+  );
   return (
     <View
       style={[userMessageStylesheet.bubble, isAlignedLeft && userMessageStylesheet.bubbleLeft]}
       testID="user-message-bubble"
     >
       <MessagePreview itemId={itemId}>
-        {images.length > 0 ? (
+        {images.length || imageAttachments?.length ? (
           <ReadOnlyMessageImages
             images={images}
+            imageAttachments={imageAttachments}
+            imageReader={imageReader}
             style={
               hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined
             }
@@ -512,10 +535,13 @@ export const UserMessage = memo(function UserMessage({
   itemId,
   sender,
   serverId,
+  workspaceId,
   agentId,
   messageId,
   message,
   images = [],
+  imageAttachments,
+  topicAttribution,
   attachments = [],
   timestamp,
   capabilities,
@@ -530,9 +556,8 @@ export const UserMessage = memo(function UserMessage({
   const [isHovered, setIsHovered] = useState(false);
   const isAlignedLeft = useUserMessageAlignment() === "left" && !sender;
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
-  const hasText = message.trim().length > 0;
-  const hasImages = images.length > 0;
-  const hasAttachments = attachments.length > 0;
+  const displayMessage = getUserMessageDisplayText(message, topicAttribution, messageId ?? itemId);
+  const hasText = displayMessage.trim().length > 0;
   const showTrailingRow = !isPending && hasText && (isCompact || isNative || isHovered);
   const formattedTimestamp = useMemo(
     () => formatMessageTimestamp(new Date(timestamp)),
@@ -541,7 +566,7 @@ export const UserMessage = memo(function UserMessage({
 
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
-  const getMessageContent = useCallback(() => message, [message]);
+  const getMessageContent = useCallback(() => displayMessage, [displayMessage]);
 
   const containerStyle = useMemo(
     () => [
@@ -557,26 +582,41 @@ export const UserMessage = memo(function UserMessage({
   const trailingRowStyle = useMemo(
     () => [
       userMessageStylesheet.trailingRow,
+      isAlignedLeft && userMessageStylesheet.trailingRowLeft,
       showTrailingRow
         ? userMessageStylesheet.trailingRowVisible
         : userMessageStylesheet.trailingRowHidden,
     ],
-    [showTrailingRow],
+    [isAlignedLeft, showTrailingRow],
   );
 
   function renderTurnDivider() {
+    const hasImages = images.length > 0 || Boolean(imageAttachments?.length);
+    const hasAttachments = attachments.length > 0;
     if (!isFirstInGroup || !(hasText || hasImages || hasAttachments)) return null;
     const label = sender
       ? formattedTimestamp
       : `${i18n.language?.startsWith("zh") ? "你的提问" : "Your prompt"} · ${formattedTimestamp}`;
     return (
       <View style={userMessageStylesheet.turnDivider} testID="user-message-turn-divider">
-        <View style={userMessageStylesheet.turnDividerLine} />
+        <View
+          style={
+            isAlignedLeft
+              ? userMessageStylesheet.turnDividerEndLine
+              : userMessageStylesheet.turnDividerLine
+          }
+        />
         <View style={userMessageStylesheet.turnDividerDot} />
         <Text style={userMessageStylesheet.turnDividerLabel} testID="user-message-turn-label">
           {label}
         </Text>
-        <View style={userMessageStylesheet.turnDividerEndLine} />
+        <View
+          style={
+            isAlignedLeft
+              ? userMessageStylesheet.turnDividerLine
+              : userMessageStylesheet.turnDividerEndLine
+          }
+        />
       </View>
     );
   }
@@ -594,8 +634,11 @@ export const UserMessage = memo(function UserMessage({
         <UserMessageBubble
           itemId={itemId}
           serverId={serverId}
-          message={message}
+          workspaceId={workspaceId}
+          client={client}
+          message={displayMessage}
           images={images}
+          imageAttachments={imageAttachments}
           attachments={attachments}
           isAlignedLeft={isAlignedLeft}
           hasText={hasText}
@@ -616,7 +659,7 @@ export const UserMessage = memo(function UserMessage({
                 agentId={agentId}
                 messageId={messageId}
                 client={client}
-                rewoundText={message}
+                rewoundText={displayMessage}
               />
             ) : null}
             <TurnCopyButton

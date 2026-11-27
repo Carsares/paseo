@@ -650,52 +650,57 @@ function renderDirectory() {
   return <div>Team directory</div>;
 }
 
-it("toggles Team from the leading button in the shared compact sheet stack", async () => {
-  const queryClient = new QueryClient();
-  let stack: ReturnType<typeof useWorkspaceSheetPages>;
-  function Harness() {
-    stack = useWorkspaceSheetPages();
-    return (
-      <TeamDirectorySheetProvider renderDirectory={renderDirectory}>
-        <CompactWorkspaceHeader
-          topicHeader
-          isRouteFocused
-          isCompact
-          serverId="test"
-          isLoading={false}
-          title="Workspace"
-          subtitle="Project"
-          isSubtitleDistinct
-          explorerAction={null}
-          inDesktopTitlebar={false}
-          tabSwitcher={null}
-          headerVariant="compact"
-        >
-          {null}
-        </CompactWorkspaceHeader>
-      </TeamDirectorySheetProvider>
+it.each([true, false])(
+  "keeps Team and the mode switch in the compact header (topic: %s)",
+  async (topicHeader) => {
+    const queryClient = new QueryClient();
+    let stack: ReturnType<typeof useWorkspaceSheetPages>;
+    function Harness() {
+      stack = useWorkspaceSheetPages();
+      return (
+        <TeamDirectorySheetProvider renderDirectory={renderDirectory}>
+          <CompactWorkspaceHeader
+            topicHeader={topicHeader}
+            isRouteFocused
+            isCompact
+            serverId="test"
+            isLoading={false}
+            title="Workspace"
+            subtitle="Project"
+            isSubtitleDistinct
+            explorerAction={null}
+            inDesktopTitlebar={false}
+            tabSwitcher={null}
+            headerVariant="compact"
+            modeTarget={modeTarget}
+          >
+            {null}
+          </CompactWorkspaceHeader>
+        </TeamDirectorySheetProvider>
+      );
+    }
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PortalProvider>
+            <WorkspaceSheetStackProvider workspaceKey="test:compact-team">
+              <Harness />
+            </WorkspaceSheetStackProvider>
+          </PortalProvider>
+        </QueryClientProvider>,
+      ),
     );
-  }
-  await act(async () =>
-    root.render(
-      <QueryClientProvider client={queryClient}>
-        <PortalProvider>
-          <WorkspaceSheetStackProvider workspaceKey="test:compact-team">
-            <Harness />
-          </WorkspaceSheetStackProvider>
-        </PortalProvider>
-      </QueryClientProvider>,
-    ),
-  );
-  const team = page.getByTestId("topic-header-toggle-directory");
-  await expect.element(team).toHaveAccessibleName("Show team directory");
-  await act(async () => team.click());
-  expect(stack!.getSnapshot().map(({ key }) => key)).toEqual(["page:team"]);
-  await expect.element(team).toHaveAccessibleName("Hide team directory");
-  await act(async () => team.click());
-  expect(stack!.getSnapshot()).toEqual([]);
-  await expect.element(team).toHaveAccessibleName("Show team directory");
-});
+    const team = page.getByTestId("topic-header-toggle-directory");
+    await expect.element(page.getByTestId("topic-stream-mode-switch")).toBeVisible();
+    await expect.element(team).toHaveAccessibleName("Show team directory");
+    await act(async () => team.click());
+    expect(stack!.getSnapshot().map(({ key }) => key)).toEqual(["page:team"]);
+    await expect.element(team).toHaveAccessibleName("Hide team directory");
+    await act(async () => team.click());
+    expect(stack!.getSnapshot()).toEqual([]);
+    await expect.element(team).toHaveAccessibleName("Show team directory");
+  },
+);
 
 const insets = { top: 0, bottom: 0, left: 0, right: 0 };
 const leftRail = { width: 52 };

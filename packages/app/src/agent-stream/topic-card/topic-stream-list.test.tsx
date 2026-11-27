@@ -7,7 +7,15 @@ import type {
   WorkspaceTopicDecideResponse,
 } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSidebarAttention } from "@/components/sidebar/sidebar-unread-conclusions";
@@ -252,6 +260,7 @@ describe("TopicStreamList & read-watermark integration", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -319,6 +328,85 @@ describe("TopicStreamList & read-watermark integration", () => {
     expect(
       await screen.findByRole("button", { name: "composer.attachments.openImage" }),
     ).toBeTruthy();
+  });
+
+  it("reconciles a missed image and completion update without settling another follow-up", async () => {
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: false,
+      workspaceDirectory: "/workspace/topic",
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const image = {
+      id: "upload_58cc15d3-4380-4726-bf78-603537c9b213",
+      fileName: "example.png",
+      mimeType: "image/png",
+      size: 4,
+    };
+    const first: TopicThreadEntry = {
+      entryId: "first",
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      role: "user_followup",
+      topicKey: "msg:m-1",
+      rootMessageId: "m-1",
+      routedAgentId: MAIN_AGENT_ID,
+      text: "Please review the attached image.",
+      status: "running",
+      seq: 1,
+      createdAt: new Date(3000).toISOString(),
+      updatedAt: new Date(3000).toISOString(),
+    };
+    const second: TopicThreadEntry = {
+      ...first,
+      entryId: "second",
+      status: "queued",
+      text: "Second follow-up",
+      seq: 2,
+    };
+    const queryKey = workspaceTopicEntriesQueryKey(SERVER_ID, WORKSPACE_ID, MAIN_AGENT_ID);
+    qc.setQueryData(queryKey, [first, second]);
+    const readFile = vi.fn().mockResolvedValue({
+      bytes: Uint8Array.of(1, 2, 3, 4),
+      mime: image.mimeType,
+      size: image.size,
+    });
+    const listWorkspaceTopicEntries = vi.fn().mockResolvedValue({
+      entries: [{ ...first, status: "completed", imageAttachments: [image] }, second],
+      error: null,
+    });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { listWorkspaceTopicEntries, readFile },
+    } as never);
+    vi.useFakeTimers();
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={makeStreamItems()}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    const status = "topicWorkbench.topicStream.status.dispatching";
+    expect(within(screen.getByTestId("topic-reply-thread-first")).getByText(status)).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(2_100));
+    await act(() => vi.advanceTimersByTimeAsync(100));
+
+    const completed = within(screen.getByTestId("topic-reply-thread-first"));
+    expect(completed.queryByText(status)).toBeNull();
+    expect(completed.getByRole("button", { name: "composer.attachments.openImage" })).toBeTruthy();
+    expect(within(screen.getByTestId("topic-reply-thread-second")).getByText(status)).toBeTruthy();
   });
 
   it.each([false, true])(

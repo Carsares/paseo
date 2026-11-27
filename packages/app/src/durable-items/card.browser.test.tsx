@@ -458,6 +458,130 @@ const review = {
   evidence: [{ type: "file", path: "trace.md", fingerprint: "saved" }],
 } satisfies WorkspaceDurableItem;
 
+it("keeps the decision actions in view while a long reminder scrolls at phone width", async () => {
+  container.style.width = "420px";
+  const longReminder: WorkspaceDurableItem = {
+    ...pending,
+    summary: [`Detail ${"path".repeat(150)}`, ...Array(24).fill("More decision details")].join(
+      "\n",
+    ),
+    evidence: [{ type: "file", path: "last-evidence.md", fingerprint: "saved" }],
+  };
+  const { decide } = serve([longReminder]);
+  decide.mockResolvedValue({
+    requestId: "reply",
+    workspaceId: longReminder.workspaceId,
+    durableItemRequestId: longReminder.requestId,
+    item: decided(longReminder),
+    error: null,
+  });
+  const view = render();
+  const body = await view.findByTestId("durable-item-reminder-body");
+  const hint = await view.findByTestId("durable-item-reminder-scroll-hint");
+  const card = view.getByTestId("durable-item-card").getBoundingClientRect();
+  const approve = view.getByRole("button", { name: "Approve" });
+  const actionBounds = approve.getBoundingClientRect();
+  expect(body.scrollHeight).toBeGreaterThan(body.clientHeight);
+  expect(body.scrollWidth).toBeLessThanOrEqual(body.clientWidth);
+  expect(hint.getBoundingClientRect().bottom).toBeLessThanOrEqual(actionBounds.top);
+  expect(actionBounds.bottom).toBeLessThan(card.bottom);
+  body.scrollTop = body.scrollHeight;
+  expect(body.scrollTop).toBeGreaterThan(0);
+  const evidence = view.getByRole("button", { name: "last-evidence.md" });
+  expect(evidence.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+    body.getBoundingClientRect().bottom + 1,
+  );
+  expect(approve.getBoundingClientRect().top).toBe(actionBounds.top);
+  await expect.element(approve).toBeEnabled();
+  await act(async () => approve.click());
+  expect(decide).toHaveBeenCalledOnce();
+});
+
+it("keeps a reminder's submission, scroll position, and evidence open as another reminder comes and goes", async () => {
+  container.style.width = "420px";
+  const first: WorkspaceDurableItem = {
+    ...pending,
+    summary: Array(24).fill("First reminder details").join("\n"),
+    evidence: [{ type: "file", path: "first-evidence.md", fingerprint: "saved" }],
+  };
+  const second = {
+    ...pending,
+    requestId: "second",
+    title: "Second reminder",
+    summary: Array(24).fill("Second reminder details").join("\n"),
+  };
+  const items: WorkspaceDurableItem[] = [first];
+  const { decide, list } = serve(items);
+  let finishDecision!: (response: Awaited<ReturnType<typeof decide>>) => void;
+  decide.mockImplementationOnce(() => new Promise((resolve) => (finishDecision = resolve)));
+
+  const view = render();
+  const firstCard = await view.findByTestId("durable-item-card");
+  const card = within(firstCard);
+  const body = card.getByTestId("durable-item-reminder-body");
+  const approve = card.getByRole("button", { name: "Approve" });
+  await expect.element(approve).toBeEnabled();
+  act(() => card.getByRole("button", { name: "first-evidence.md" }).click());
+  const evidence = card.getByTestId("durable-item-evidence-details");
+  body.scrollTop = body.scrollHeight;
+  const bodyOffset = body.scrollTop;
+  expect(bodyOffset).toBeGreaterThan(0);
+  act(() => approve.click());
+  expect(decide).toHaveBeenCalledOnce();
+
+  const updateSecond = async (item: WorkspaceDurableItem) => {
+    items[1] = item;
+    await act(async () =>
+      applyDurableItemUpdateToCache(queryClient, "host", { workspaceId: item.workspaceId, item }),
+    );
+  };
+  const expectFirstStillSubmitting = async () => {
+    expect(
+      within(view.getByTestId("agent-durable-items")).getAllByTestId("durable-item-card")[0],
+    ).toBe(firstCard);
+    expect(card.getByTestId("durable-item-reminder-body")).toBe(body);
+    expect(card.getByTestId("durable-item-evidence-details")).toBe(evidence);
+    expect(body.scrollTop).toBe(bodyOffset);
+    const action = card.getByRole("button", { name: "Approve" });
+    await expect.element(action).toBeDisabled();
+    act(() => action.click());
+    expect(decide).toHaveBeenCalledOnce();
+  };
+
+  await updateSecond(second);
+  await view.findByText(second.title);
+  await expectFirstStillSubmitting();
+  const reminders = view.getByTestId("agent-durable-items");
+  expect(reminders.scrollHeight).toBeGreaterThan(reminders.clientHeight);
+  reminders.scrollTop = reminders.scrollHeight;
+  const secondApprove = view.getAllByRole("button", { name: "Approve" })[1];
+  expect(secondApprove.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+    reminders.getBoundingClientRect().bottom,
+  );
+  await expect.element(secondApprove).toBeEnabled();
+
+  await updateSecond(decided(second));
+  await expect.poll(() => view.queryByText(second.title)).toBeNull();
+  await expectFirstStillSubmitting();
+  expect(approve.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+    reminders.getBoundingClientRect().bottom,
+  );
+
+  items[0] = decided(first);
+  await act(async () =>
+    finishDecision({
+      requestId: "write",
+      workspaceId: first.workspaceId,
+      durableItemRequestId: first.requestId,
+      item: items[0],
+      error: null,
+    }),
+  );
+  await expect.poll(() => view.queryByTestId("agent-durable-items-rail")).toBeNull();
+  expect(list).toHaveBeenCalledTimes(2);
+  expect(decide).toHaveBeenCalledOnce();
+});
+
 it("blocks a stale evidence revision in both the conversation and the sidebar detail", async () => {
   const { decide } = serve([review]);
   decide.mockResolvedValue({

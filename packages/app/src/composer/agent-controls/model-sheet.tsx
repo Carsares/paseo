@@ -273,7 +273,7 @@ function ModelSheetBatchControls({
           </Button>
         )}
       </View>
-      {reason ? <Text style={styles.triggerText}>{reason}</Text> : null}
+      {reason ? <Text style={[styles.triggerText, styles.batchReason]}>{reason}</Text> : null}
       {selecting && count > 0 ? (
         <View style={styles.batchActions}>
           {picker.models.map((model) => (
@@ -796,6 +796,10 @@ const styles = StyleSheet.create((theme) => ({
   batchControls: {
     gap: theme.spacing[1],
     paddingVertical: theme.spacing[1],
+  },
+  batchReason: {
+    // Match the ModelBrowser row inset, leading icon slot, and gap before its label.
+    paddingHorizontal: (isWeb ? theme.spacing[3] : theme.spacing[6]) + 16 + theme.spacing[2],
   },
   batchActions: {
     flexDirection: "row",

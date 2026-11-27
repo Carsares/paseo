@@ -1,7 +1,7 @@
-import { X } from "lucide-react-native";
+import { ChevronDown, X } from "lucide-react-native";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ScrollView, Text, View } from "react-native";
+import { ScrollView, Text, View, type LayoutChangeEvent } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
@@ -13,6 +13,7 @@ import { CHAT_COLUMN_RAIL_DATASET } from "@/chat-rail";
 import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { useIsCompactFormFactor } from "@/constants/layout";
+import { isWeb } from "@/constants/platform";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import {
   useActiveWorkspaceSheetOpener,
@@ -37,6 +38,10 @@ import { useReminderDismissalStore } from "./reminder-dismissal-store";
 const DECISIONS = ["approve", "reject", "request_changes"] as const;
 const EMPTY_REMINDERS: readonly WorkspaceDurableItem[] = [];
 const DismissIcon = withUnistyles(X, (theme) => ({ color: theme.colors.foregroundMuted }));
+const ScrollHintIcon = withUnistyles(ChevronDown, (theme) => ({
+  color: theme.colors.foregroundMuted,
+  size: theme.iconSize.sm,
+}));
 // Keep a rejected revision blocked across chat and inbox cards, including after remounting.
 const useStaleEvidence = create<Readonly<Record<string, number>>>(() => ({}));
 
@@ -164,6 +169,7 @@ export function AgentDurableItems({
 }) {
   if (!items.length) return null;
 
+  const hasMultipleItems = items.length > 1;
   return (
     <View
       style={[styles.agentItemsRail, { marginBottom: trackClearance }]}
@@ -171,9 +177,13 @@ export function AgentDurableItems({
       testID="agent-durable-items-rail"
     >
       <ScrollView
-        style={styles.agentItems}
-        contentContainerStyle={styles.agentItemsContent}
+        style={[styles.agentItems, hasMultipleItems && styles.agentItemList]}
+        contentContainerStyle={[
+          styles.agentItemsContent,
+          !hasMultipleItems && styles.singleItemContent,
+        ]}
         nestedScrollEnabled
+        keyboardShouldPersistTaps="handled"
         testID="agent-durable-items"
       >
         {items.map((item) => (
@@ -188,6 +198,75 @@ export function AgentDurableItems({
       </ScrollView>
     </View>
   );
+}
+
+function ReminderBody({ children }: { children: React.ReactNode }) {
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [contentHeight, setContentHeight] = useState(0);
+  const measureViewport = useCallback(
+    (event: LayoutChangeEvent) => setViewportHeight(event.nativeEvent.layout.height),
+    [],
+  );
+  const measureContent = useCallback((_width: number, height: number) => {
+    setContentHeight(height);
+  }, []);
+  const canScroll = viewportHeight > 0 && contentHeight - viewportHeight > 1;
+
+  return (
+    <View style={styles.reminderBody}>
+      <ScrollView
+        style={styles.reminderScroller}
+        onLayout={measureViewport}
+        onContentSizeChange={measureContent}
+        nestedScrollEnabled
+        persistentScrollbar
+        keyboardShouldPersistTaps="handled"
+        testID="durable-item-reminder-body"
+      >
+        <View style={styles.bodyContent}>{children}</View>
+      </ScrollView>
+      {canScroll ? (
+        <View style={styles.scrollHint} aria-hidden testID="durable-item-reminder-scroll-hint">
+          <ScrollHintIcon />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function DurableItemBody({
+  serverId,
+  item,
+  isReminder,
+  openEvidenceKey,
+  onOpenEvidence,
+}: {
+  serverId: string;
+  item: WorkspaceDurableItem;
+  isReminder: boolean;
+  openEvidenceKey: string | null;
+  onOpenEvidence: (evidence: WorkspaceDurableItemEvidence) => void;
+}) {
+  const evidenceByKey = new Map(item.evidence.map((evidence) => [evidenceKey(evidence), evidence]));
+  const body = (
+    <>
+      <Text style={[styles.title, isReminder && styles.reminderText]}>{item.title}</Text>
+      {item.summary ? (
+        <Text style={[styles.text, isReminder && styles.reminderText]}>{item.summary}</Text>
+      ) : null}
+      {[...evidenceByKey].map(([key, evidence]) => (
+        <EvidenceRow
+          key={key}
+          serverId={serverId}
+          workspaceId={item.workspaceId}
+          evidence={evidence}
+          expanded={openEvidenceKey === key}
+          onPress={onOpenEvidence}
+        />
+      ))}
+    </>
+  );
+  return isReminder ? <ReminderBody>{body}</ReminderBody> : body;
 }
 
 function DurableItemCardContent({
@@ -233,7 +312,6 @@ function DurableItemCardContent({
     else if (result.isSuccess && !current) blockMessage = "unavailable";
   }
 
-  const evidenceByKey = new Map(item.evidence.map((evidence) => [evidenceKey(evidence), evidence]));
   const openEvidence = useStableEvent((evidence: WorkspaceDurableItemEvidence) => {
     const key = evidenceKey(evidence);
     if (compact) {
@@ -300,7 +378,7 @@ function DurableItemCardContent({
   if (item.status === "expired") terminalLabel = t("topicWorkbench.durableItems.expired");
 
   return (
-    <View style={styles.card} testID="durable-item-card">
+    <View style={[styles.card, dismissible && styles.reminderCard]} testID="durable-item-card">
       <View style={styles.header}>
         <Text style={styles.meta}>{t(`topicWorkbench.durableItems.kind.${item.kind}`)}</Text>
         {dismissible ? (
@@ -313,18 +391,13 @@ function DurableItemCardContent({
           </ToolbarButton>
         ) : null}
       </View>
-      <Text style={styles.title}>{item.title}</Text>
-      {item.summary ? <Text style={styles.text}>{item.summary}</Text> : null}
-      {[...evidenceByKey].map(([key, evidence]) => (
-        <EvidenceRow
-          key={key}
-          serverId={serverId}
-          workspaceId={item.workspaceId}
-          evidence={evidence}
-          expanded={openEvidenceKey === key}
-          onPress={openEvidence}
-        />
-      ))}
+      <DurableItemBody
+        serverId={serverId}
+        item={item}
+        isReminder={dismissible}
+        openEvidenceKey={openEvidenceKey}
+        onOpenEvidence={openEvidence}
+      />
       {terminalLabel ? (
         <Text style={styles.text} accessibilityLiveRegion="polite">
           {terminalLabel}
@@ -374,19 +447,48 @@ const styles = StyleSheet.create((theme) => ({
   agentItems: {
     flexGrow: 0,
     flexShrink: 1,
-    maxHeight: 240,
     width: "100%",
     maxWidth: theme.contentMaxWidth,
+  },
+  agentItemList: {
+    maxHeight: 300,
   },
   agentItemsContent: {
     gap: theme.spacing[2],
     paddingVertical: theme.spacing[2],
+  },
+  singleItemContent: {
+    flexShrink: 1,
   },
   card: {
     gap: theme.spacing[2],
     padding: theme.spacing[3],
     borderRadius: theme.borderRadius.lg,
     backgroundColor: theme.colors.surface2,
+  },
+  reminderCard: {
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  reminderBody: {
+    flexShrink: 1,
+    minHeight: 0,
+  },
+  reminderScroller: {
+    flexGrow: 0,
+    flexShrink: 1,
+    maxHeight: 144,
+  },
+  reminderText: {
+    minWidth: 0,
+    ...(isWeb ? { overflowWrap: "anywhere" as const } : {}),
+  },
+  bodyContent: {
+    gap: theme.spacing[2],
+  },
+  scrollHint: {
+    alignItems: "flex-end",
+    paddingRight: theme.spacing[1],
   },
   header: {
     flexDirection: "row",

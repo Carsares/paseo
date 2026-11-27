@@ -73,6 +73,53 @@ describe("UserMessage prominence", () => {
     expect(queryByTestId("user-message-turn-divider")).toBeNull();
   });
 
+  it("hides only the routed topic envelope and keeps quotes and the user's own markup", () => {
+    const opening = '<paseo-topic-context root-message-id="root">';
+    const envelope = opening + "\n</paseo-topic-context>\n\n";
+    const authored = "> Original answer\n\n" + envelope + "Please explain this example.";
+    const { getByTestId, getAllByText } = renderPrompt({
+      message: envelope + authored,
+      topicAttribution: { rootMessageId: "root" },
+    });
+
+    expect(getByTestId("user-message-bubble").textContent).toContain("Original answer");
+    expect(getByTestId("user-message-bubble").textContent).toContain(
+      "Please explain this example.",
+    );
+    expect(getAllByText(/paseo-topic-context/)).toHaveLength(1);
+  });
+
+  it("hides a trimmed routing envelope on an image-only follow-up", () => {
+    const { getByTestId, queryByText } = renderPrompt({
+      message:
+        '<paseo-topic-context task-id="task" root-message-id="root">\n' +
+        "The lead is on another host. Answer in this topic or coordinate with the lead via the usual tools.\n" +
+        "</paseo-topic-context>",
+      topicAttribution: { topicKey: "task:task", rootMessageId: "root" },
+      imageAttachments: [
+        { id: "upload-image-1", fileName: "diagram.png", mimeType: "image/png", size: 48 },
+      ],
+    });
+
+    expect(queryByText(/paseo-topic-context/)).toBeNull();
+    expect(getByTestId("user-message-turn-divider")).toBeTruthy();
+    expect(getByTestId("user-message-bubble").textContent).toBe("");
+  });
+
+  it.each([undefined, { rootMessageId: "another" }, { rootMessageId: "prompt" }])(
+    "keeps an authored topic element without matching follow-up attribution (%j)",
+    (topicAttribution) => {
+      const root = topicAttribution?.rootMessageId === "prompt" ? "prompt" : "root";
+      const { getByTestId } = renderPrompt({
+        message:
+          '<paseo-topic-context root-message-id="' + root + '">\n</paseo-topic-context>\n\nText',
+        topicAttribution,
+      });
+
+      expect(getByTestId("user-message-bubble").textContent).toContain("paseo-topic-context");
+    },
+  );
+
   it.each([
     ["an attachment", { attachments: [{ type: "text", mimeType: "text/plain", text: "Notes" }] }],
     [
@@ -111,6 +158,12 @@ describe("UserMessage prominence", () => {
     expect(getComputedStyle(prompt.getByTestId("user-message-content")).alignSelf).toBe(
       "flex-start",
     );
+    expect(getComputedStyle(prompt.getByTestId("user-message-trailing-row")).alignSelf).toBe(
+      "flex-start",
+    );
+    const divider = prompt.getByTestId("user-message-turn-divider");
+    expect(getComputedStyle(divider.firstElementChild!).flexGrow).not.toBe("1");
+    expect(getComputedStyle(divider.lastElementChild!).flexGrow).toBe("1");
     prompt.unmount();
 
     const agent = renderPrompt({ sender: { id: "agent", title: "Reviewer" } }, "left");
@@ -124,6 +177,9 @@ describe("UserMessage prominence", () => {
 
     expect(contentStyle.alignSelf).toBe("flex-end");
     expect(contentStyle.alignItems).toBe("flex-end");
+    expect(getComputedStyle(getByTestId("user-message-trailing-row")).alignSelf).toBe("flex-end");
+    const divider = getByTestId("user-message-turn-divider");
+    expect(getComputedStyle(divider.firstElementChild!).flexGrow).toBe("1");
     expect(contentStyle.maxWidth).toBe("85%");
     expect(["auto", ""]).toContain(contentStyle.width);
     expect(["auto", ""]).toContain(bubbleStyle.width);

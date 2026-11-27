@@ -59,6 +59,72 @@ function compareEntries(left: TopicThreadEntry, right: TopicThreadEntry): number
   return left.entryId.localeCompare(right.entryId);
 }
 
+const entryPhase = { queued: 0, running: 1, completed: 2, error: 2 } as const;
+
+function entryUpdatedMs(entry: TopicThreadEntry): number {
+  const updated = Date.parse(entry.updatedAt);
+  if (Number.isFinite(updated)) return updated;
+  const created = Date.parse(entry.createdAt);
+  return Number.isFinite(created) ? created : -Infinity;
+}
+
+function mergeEntry(
+  existing: TopicThreadEntry,
+  incoming: TopicThreadEntry,
+  preferExistingOnTie = false,
+): TopicThreadEntry {
+  const existingMs = entryUpdatedMs(existing);
+  const incomingMs = entryUpdatedMs(incoming);
+  // Recovery can reset a pending entry with a newer timestamp. Use phase only
+  // for writes in the same millisecond, when a queued receipt can trail its completion.
+  const order =
+    incomingMs === existingMs
+      ? entryPhase[incoming.status] - entryPhase[existing.status]
+      : incomingMs - existingMs;
+  const useIncoming = order > 0 || (order === 0 && !preferExistingOnTie);
+  const newer = useIncoming ? incoming : existing;
+  const older = useIncoming ? existing : incoming;
+  // Images belong to this entry for its lifetime. An older response may be
+  // the only one that carries the upload references.
+  return !newer.imageAttachments?.length && older.imageAttachments?.length
+    ? { ...newer, imageAttachments: older.imageAttachments }
+    : newer;
+}
+
+// Associate list responses with their request-start state. The cache reads this
+// at commit so updates between queryFn returning and TanStack writing also win.
+const entriesBeforeFetch = new WeakMap<TopicThreadEntry[], readonly TopicThreadEntry[]>();
+
+function mergeFetchedEntries(
+  snapshot: TopicThreadEntry[],
+  beforeFetch: readonly TopicThreadEntry[],
+  current: readonly TopicThreadEntry[],
+): TopicThreadEntry[] {
+  const priorById = new Map(beforeFetch.map((entry) => [entry.entryId, entry]));
+  const byId = new Map(snapshot.map((entry) => [entry.entryId, entry]));
+  for (const existing of current) {
+    const fetched = byId.get(existing.entryId);
+    const changedWhileFetching = priorById.get(existing.entryId) !== existing;
+    if (fetched) {
+      byId.set(existing.entryId, mergeEntry(existing, fetched, changedWhileFetching));
+    } else if (changedWhileFetching) {
+      // Keep events that raced the snapshot. A later fetch may remove these
+      // too, once they are present at its start and no longer changing.
+      byId.set(existing.entryId, existing);
+    }
+  }
+  return [...byId.values()].sort(compareEntries);
+}
+
+function shareTopicEntries(previous: unknown, incoming: unknown): TopicThreadEntry[] {
+  const current = previous as TopicThreadEntry[] | undefined;
+  const next = incoming as TopicThreadEntry[];
+  const beforeFetch = entriesBeforeFetch.get(next);
+  if (!beforeFetch) return replaceEqualDeep(current, next);
+  entriesBeforeFetch.delete(next);
+  return replaceEqualDeep(current, mergeFetchedEntries(next, beforeFetch, current ?? []));
+}
+
 function compareAnchors(left: TopicAnchorSummary, right: TopicAnchorSummary): number {
   const leftMs = Date.parse(left.createdAt) || 0;
   const rightMs = Date.parse(right.createdAt) || 0;
@@ -273,7 +339,7 @@ export function upsertTopicThreadEntry(
     return [...entries, incoming].sort(compareEntries);
   }
   const next = [...entries];
-  next[index] = incoming;
+  next[index] = mergeEntry(entries[index]!, incoming);
   return next.sort(compareEntries);
 }
 
@@ -314,6 +380,7 @@ export function useWorkspaceTopicEntries(
   const active = activeOverride ?? paneActive;
   const enabled =
     Boolean(workspaceId && mainAgentId) && active && appVisible && supported && online;
+  const entriesKey = workspaceTopicEntriesQueryKey(serverId, workspaceId, mainAgentId ?? "");
 
   const anchorsKey = useMemo(
     () => workspaceTopicAnchorsQueryKey(serverId, workspaceId, mainAgentId ?? ""),
@@ -321,16 +388,18 @@ export function useWorkspaceTopicEntries(
   );
 
   const query = useFetchQuery({
-    queryKey: workspaceTopicEntriesQueryKey(serverId, workspaceId, mainAgentId ?? ""),
+    queryKey: entriesKey,
     dataShape: "value" as const,
     staleTimeMs: TOPIC_ENTRIES_STALE_MS,
     enabled,
     refetchOnWindowFocus: true,
     retry: false as const,
+    structuralSharing: shareTopicEntries,
     queryFn: async ({ signal }) => {
       const client = getOnlineThreadClient(serverId);
       if (!client || !mainAgentId) throw new Error("Host is offline");
       signal.throwIfAborted();
+      const beforeEntries = queryClient.getQueryData<TopicThreadEntry[]>(entriesKey) ?? [];
       const beforeFetch = queryClient.getQueryData<TopicAnchorSummary[]>(anchorsKey) ?? [];
       const response = await client.listWorkspaceTopicEntries({ workspaceId, mainAgentId });
       signal.throwIfAborted();
@@ -341,7 +410,9 @@ export function useWorkspaceTopicEntries(
           mergeFetchedAnchors(incomingAnchors, beforeFetch, current ?? []),
         );
       }
-      return [...response.entries].sort(compareEntries);
+      const entries = [...response.entries];
+      entriesBeforeFetch.set(entries, beforeEntries);
+      return entries;
     },
   });
 

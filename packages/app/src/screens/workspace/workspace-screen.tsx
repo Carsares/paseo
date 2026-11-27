@@ -241,7 +241,11 @@ import {
 } from "@/screens/workspace/workspace-pane-content";
 import { useMountedTabSet } from "@/screens/workspace/use-mounted-tab-set";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
-import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane";
+import {
+  SheetPaneHostProvider,
+  useWorkspaceSheetPages,
+  type SheetPaneHost,
+} from "@/screens/workspace/sheet-pane";
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import type { PaneHost } from "@/panels/panel-manifest";
 import { WorkspaceFocusProvider } from "@/workspace/focus";
@@ -610,6 +614,7 @@ function useWorkspaceTopicNavigation({
   uiTabs,
   isTopicWorkspace,
   supportsTopicWorkbench,
+  compact,
   mainAgentId,
   desktopFocusModeEnabled,
   focusedPaneAgentId,
@@ -622,6 +627,7 @@ function useWorkspaceTopicNavigation({
   uiTabs: WorkspaceTab[];
   isTopicWorkspace: boolean;
   supportsTopicWorkbench: boolean;
+  compact: boolean;
   mainAgentId: string | null;
   desktopFocusModeEnabled: boolean;
   focusedPaneAgentId: string | null;
@@ -671,9 +677,9 @@ function useWorkspaceTopicNavigation({
     ],
   );
   const activeMainCanSwitchMode = useSessionStore((state) => {
+    const isCompactOrdinaryWorkspace = isWeb && compact && !isTopicWorkspace;
     if (
-      !isTopicWorkspace ||
-      !supportsTopicWorkbench ||
+      (!isCompactOrdinaryWorkspace && (!isTopicWorkspace || !supportsTopicWorkbench)) ||
       !mainAgentId ||
       focusedPaneAgentId !== mainAgentId
     ) {
@@ -686,7 +692,7 @@ function useWorkspaceTopicNavigation({
       isWorkspaceRootAgent(agent, normalizedWorkspaceId) &&
       isMainControlAgent(agent) &&
       !agent.archivedAt &&
-      !(agent.status === "closed" && !agent.lastUserMessageAt),
+      (isCompactOrdinaryWorkspace || !(agent.status === "closed" && !agent.lastUserMessageAt)),
     );
   });
   const specialistTab = useMemo(
@@ -1097,8 +1103,16 @@ function WorkspaceTeamDirectoryShellBridge({
   compactTeamDirectory?: (close: () => void) => ReactNode;
   children: ReactNode;
 }) {
+  const sheetPages = useWorkspaceSheetPages();
+  const value = useMemo(
+    () =>
+      isWeb && compactTeamDirectory && sheetPages
+        ? { ...baseValue, isOwnedByWorkspaceShell: true }
+        : baseValue,
+    [baseValue, compactTeamDirectory, sheetPages],
+  );
   return (
-    <TeamDirectoryShellProvider value={baseValue}>
+    <TeamDirectoryShellProvider value={value}>
       {compactTeamDirectory ? (
         <TeamDirectorySheetProvider renderDirectory={compactTeamDirectory}>
           {children}
@@ -4639,6 +4653,7 @@ function WorkspaceScreenContent({
     uiTabs,
     isTopicWorkspace,
     supportsTopicWorkbench,
+    compact: isMobile,
     mainAgentId,
     desktopFocusModeEnabled,
     focusedPaneAgentId,

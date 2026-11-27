@@ -1,9 +1,12 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { memo, useCallback, useMemo, type ReactElement } from "react";
+import { View } from "react-native";
+import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { BackgroundWorkTrack, createHostBackgroundWorkModel } from "@/background-work";
 import { WorkspaceDiffStatPill } from "@/composer/diff-stat-pill";
 import { AgentTaskList } from "@/composer/task-list";
 import { ComposerTrackBar } from "@/composer/tracks";
+import { resolveComposerTrackControlClearance } from "@/composer/pill-styles";
 import { WorkspaceTaskLedger } from "@/composer/workspace-task-ledger";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { usePaneContext } from "@/panels/pane-context";
@@ -38,11 +41,13 @@ export const AgentTracks = memo(function AgentTracks({
   workspaceId,
   agentId,
   parentAgentId,
+  reserveSpace,
 }: {
   serverId: string;
   workspaceId: string;
   agentId: string;
   parentAgentId: string | null;
+  reserveSpace: boolean;
 }): ReactElement {
   const subagentRows = useSubagentsForParent({ serverId, parentAgentId: agentId });
   const tasks = useSessionStore((state): TodoEntry[] | undefined =>
@@ -127,7 +132,7 @@ export const AgentTracks = memo(function AgentTracks({
     });
   }, [isCompact, openInSidePane, workspaceKey]);
 
-  return (
+  const bar = (
     <ComposerTrackBar>
       <BackgroundWorkTrack model={backgroundModel} count={backgroundWorkCount} />
       {parentAgentId ? (
@@ -160,5 +165,16 @@ export const AgentTracks = memo(function AgentTracks({
         onPress={handleOpenChanges}
       />
     </ComposerTrackBar>
+  );
+  // Anchor the bar to its own row so the topic viewport stops above it.
+  return reserveSpace ? (
+    <View
+      testID="agent-tracks-row"
+      style={inlineUnistylesStyle({ minHeight: resolveComposerTrackControlClearance(isCompact) })}
+    >
+      {bar}
+    </View>
+  ) : (
+    bar
   );
 });

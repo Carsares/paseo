@@ -9,6 +9,7 @@ import {
   hydrateStreamState,
   mergeToolCallDetail,
   reduceStreamUpdate,
+  replaceWithCanonicalStream,
   streamTimelineItemIdentity,
   type AgentToolCallItem,
   type StreamItem,
@@ -158,6 +159,90 @@ describe("plugin timeline rows", () => {
 });
 
 describe("user message identity", () => {
+  const imageAttachments = [
+    { id: "upload-image-1", fileName: "diagram.png", mimeType: "image/png", size: 48 },
+  ];
+  const topicImageEvent = {
+    type: "timeline",
+    provider: "claude",
+    turnId: "turn-image",
+    topicKey: "msg:root",
+    rootMessageId: "root",
+    item: {
+      type: "user_message",
+      text: "",
+      clientMessageId: "client-image",
+      messageId: "provider-image",
+      imageAttachments,
+    },
+  } satisfies AgentStreamEventPayload;
+
+  it.each(["tail", "head"] as const)(
+    "shows a live image-only user message in the %s lane",
+    (lane) => {
+      const result = applyStreamEvent({
+        tail: [],
+        head: [],
+        event: topicImageEvent,
+        timestamp: new Date(1000),
+        unmatchedUserMessageInsert: lane,
+      });
+      expect(result[lane]).toEqual([
+        expect.objectContaining({
+          kind: "user_message",
+          messageId: "provider-image",
+          rootMessageId: "root",
+          text: "",
+          imageAttachments,
+        }),
+      ]);
+      expect(result[lane === "tail" ? "head" : "tail"]).toEqual([]);
+    },
+  );
+
+  it("keeps stored image references and late topic attribution when replay echoes omit them", () => {
+    const incomplete = {
+      type: "timeline",
+      provider: "claude",
+      turnId: "turn-image",
+      item: {
+        type: "user_message",
+        text: "Review the diagram",
+        clientMessageId: "client-image",
+        messageId: "provider-image",
+      },
+    } satisfies AgentStreamEventPayload;
+    const timestamp = new Date(1000);
+    const replay = hydrateStreamState(
+      [
+        { event: incomplete, timestamp },
+        { event: topicImageEvent, timestamp },
+        { event: incomplete, timestamp },
+      ],
+      { source: "canonical" },
+    );
+    expect(replay).toEqual([
+      expect.objectContaining({
+        kind: "user_message",
+        id: "provider-image",
+        text: "Review the diagram",
+        rootMessageId: "root",
+        imageAttachments,
+      }),
+    ]);
+
+    const withoutImages = hydrateStreamState([{ event: incomplete, timestamp }]);
+    const replaced = replaceWithCanonicalStream({
+      canonical: withoutImages,
+      previousTail: replay,
+      previousHead: [],
+      sendingClientMessageIds: [],
+      preserveContinuity: true,
+      canonicalCoverage: { epoch: "epoch", endSeq: 1 },
+    });
+    expect(replaced.tail).toEqual(replay);
+  });
+
   it("replaces provisional optimistic turn membership with canonical membership", () => {
     const optimistic = createUserMessage({
       clientMessageId: "hello-client",

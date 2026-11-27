@@ -1169,11 +1169,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           <UserMessage
             itemId={item.id}
             serverId={resolvedServerId}
+            workspaceId={context.workspaceId ?? undefined}
             agentId={agentId}
             messageId={item.messageId}
             message={item.text}
             sender={item.sender}
             images={item.images}
+            imageAttachments={item.imageAttachments}
+            topicAttribution={item}
             attachments={item.attachments}
             timestamp={item.timestamp.getTime()}
             capabilities={context.capabilities}

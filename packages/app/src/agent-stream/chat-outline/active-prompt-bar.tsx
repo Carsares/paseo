@@ -3,6 +3,7 @@ import { Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { EdgeFade } from "@/components/ui/edge-fade";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { isWeb } from "@/constants/platform";
@@ -70,6 +71,12 @@ export const ActivePromptBar = memo(function ActivePromptBar({
       style={[styles.overlay, inlineUnistylesStyle({ top: topOverlayInset })]}
     >
       {isWeb ? <style>{HIDE_DURING_CHAT_FIND}</style> : null}
+      {isWeb ? (
+        <>
+          <View pointerEvents="none" style={styles.backdrop} />
+          <EdgeFade edge="top" solidFraction={0} backdrop="surface0" style={styles.backdropFade} />
+        </>
+      ) : null}
       <View
         testID="active-prompt-bar"
         style={[styles.card, inlineUnistylesStyle({ maxWidth: contentMaxWidth })]}
@@ -118,8 +125,24 @@ const styles = StyleSheet.create((theme) => ({
     right: 0,
     alignItems: "center",
     paddingTop: theme.spacing[2],
+    paddingBottom: isWeb ? theme.spacing[2] : 0,
     paddingHorizontal: theme.spacing[3],
     zIndex: 3,
+  },
+  backdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: theme.colors.surface0,
+  },
+  backdropFade: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    right: 0,
+    height: theme.spacing[6],
   },
   card: {
     flexDirection: "row",

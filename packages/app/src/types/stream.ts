@@ -4,6 +4,7 @@ import type {
   AgentProvider,
   AgentTimelineItem,
   JsonValue,
+  MessageImageAttachment,
   TimelineTopicAttribution,
   ToolCallDetail,
   UserMessageForkContext,
@@ -111,6 +112,7 @@ export interface UserMessageItem {
   text: string;
   timestamp: Date;
   images?: UserMessageImageAttachment[];
+  imageAttachments?: MessageImageAttachment[];
   attachments?: AgentAttachment[];
   /** Set when this message's turn ended via `turn_canceled`. */
   turnCanceled?: true;
@@ -128,6 +130,7 @@ export interface UserMessageInput {
   text: string;
   timestamp: Date;
   images?: UserMessageImageAttachment[];
+  imageAttachments?: MessageImageAttachment[];
   attachments?: AgentAttachment[];
   /** Set when this message's turn ended via `turn_canceled`. */
   turnCanceled?: true;
@@ -160,6 +163,7 @@ export function createUserMessage(input: UserMessageInput): UserMessageItem {
     text: input.text,
     timestamp: input.timestamp,
     ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+    ...(input.imageAttachments?.length ? { imageAttachments: input.imageAttachments } : {}),
     ...(input.attachments && input.attachments.length > 0
       ? { attachments: input.attachments }
       : {}),
@@ -345,6 +349,7 @@ function isSameUserMessage(existing: UserMessageItem, merged: UserMessageItem): 
     existing.text === merged.text &&
     existing.timestamp === merged.timestamp &&
     existing.images === merged.images &&
+    existing.imageAttachments === merged.imageAttachments &&
     existing.attachments === merged.attachments
   );
 }
@@ -380,6 +385,7 @@ function produceUserMessage(
   const merged = createUserMessage({
     ...presentation,
     attachments: mergeUserMessageAttachments(presentation.attachments, other.attachments),
+    imageAttachments: incoming.imageAttachments ?? existing.imageAttachments,
     clientMessageId: incoming.clientMessageId ?? existing.clientMessageId,
     messageId: incoming.messageId ?? existing.messageId,
     topicKey: incoming.topicKey ?? existing.topicKey,
@@ -1061,39 +1067,6 @@ export function handoffCreatedAgentUserMessageToStream(params: {
   });
 }
 
-function appendUserMessage(
-  state: StreamItem[],
-  text: string,
-  timestamp: Date,
-  _source: StreamUpdateSource,
-  messageId?: string,
-  clientMessageId?: string,
-  timelineCursor?: TimelinePosition,
-  turnId?: string,
-  forkContext?: UserMessageForkContext,
-  topicAttribution?: TimelineTopicAttribution,
-): StreamItem[] {
-  const { chunk, hasContent } = normalizeChunk(text);
-  const attachments = forkContextToChatHistoryAttachments(forkContext);
-  if (!hasContent && !attachments) {
-    return state;
-  }
-
-  const chunkSeed = hasContent ? chunk.trim() || chunk : "chat_history";
-  const nextItem = createUserMessage({
-    id: messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp),
-    clientMessageId,
-    messageId,
-    timelineCursor,
-    turnId,
-    ...pickTopicAttribution(topicAttribution),
-    text: hasContent ? chunk : "",
-    timestamp,
-    attachments,
-  });
-  return upsertUserMessage(state, nextItem);
-}
-
 function appendAssistantMessage(
   state: StreamItem[],
   text: string,
@@ -1708,19 +1681,17 @@ function reduceTimelineEvent(
   const item = event.item;
   const topicAttribution = pickTopicAttribution(event);
   switch (item.type) {
-    case "user_message":
-      return appendUserMessage(
-        state,
-        item.text,
+    case "user_message": {
+      const { canonical, hasRenderableContent } = createCanonicalUserMessage({
+        existing: state,
+        item,
         timestamp,
-        source,
-        item.messageId,
-        item.clientMessageId,
         timelineCursor,
-        event.turnId,
-        item.forkContext,
+        turnId: event.turnId,
         topicAttribution,
-      );
+      });
+      return hasRenderableContent ? upsertUserMessage(state, canonical) : state;
+    }
     case "assistant_message":
       return appendAssistantMessage(
         state,
@@ -2148,10 +2119,12 @@ function createCanonicalUserMessage(input: {
     text: normalized.hasContent ? normalized.chunk : "",
     timestamp,
     attachments,
+    imageAttachments: item.imageAttachments,
   });
   return {
     canonical,
-    hasRenderableContent: normalized.hasContent || (attachments?.length ?? 0) > 0,
+    hasRenderableContent:
+      normalized.hasContent || Boolean(attachments?.length || canonical.imageAttachments?.length),
   };
 }
 

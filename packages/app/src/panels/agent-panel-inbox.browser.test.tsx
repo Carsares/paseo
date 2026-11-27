@@ -1389,12 +1389,16 @@ it("aligns topic cards, decisions, tracks and composer while reserving the timel
     expectColumnsToAlign(decision, card);
     expect(card.getBoundingClientRect().width).toBeCloseTo(expectedWidth);
   };
+  const expectTracksBelowTopicViewport = () => {
+    const topicViewport = view.getByTestId("topic-stream-list").getBoundingClientRect();
+    const tracksRow = view.getByTestId("agent-tracks-row").getBoundingClientRect();
+    expect(topicViewport.bottom).toBeLessThanOrEqual(tracksRow.top);
+    expect(tracks().getBoundingClientRect().bottom).toBeLessThanOrEqual(tracksRow.bottom);
+  };
 
   expect(decisionRail.matches(railSelector)).toBe(true);
-  expect(getComputedStyle(decisionRail).marginBottom).toBe("52px");
+  expectTracksBelowTopicViewport();
   expect(decision.getBoundingClientRect().bottom).toBeLessThan(task.getBoundingClientRect().top);
-  const topicContent = view.getByTestId("topic-stream-list").firstElementChild!.firstElementChild!;
-  expect(getComputedStyle(topicContent).paddingBottom).toBe("34px");
   expectTopicColumns(DEFAULT_CONTENT_MAX_WIDTH);
   await userEvent.click(page.getByTestId("topic-stream-mode-timeline"));
   await vi.waitFor(() => {
@@ -1420,9 +1424,7 @@ it("aligns topic cards, decisions, tracks and composer while reserving the timel
   await vi.waitFor(() => expectTopicColumns(width - 32));
   await userEvent.click(page.getByRole("button", { name: "Dismiss reminder" }));
   expect(view.queryByTestId("agent-durable-items-rail")).toBeNull();
-  const expandedContent =
-    view.getByTestId("topic-stream-list").firstElementChild!.firstElementChild!;
-  expect(getComputedStyle(expandedContent).paddingBottom).toBe("86px");
+  expectTracksBelowTopicViewport();
 });
 
 it("keeps the task pill clear of the decision evidence in a compact conversation", async () => {
@@ -1435,13 +1437,11 @@ it("keeps the task pill clear of the decision evidence in a compact conversation
     false,
     { features: reminderFeatures },
   );
-  const decisionRail = await view.findByTestId("agent-durable-items-rail");
-  const decision = view.getByTestId("durable-item-card");
+  const decision = await view.findByTestId("durable-item-card");
   const task = await view.findByTestId("workspace-task-ledger");
   const textbox = view.getByRole("textbox", { name: "Message agent..." });
   const composerColumn = textbox.closest('[data-chat-rail-lane="true"]')!.firstElementChild!;
   expectColumnsToAlign(decision, composerColumn as HTMLElement);
-  expect(getComputedStyle(decisionRail).marginBottom).toBe("48px");
   expect(decision.getBoundingClientRect().bottom).toBeLessThan(task.getBoundingClientRect().top);
 });
 

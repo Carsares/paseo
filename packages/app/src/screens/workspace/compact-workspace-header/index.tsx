@@ -77,7 +77,7 @@ export function CompactWorkspaceHeader({
     explorer: topicHeader && actionsInBar ? null : explorerAction,
   };
   const topicTitle = useMemo(() => {
-    if (!topicHeader && !(showDirectoryToggle && openDirectory)) return titleContent;
+    if (!topicHeader && !modeTarget && !(showDirectoryToggle && openDirectory)) return titleContent;
     return (
       <WorkspaceTopicHeaderLeading
         compact={isCompact}

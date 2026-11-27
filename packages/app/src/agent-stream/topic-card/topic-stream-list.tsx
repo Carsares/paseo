@@ -1,7 +1,4 @@
-import { Buffer } from "buffer";
-import { resolveRasterImageMimeType } from "@/attachments/file-types";
-import type { MessageImageReader } from "@/components/read-only-message-images";
-import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
+import { useMessageImageReader } from "@/components/user-message/image-reader";
 import type {
   AgentAttachment,
   TopicReplyRouteMode,
@@ -42,9 +39,14 @@ import {
 } from "@/durable-items/queries";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
 import { useFilePicker } from "@/hooks/use-file-picker";
+import { useAppVisible } from "@/hooks/use-app-visible";
 import { usePaneContext } from "@/panels/pane-context";
 import { useHostFeature } from "@/runtime/host-features";
-import { getHostRuntimeStore, useHostRuntimeClient } from "@/runtime/host-runtime";
+import {
+  getHostRuntimeStore,
+  useHostRuntimeClient,
+  useHostRuntimeIsConnected,
+} from "@/runtime/host-runtime";
 import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 import {
   buildTopicInboxReadScopeKey,
@@ -108,9 +110,7 @@ const retryIntents = new Map<
   { clientMessageId: string; attachments?: AgentAttachment[] }
 >();
 
-// The file API handles this virtual attachment address with the authenticated upload owner.
-const MESSAGE_IMAGE_PREFIX = "paseo-attachment:";
-const MAX_MESSAGE_IMAGE_BYTES = 50 * 1024 * 1024;
+const PENDING_FOLLOWUP_REFRESH_MS = 2_000;
 
 function readRetryUploadNames(error: TopicReplyRejectedError): string[] | null {
   const prefix = "topic_attachments_reupload_required:";
@@ -584,27 +584,9 @@ export const TopicStreamList = memo(function TopicStreamList({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const client = useHostRuntimeClient(serverId);
-  const workspaceDirectory = useWorkspaceDirectory(serverId, workspaceId);
-  const imageReader = useMemo<MessageImageReader | undefined>(() => {
-    if (!client || !workspaceDirectory) return undefined;
-    return {
-      serverId,
-      workspaceId,
-      read: async (image) => {
-        const file = await client.readFile(
-          workspaceDirectory,
-          MESSAGE_IMAGE_PREFIX + image.id,
-          undefined,
-          Math.min(image.size, MAX_MESSAGE_IMAGE_BYTES),
-        );
-        const mime = resolveRasterImageMimeType({ mimeType: file.mime });
-        if (!mime || mime !== image.mimeType || file.size !== image.size) {
-          throw new Error("Image attachment is unavailable.");
-        }
-        return "data:" + mime + ";base64," + Buffer.from(file.bytes).toString("base64");
-      },
-    };
-  }, [client, serverId, workspaceDirectory, workspaceId]);
+  const online = useHostRuntimeIsConnected(serverId);
+  const imageReader = useMessageImageReader(client, serverId, workspaceId);
+  const appVisible = useAppVisible();
   const paneActive = useRetainedPanelActive();
   const { tabId } = usePaneContext();
   const teamDirectoryShell = useTeamDirectoryShell();
@@ -639,6 +621,21 @@ export const TopicStreamList = memo(function TopicStreamList({
     anchors: topicAnchors,
     refetch: refetchTopicEntries,
   } = useWorkspaceTopicEntries(serverId, workspaceId, mainAgentId, paneActive);
+  const hasPendingFollowup = threadEntries.some(
+    (entry) =>
+      entry.role === "user_followup" &&
+      !entry.retryable &&
+      (entry.status === "queued" || entry.status === "running"),
+  );
+  useEffect(() => {
+    if (!online || !paneActive || !appVisible || !hasPendingFollowup) return;
+    // The initial response is queued and later delivery updates can be missed.
+    // Read the persisted entries so a different turn cannot settle this follow-up.
+    const interval = setInterval(() => {
+      void refetchTopicEntries({ cancelRefetch: false });
+    }, PENDING_FOLLOWUP_REFRESH_MS);
+    return () => clearInterval(interval);
+  }, [appVisible, hasPendingFollowup, online, paneActive, refetchTopicEntries]);
   const supportsTopicAnchorEvents = useHostFeature(serverId, "workspaceTopicAnchorEvents");
   useEffect(() => {
     // COMPAT(workspaceTopicAnchorEvents): added in v0.18.0, remove gate after 2027-06-01.

@@ -1,3 +1,6 @@
+import { createInstance } from "i18next";
+import { en } from "@/i18n/resources/en";
+import { zhCN } from "@/i18n/resources/zh-CN";
 import { describe, expect, it } from "vitest";
 import {
   backAddProjectPage,
@@ -111,22 +114,50 @@ describe("Add Project navigation", () => {
 });
 
 describe("Add Project options", () => {
+  const translations = createInstance();
+  void translations.init({
+    lng: "en",
+    resources: { en: { translation: en }, "zh-CN": { translation: zhCN } },
+    initAsync: false,
+    interpolation: { escapeValue: false },
+  });
+  const t = translations.getFixedT("en");
+
+  it("localizes method labels and descriptions without changing host and path values", () => {
+    const chinese = translations.getFixedT("zh-CN");
+    expect(buildAddProjectMethods(HOST, chinese)).toMatchObject([
+      { label: "搜索目录", description: "在 Local 上查找目录" },
+      { label: "浏览", description: "在 Finder 中选择或创建目录" },
+      { label: "从 GitHub 克隆" },
+      { label: "新建目录", description: "在 Local 上创建空目录" },
+    ]);
+    expect(
+      buildCloneLocationOptions(
+        { parents: ["~/dev"], repositoryName: "paseo", existingPaths: [] },
+        chinese,
+      ),
+    ).toMatchObject([{ displayPath: "~/dev/paseo", secondaryText: "父目录：~/dev" }]);
+  });
+
   it("hides every mutating method when the host lacks stable project identity", () => {
     const outdatedHost = { ...HOST, canAddProject: false };
 
-    expect(buildAddProjectMethods(outdatedHost)).toEqual([]);
-    expect(addProjectMethodEmptyText(outdatedHost)).toBe("Update the host to use Add Project.");
+    expect(buildAddProjectMethods(outdatedHost, t)).toEqual([]);
+    expect(addProjectMethodEmptyText(outdatedHost, t)).toBe("Update the host to use Add Project.");
   });
 
   it("keeps host-upgrade methods discoverable while hiding local-only Browse", () => {
     expect(
-      buildAddProjectMethods({
-        ...HOST,
-        canBrowse: false,
-        canCloneGithubRepositories: false,
-        canSearchGithubRepositories: false,
-        canCreateDirectory: false,
-      }),
+      buildAddProjectMethods(
+        {
+          ...HOST,
+          canBrowse: false,
+          canCloneGithubRepositories: false,
+          canSearchGithubRepositories: false,
+          canCreateDirectory: false,
+        },
+        t,
+      ),
     ).toEqual([
       {
         id: "directory-search",
@@ -149,27 +180,30 @@ describe("Add Project options", () => {
   });
 
   it("offers manual URL and protocol-specific owner/repo clone choices", () => {
-    expect(buildManualGithubRepositoryChoices("git@github.com:getpaseo/paseo.git")).toEqual([
+    expect(buildManualGithubRepositoryChoices("git@github.com:getpaseo/paseo.git", t)).toEqual([
       expect.objectContaining({
         id: "manual:git@github.com:getpaseo/paseo.git",
         nameWithOwner: "getpaseo/paseo",
         cloneUrl: "git@github.com:getpaseo/paseo.git",
       }),
     ]);
-    expect(buildManualGithubRepositoryChoices("getpaseo/paseo")).toEqual([
+    expect(buildManualGithubRepositoryChoices("getpaseo/paseo", t)).toEqual([
       expect.objectContaining({ cloneProtocol: "https", cloneUrl: "getpaseo/paseo" }),
       expect.objectContaining({ cloneProtocol: "ssh", cloneUrl: "getpaseo/paseo" }),
     ]);
-    expect(buildManualGithubRepositoryChoices("paseo")).toEqual([]);
+    expect(buildManualGithubRepositoryChoices("paseo", t)).toEqual([]);
   });
 
   it("shows final clone paths while retaining parent paths as values", () => {
     expect(
-      buildCloneLocationOptions({
-        parents: ["~/dev", "~/workspace"],
-        repositoryName: "paseo",
-        existingPaths: ["~/workspace/paseo"],
-      }),
+      buildCloneLocationOptions(
+        {
+          parents: ["~/dev", "~/workspace"],
+          repositoryName: "paseo",
+          existingPaths: ["~/workspace/paseo"],
+        },
+        t,
+      ),
     ).toEqual([
       {
         id: "~/dev",
@@ -190,11 +224,14 @@ describe("Add Project options", () => {
 
   it("shows equivalent absolute-home and tilde destinations only once", () => {
     expect(
-      buildCloneLocationOptions({
-        parents: ["/Users/moboudra/dev", "~/dev"],
-        repositoryName: "dotfiles",
-        existingPaths: [],
-      }),
+      buildCloneLocationOptions(
+        {
+          parents: ["/Users/moboudra/dev", "~/dev"],
+          repositoryName: "dotfiles",
+          existingPaths: [],
+        },
+        t,
+      ),
     ).toEqual([
       {
         id: "/Users/moboudra/dev",

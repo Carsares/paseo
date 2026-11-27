@@ -1285,13 +1285,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const hasAgentComposer = showsComposer && hasActiveComposer && !draft;
   const hasAgentTracks = hasActiveComposer && !draft;
   const reminders = useAgentDurableReminders(serverId, workspaceId, agentState.id, isPaneFocused);
-  const { reminderTrackClearance, streamTailClearance, streamControlClearance } =
-    resolveAgentTrackClearances(
-      useIsCompactFormFactor(),
-      hasActiveComposer,
-      hasAgentTracks,
-      reminders.items.length > 0,
-    );
+  const compact = useIsCompactFormFactor();
   const queryClient = useQueryClient();
   const canSubmitSelection = useStableEvent(
     (selectedAgentId: string, selectedWorkspaceId: string) => {
@@ -1387,6 +1381,14 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       showHistorySyncError,
     });
   const useTopicCards = useTopicStreamMode(serverId, agentId) === "topics" && isMainControlStream;
+  const { reminderTrackClearance, streamTailClearance, streamControlClearance } =
+    resolveAgentTrackClearances(
+      compact,
+      hasActiveComposer,
+      hasAgentTracks,
+      reminders.items.length > 0,
+      useTopicCards,
+    );
   const handleFocusCompactComposer = useCallback(() => {
     composerEditingSession.focus();
   }, [composerEditingSession]);
@@ -1556,6 +1558,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           workspaceId={workspaceId}
           agentId={agentId}
           parentAgentId={parentPillAgentId}
+          reserveSpace={useTopicCards}
         />
       ) : null}
     </View>
@@ -1817,7 +1820,11 @@ function resolveAgentTrackClearances(
   hasActiveComposer: boolean,
   hasAgentTracks: boolean,
   hasReminders: boolean,
+  tracksInFlow: boolean,
 ) {
+  if (tracksInFlow) {
+    return { reminderTrackClearance: 0, streamControlClearance: 0, streamTailClearance: 0 };
+  }
   // The floating track bar reserves a stable lane even when its pills come and go. The
   // reminders take over that lane when visible, leaving only the transcript's trailing gap.
   const trackControlClearance = hasActiveComposer
