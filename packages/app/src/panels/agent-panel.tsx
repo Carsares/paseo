@@ -54,7 +54,7 @@ import {
   renderPendingPermissionsNode,
   type AgentStreamViewHandle,
 } from "@/agent-stream/view";
-import { AgentDurableItems } from "@/durable-items/card";
+import { AgentDurableItems, useAgentDurableReminders } from "@/durable-items/card";
 import { CHAT_COLUMN_RAIL_DATASET, ChatColumnRailSurface } from "@/chat-rail";
 import { ArchivedAgentCallout } from "@/components/archived-agent-callout";
 import { ComposerDock } from "@/composer/dock";
@@ -1283,6 +1283,15 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
   const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
   const hasAgentComposer = showsComposer && hasActiveComposer && !draft;
+  const hasAgentTracks = hasActiveComposer && !draft;
+  const reminders = useAgentDurableReminders(serverId, workspaceId, agentState.id, isPaneFocused);
+  const { reminderTrackClearance, streamTailClearance, streamControlClearance } =
+    resolveAgentTrackClearances(
+      useIsCompactFormFactor(),
+      hasActiveComposer,
+      hasAgentTracks,
+      reminders.items.length > 0,
+    );
   const queryClient = useQueryClient();
   const canSubmitSelection = useStableEvent(
     (selectedAgentId: string, selectedWorkspaceId: string) => {
@@ -1527,7 +1536,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           hasAppliedAuthoritativeHistory={hasAppliedAuthoritativeHistory}
           isInitialHistoryLoading={isInitialHistoryLoading}
           revealInitialHistory={revealInitialHistory}
-          hasActiveComposer={hasActiveComposer}
+          bottomOverlayTailClearance={streamTailClearance}
+          bottomOverlayControlClearance={streamControlClearance}
           toast={toastApi}
           quoteTarget={quoteTarget}
           canSubmitSelection={canSubmitSelection}
@@ -1537,12 +1547,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       </RenderProfile>
       <AgentDurableItems
         serverId={serverId}
-        workspaceId={workspaceId}
-        agentId={agentState.id}
-        isPaneFocused={isPaneFocused}
-        pendingOnly={isMainControlStream}
+        reminders={reminders}
+        trackClearance={reminderTrackClearance}
       />
-      {hasActiveComposer && !draft ? (
+      {hasAgentTracks ? (
         <AgentTracks
           serverId={serverId}
           workspaceId={workspaceId}
@@ -1804,6 +1812,27 @@ function SheetAgentFacts({ serverId, agentId }: { serverId: string; agentId: str
   return text ? <PaneSubtitle text={text} testID="agent-pane-subtitle" /> : null;
 }
 
+function resolveAgentTrackClearances(
+  isCompact: boolean,
+  hasActiveComposer: boolean,
+  hasAgentTracks: boolean,
+  hasReminders: boolean,
+) {
+  // The floating track bar reserves a stable lane even when its pills come and go. The
+  // reminders take over that lane when visible, leaving only the transcript's trailing gap.
+  const trackControlClearance = hasActiveComposer
+    ? resolveComposerTrackControlClearance(isCompact)
+    : 0;
+  const reminderTrackClearance = hasAgentTracks && hasReminders ? trackControlClearance : 0;
+  return {
+    reminderTrackClearance,
+    streamControlClearance: trackControlClearance - reminderTrackClearance,
+    streamTailClearance:
+      (hasActiveComposer ? resolveComposerTrackTailClearance(isCompact) : 0) -
+      reminderTrackClearance,
+  };
+}
+
 const AgentStreamSection = memo(function AgentStreamSection({
   isSubagent,
   useTopicCards = false,
@@ -1818,7 +1847,8 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasAppliedAuthoritativeHistory,
   isInitialHistoryLoading,
   revealInitialHistory,
-  hasActiveComposer,
+  bottomOverlayTailClearance,
+  bottomOverlayControlClearance,
   toast,
   quoteTarget,
   canSubmitSelection,
@@ -1838,22 +1868,14 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasAppliedAuthoritativeHistory: boolean;
   isInitialHistoryLoading: boolean;
   revealInitialHistory: boolean;
-  hasActiveComposer: boolean;
+  bottomOverlayTailClearance: number;
+  bottomOverlayControlClearance: number;
   toast: ReturnType<typeof useToastHost>["api"];
   quoteTarget: ComposerQuoteTarget | null;
   canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
   onFocusCompactComposer?: () => void;
 }) {
-  const isCompactFormFactor = useIsCompactFormFactor();
-  // The track bar's space is reserved whenever the bar is mounted, pills or not: pills come and go
-  // every turn, and the transcript must not jump with them.
-  const bottomOverlayTailClearance = hasActiveComposer
-    ? resolveComposerTrackTailClearance(isCompactFormFactor)
-    : 0;
-  const bottomOverlayControlClearance = hasActiveComposer
-    ? resolveComposerTrackControlClearance(isCompactFormFactor)
-    : 0;
   const streamItemsRaw = useAgentStreamTail(serverId, agentId);
   const streamHeadRaw = useSessionStore((state) =>
     useTopicCards && agentId ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,

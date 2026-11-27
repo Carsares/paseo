@@ -29,7 +29,10 @@ import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/s
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import { useSessionStore, type Agent, type WorkspaceDescriptor } from "@/stores/session-store";
 import { TURN_LIVENESS_IDLE } from "@/timeline/turn-liveness";
-import { AgentDurableItems, DurableItemCard } from "./card";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { AgentDurableItems, DurableItemCard, useAgentDurableReminders } from "./card";
+import { applyDurableItemUpdateToCache } from "./queries";
+import { useReminderDismissalStore } from "./reminder-dismissal-store";
 
 vi.mock("@/constants/layout", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/constants/layout")>()),
@@ -182,17 +185,17 @@ function serve(items: WorkspaceDurableItem[]) {
   return { list, decide, snapshot, readFile };
 }
 
-function render(agentId = "agent", active = true, pendingOnly = false) {
+function ReminderList({ agentId }: { agentId: string }) {
+  const reminders = useAgentDurableReminders("host", "workspace", agentId);
+  return <AgentDurableItems serverId="host" reminders={reminders} />;
+}
+
+function render(agentId = "agent", active = true) {
   act(() =>
     root.render(
       <QueryClientProvider client={queryClient}>
         <RetainedPanelActivity active={active}>
-          <AgentDurableItems
-            serverId="host"
-            workspaceId="workspace"
-            agentId={agentId}
-            pendingOnly={pendingOnly}
-          />
+          <ReminderList agentId={agentId} />
         </RetainedPanelActivity>
       </QueryClientProvider>,
     ),
@@ -403,12 +406,24 @@ it("shows only pending requests from this agent and workspace", async () => {
   ]);
 });
 
-it("keeps resolved requests visible in an ordinary conversation", async () => {
-  serve([pending, decided({ ...pending, requestId: "old", title: "Earlier authorization" })]);
+it("shows only pending requests above an ordinary conversation", async () => {
+  serve([
+    pending,
+    decided({ ...pending, requestId: "old", title: "Earlier authorization" }),
+    {
+      ...pending,
+      requestId: "expired",
+      status: "expired",
+      expiredAt: pending.createdAt,
+      title: "Expired authorization",
+    },
+  ]);
   seedConversationAgents();
   const view = renderConversation("agent");
-  await view.findByText("Earlier authorization");
-  expect(view.getAllByTestId("durable-item-card")).toHaveLength(2);
+  await view.findByText(pending.title);
+  expect(view.queryByText("Earlier authorization")).toBeNull();
+  expect(view.queryByText("Expired authorization")).toBeNull();
+  expect(view.getAllByTestId("durable-item-card")).toHaveLength(1);
   expect(view.getAllByRole("button", { name: "Approve" })).toHaveLength(1);
 });
 
@@ -456,7 +471,7 @@ it("blocks a stale evidence revision in both the conversation and the sidebar de
   act(() =>
     root.render(
       <QueryClientProvider client={queryClient}>
-        <AgentDurableItems serverId="host" workspaceId="workspace" agentId="agent" />
+        <ReminderList agentId="agent" />
         <DurableItemCard serverId="host" item={review} />
       </QueryClientProvider>,
     ),
@@ -474,11 +489,64 @@ it("blocks a stale evidence revision in both the conversation and the sidebar de
   expect(view.queryByText("Approved")).toBeNull();
 });
 
+const dismissibleReview = { ...review, requestId: "dismissed-review", title: "Dismissible review" };
+
+it("dismisses only the composer reminder, restores dismissal on reload, and shows a newer revision", async () => {
+  const items: WorkspaceDurableItem[] = [dismissibleReview];
+  const { decide } = serve(items);
+  const renderCards = () => {
+    act(() =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ReminderList agentId="agent" />
+          <DurableItemCard serverId="host" item={dismissibleReview} />
+        </QueryClientProvider>,
+      ),
+    );
+    return within(container);
+  };
+  const view = renderCards();
+  const dismiss = await view.findByRole("button", { name: "Dismiss reminder" });
+  act(() => dismiss.click());
+  expect(view.queryByTestId("agent-durable-items-rail")).toBeNull();
+  expect(view.getByText(dismissibleReview.title)).toBeTruthy();
+  expect(decide).not.toHaveBeenCalled();
+
+  const store = useReminderDismissalStore;
+  const { name } = store.persist.getOptions();
+  const saved = await AsyncStorage.getItem(name!);
+  expect(saved).not.toBeNull();
+  act(() => root.unmount());
+  // Restart with the initial in-memory state and the storage bytes from before unmounting.
+  store.setState(store.getInitialState(), true);
+  await AsyncStorage.setItem(name!, saved!);
+  await store.persist.rehydrate();
+  root = createRoot(container);
+  renderCards();
+  await expect.element(await view.findByRole("button", { name: "Accept" })).toBeEnabled();
+  expect(view.queryByRole("button", { name: "Dismiss reminder" })).toBeNull();
+
+  const updated = {
+    ...dismissibleReview,
+    title: "Updated review",
+    revision: dismissibleReview.revision + 1,
+  };
+  items[0] = updated;
+  await act(async () =>
+    applyDurableItemUpdateToCache(queryClient, "host", {
+      workspaceId: updated.workspaceId,
+      item: updated,
+    }),
+  );
+  const reminder = within(await view.findByTestId("agent-durable-items"));
+  expect(reminder.getByText("Updated review")).toBeTruthy();
+});
+
 it("collapses the request list when the last pending request is resolved remotely", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const items: WorkspaceDurableItem[] = [pending];
   const { list, decide } = serve(items);
-  const view = render("agent", true, true);
+  const view = render("agent");
   await expect.element(await view.findByRole("button", { name: "Approve" })).toBeEnabled();
 
   items[0] = decided(pending);
@@ -487,7 +555,7 @@ it("collapses the request list when the last pending request is resolved remotel
   expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
   expect(decide).not.toHaveBeenCalled();
 
-  render("agent", false, true);
+  render("agent", false);
   const callsBeforeHiding = list.mock.calls.length;
   await act(async () => vi.advanceTimersByTimeAsync(30_000));
   expect(list).toHaveBeenCalledTimes(callsBeforeHiding);
@@ -495,7 +563,7 @@ it("collapses the request list when the last pending request is resolved remotel
 
 it("collapses the request list after a confirmed decision before refreshing the list", async () => {
   const { list, decide } = serve([pending]);
-  const view = render("agent", true, true);
+  const view = render("agent");
   const approve = await view.findByRole("button", { name: "Approve" });
   await expect.element(approve).toBeEnabled();
   const result = decided(pending);
@@ -520,7 +588,7 @@ it("collapses the request list after a confirmed decision before refreshing the 
 
 it("blocks a cached action until a returning host confirms its latest state", async () => {
   const { list, decide, snapshot } = serve([pending]);
-  const renderPending = () => render("agent", true, true);
+  const renderPending = () => render("agent");
   const view = renderPending();
   await expect.element(await view.findByRole("button", { name: "Approve" })).toBeEnabled();
 

@@ -133,6 +133,7 @@ export function useWorkspaceDurableItems(
   serverId: string,
   workspaceId: string,
   paneFocused = true,
+  hasSourceAgent = true,
 ) {
   const paneActive = useRetainedPanelActive();
   const appVisible = useAppVisible();
@@ -140,7 +141,7 @@ export function useWorkspaceDurableItems(
   const supported = useHostFeatureMap(serverIds, FEATURE).get(serverId) === true;
   const butlerSupported = useHostFeatureMap(serverIds, BUTLER_FEATURE).get(serverId) === true;
   const online = useHostRuntimeConnectionStatuses(serverIds).get(serverId) === "online";
-  const enabled = paneActive && appVisible && supported && online;
+  const enabled = hasSourceAgent && paneActive && appVisible && supported && online;
   const result = useFetchQuery(query(serverId, enabled, workspaceId, butlerSupported));
   useRefreshOnFocus(enabled && paneFocused, () => {
     void result.refetch({ cancelRefetch: false });

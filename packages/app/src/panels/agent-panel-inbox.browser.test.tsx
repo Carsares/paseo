@@ -306,6 +306,7 @@ async function mountTopicConversation(
     headerWorkspaceId?: string;
     paneFallback?: { agentId: string; tabId: string };
     chatOutline?: boolean;
+    features?: ServerInfoStatusPayload["features"];
   },
 ) {
   compactTestLayout = width < 600;
@@ -342,6 +343,7 @@ async function mountTopicConversation(
       workspaceTopicThreads: true,
       rewindPendingFiles: Boolean(options?.rewindRecovery),
       agentTimelinePromptIndex: Boolean(options?.chatOutline),
+      ...options?.features,
     },
   });
   publishAgent(
@@ -1326,15 +1328,52 @@ function expectColumnsToAlign(card: HTMLElement, reference: HTMLElement) {
   expect(bounds.width).toBeCloseTo(expected.width);
 }
 
-it("aligns the topic cards, tracks and composer while reserving the gutter in the timeline", async () => {
+function createDecisionReminderClient(requestId: string) {
   const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
-  const width = CHAT_OUTLINE_MIN_PANEL_WIDTH + 2;
-  await mountTopicConversation(client, true, width, false, [], true, { chatOutline: true });
+  vi.spyOn(client, "listWorkspaceTasks").mockResolvedValue([]);
+  vi.spyOn(client, "listWorkspaceDurableItems").mockResolvedValue({
+    requestId: "list",
+    items: [
+      {
+        workspaceId: pane.workspaceId,
+        requestId,
+        sourceAgentId: agentId,
+        sourceTurnId: "turn",
+        kind: "decision",
+        status: "pending",
+        revision: 0,
+        title: "Review the decision",
+        createdAt: "2026-04-20T00:00:00.000Z",
+        evidence: [{ type: "file", path: "decision.md", fingerprint: "saved" }],
+      },
+    ],
+    nextCursor: null,
+    error: null,
+  });
+  return client;
+}
+
+const reminderFeatures = { workspaceDurableItemsV1: true, workspaceTaskLedger: true };
+
+it("aligns topic cards, decisions, tracks and composer while reserving the timeline outline gutter", async () => {
+  const width = 1320;
+  await mountTopicConversation(
+    createDecisionReminderClient("wide-decision"),
+    true,
+    width,
+    false,
+    [],
+    true,
+    { chatOutline: true, features: reminderFeatures },
+  );
   await userEvent.click(page.getByRole("button", { name: "Hide team directory" }));
 
   const railSelector = '[data-chat-rail-lane="true"]';
   const topicCard = () => view.getByTestId("topic-thread-card-msg:a");
   const tracks = () => view.getByTestId("composer-track-scroll");
+  const decision = await view.findByTestId("durable-item-card");
+  const decisionRail = view.getByTestId("agent-durable-items-rail");
+  const task = await view.findByTestId("workspace-task-ledger");
   const composerRail = () => {
     const input: HTMLElement = view.getByRole("textbox", { name: "Message agent..." });
     return input.closest<HTMLElement>(railSelector)!;
@@ -1347,9 +1386,15 @@ it("aligns the topic cards, tracks and composer while reserving the gutter in th
     expect(getComputedStyle(tracks().closest(railSelector)!).paddingLeft).toBe("16px");
     expectColumnsToAlign(card, rail.firstElementChild as HTMLElement);
     expectColumnsToAlign(card, tracks().closest(railSelector)!.firstElementChild as HTMLElement);
+    expectColumnsToAlign(decision, card);
     expect(card.getBoundingClientRect().width).toBeCloseTo(expectedWidth);
   };
 
+  expect(decisionRail.matches(railSelector)).toBe(true);
+  expect(getComputedStyle(decisionRail).marginBottom).toBe("52px");
+  expect(decision.getBoundingClientRect().bottom).toBeLessThan(task.getBoundingClientRect().top);
+  const topicContent = view.getByTestId("topic-stream-list").firstElementChild!.firstElementChild!;
+  expect(getComputedStyle(topicContent).paddingBottom).toBe("34px");
   expectTopicColumns(DEFAULT_CONTENT_MAX_WIDTH);
   await userEvent.click(page.getByTestId("topic-stream-mode-timeline"));
   await vi.waitFor(() => {
@@ -1360,6 +1405,8 @@ it("aligns the topic cards, tracks and composer while reserving the gutter in th
     expect(getComputedStyle(tracks().closest(railSelector)!).paddingLeft).toBe(
       `${16 + CHAT_OUTLINE_GUTTER_INSET}px`,
     );
+    expect(getComputedStyle(decisionRail).paddingLeft).toBe(`${16 + CHAT_OUTLINE_GUTTER_INSET}px`);
+    expectColumnsToAlign(decision, composerRail().firstElementChild as HTMLElement);
   });
 
   await userEvent.click(page.getByTestId("topic-stream-mode-topics"));
@@ -1367,8 +1414,35 @@ it("aligns the topic cards, tracks and composer while reserving the gutter in th
   await vi.waitFor(() => expectTopicColumns(420 - 32));
 
   container.style.width = `${width}px`;
+  container.style.setProperty("--test-content-max-width", "1200px");
+  await vi.waitFor(() => expectTopicColumns(1200));
   container.style.setProperty("--test-content-max-width", "100%");
   await vi.waitFor(() => expectTopicColumns(width - 32));
+  await userEvent.click(page.getByRole("button", { name: "Dismiss reminder" }));
+  expect(view.queryByTestId("agent-durable-items-rail")).toBeNull();
+  const expandedContent =
+    view.getByTestId("topic-stream-list").firstElementChild!.firstElementChild!;
+  expect(getComputedStyle(expandedContent).paddingBottom).toBe("86px");
+});
+
+it("keeps the task pill clear of the decision evidence in a compact conversation", async () => {
+  await mountTopicConversation(
+    createDecisionReminderClient("compact-decision"),
+    true,
+    390,
+    false,
+    [],
+    false,
+    { features: reminderFeatures },
+  );
+  const decisionRail = await view.findByTestId("agent-durable-items-rail");
+  const decision = view.getByTestId("durable-item-card");
+  const task = await view.findByTestId("workspace-task-ledger");
+  const textbox = view.getByRole("textbox", { name: "Message agent..." });
+  const composerColumn = textbox.closest('[data-chat-rail-lane="true"]')!.firstElementChild!;
+  expectColumnsToAlign(decision, composerColumn as HTMLElement);
+  expect(getComputedStyle(decisionRail).marginBottom).toBe("48px");
+  expect(decision.getBoundingClientRect().bottom).toBeLessThan(task.getBoundingClientRect().top);
 });
 
 it("aligns to the shared chat column with and without the outline gutter", async () => {

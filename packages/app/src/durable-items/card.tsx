@@ -1,14 +1,17 @@
+import { X } from "lucide-react-native";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
-import { StyleSheet } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import type {
   WorkspaceDurableItem,
   WorkspaceDurableItemEvidence,
 } from "@getpaseo/protocol/messages";
+import { CHAT_COLUMN_RAIL_DATASET } from "@/chat-rail";
 import { Button } from "@/components/ui/button";
+import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import {
@@ -29,8 +32,11 @@ import {
   reconcileDurableItemDecision,
   useWorkspaceDurableItems,
 } from "./queries";
+import { useReminderDismissalStore } from "./reminder-dismissal-store";
 
 const DECISIONS = ["approve", "reject", "request_changes"] as const;
+const EMPTY_REMINDERS: readonly WorkspaceDurableItem[] = [];
+const DismissIcon = withUnistyles(X, (theme) => ({ color: theme.colors.foregroundMuted }));
 // Keep a rejected revision blocked across chat and inbox cards, including after remounting.
 const useStaleEvidence = create<Readonly<Record<string, number>>>(() => ({}));
 
@@ -123,51 +129,64 @@ export function DurableItemCard({
   return <DurableItemCardContent serverId={serverId} snapshot={item} workspace={workspace} />;
 }
 
-interface AgentDurableItemsProps {
-  serverId: string;
-  workspaceId: string;
-  agentId: string | null;
-  isPaneFocused?: boolean;
-  pendingOnly?: boolean;
-}
-
-export function AgentDurableItems({ agentId, ...props }: AgentDurableItemsProps) {
-  if (!agentId) return null;
-  return <AgentDurableItemsList {...props} agentId={agentId} />;
-}
-
-function AgentDurableItemsList({
-  serverId,
-  workspaceId,
-  agentId,
+export function useAgentDurableReminders(
+  serverId: string,
+  workspaceId: string,
+  agentId: string | null,
   isPaneFocused = true,
-  pendingOnly = false,
-}: Omit<AgentDurableItemsProps, "agentId"> & { agentId: string }) {
-  const workspace = useWorkspaceDurableItems(serverId, workspaceId, isPaneFocused);
-  const items = workspace.result.data?.filter(
-    (item) =>
-      item.workspaceId === workspaceId &&
-      item.sourceAgentId === agentId &&
-      (!pendingOnly || item.status === "pending"),
+) {
+  const workspace = useWorkspaceDurableItems(serverId, workspaceId, isPaneFocused, !!agentId);
+  const revisions = useReminderDismissalStore((state) => state.revisions);
+  const items = useMemo(
+    () =>
+      agentId && revisions && workspace.result.data
+        ? workspace.result.data.filter(
+            (item) =>
+              item.workspaceId === workspaceId &&
+              item.sourceAgentId === agentId &&
+              item.status === "pending" &&
+              item.revision > (revisions[durableItemKey({ serverId, ...item })] ?? -1),
+          )
+        : EMPTY_REMINDERS,
+    [agentId, revisions, serverId, workspaceId, workspace.result.data],
   );
-  if (!items?.length) return null;
+  return { items, workspace };
+}
+
+export function AgentDurableItems({
+  serverId,
+  reminders: { items, workspace },
+  trackClearance = 0,
+}: {
+  serverId: string;
+  reminders: ReturnType<typeof useAgentDurableReminders>;
+  trackClearance?: number;
+}) {
+  if (!items.length) return null;
 
   return (
-    <ScrollView
-      style={styles.agentItems}
-      contentContainerStyle={styles.agentItemsContent}
-      nestedScrollEnabled
-      testID="agent-durable-items"
+    <View
+      style={[styles.agentItemsRail, { marginBottom: trackClearance }]}
+      dataSet={CHAT_COLUMN_RAIL_DATASET}
+      testID="agent-durable-items-rail"
     >
-      {items.map((item) => (
-        <DurableItemCardContent
-          key={durableItemKey({ serverId, workspaceId, requestId: item.requestId })}
-          serverId={serverId}
-          snapshot={item}
-          workspace={workspace}
-        />
-      ))}
-    </ScrollView>
+      <ScrollView
+        style={styles.agentItems}
+        contentContainerStyle={styles.agentItemsContent}
+        nestedScrollEnabled
+        testID="agent-durable-items"
+      >
+        {items.map((item) => (
+          <DurableItemCardContent
+            key={durableItemKey({ serverId, ...item })}
+            serverId={serverId}
+            snapshot={item}
+            workspace={workspace}
+            dismissible
+          />
+        ))}
+      </ScrollView>
+    </View>
   );
 }
 
@@ -175,10 +194,12 @@ function DurableItemCardContent({
   serverId,
   snapshot,
   workspace: { result, online },
+  dismissible = false,
 }: {
   serverId: string;
   snapshot: WorkspaceDurableItem;
   workspace: ReturnType<typeof useWorkspaceDurableItems>;
+  dismissible?: boolean;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -193,6 +214,10 @@ function DurableItemCardContent({
     workspaceId: item.workspaceId,
     requestId: item.requestId,
   });
+  const dismiss = useCallback(
+    () => useReminderDismissalStore.getState().dismiss(address, item.revision),
+    [address, item.revision],
+  );
   const [openEvidenceKey, setOpenEvidenceKey] = useState<string | null>(null);
   const staleEvidenceRevision = useStaleEvidence((state) => state[address]);
   const [feedback, setFeedback] = useState<"conflict" | "unconfirmed" | null>(null);
@@ -276,7 +301,18 @@ function DurableItemCardContent({
 
   return (
     <View style={styles.card} testID="durable-item-card">
-      <Text style={styles.meta}>{t(`topicWorkbench.durableItems.kind.${item.kind}`)}</Text>
+      <View style={styles.header}>
+        <Text style={styles.meta}>{t(`topicWorkbench.durableItems.kind.${item.kind}`)}</Text>
+        {dismissible ? (
+          <ToolbarButton
+            compact
+            label={t("topicWorkbench.durableItems.dismissReminder")}
+            onPress={dismiss}
+          >
+            <DismissIcon size={14} />
+          </ToolbarButton>
+        ) : null}
+      </View>
       <Text style={styles.title}>{item.title}</Text>
       {item.summary ? <Text style={styles.text}>{item.summary}</Text> : null}
       {[...evidenceByKey].map(([key, evidence]) => (
@@ -329,14 +365,21 @@ function DurableItemCardContent({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  agentItemsRail: {
+    flexShrink: 1,
+    alignItems: "center",
+    width: "100%",
+    paddingHorizontal: theme.spacing[4],
+  },
   agentItems: {
     flexGrow: 0,
     flexShrink: 1,
     maxHeight: 240,
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
   },
   agentItemsContent: {
     gap: theme.spacing[2],
-    paddingHorizontal: theme.spacing[3],
     paddingVertical: theme.spacing[2],
   },
   card: {
@@ -344,6 +387,11 @@ const styles = StyleSheet.create((theme) => ({
     padding: theme.spacing[3],
     borderRadius: theme.borderRadius.lg,
     backgroundColor: theme.colors.surface2,
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
   title: {
     color: theme.colors.foreground,
