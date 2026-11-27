@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open } from "node:fs/promises";
+import { mkdir, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { writePrivateFileAtomicSync } from "../../private-files.js";
@@ -137,13 +137,24 @@ async function writePrivate(file: string, data: string | Buffer): Promise<void> 
 }
 
 export class CheckpointStore {
-  private readonly workspaceDirectory: string;
+  readonly workspaceDirectory: string;
 
   constructor(
     private readonly home: string,
-    workspaceId: string,
+    workspace: string | { key: string },
   ) {
-    this.workspaceDirectory = path.join(home, "file-checkpoints", stableKey(workspaceId));
+    const key = typeof workspace === "string" ? stableKey(workspace) : workspace.key;
+    if (!/^[a-f0-9]{64}$/.test(key)) refuse("Invalid checkpoint workspace key");
+    this.workspaceDirectory = path.join(home, "file-checkpoints", key);
+  }
+
+  static async *existing(home: string): AsyncGenerator<CheckpointStore> {
+    const root = path.join(home, "file-checkpoints");
+    await requireRealPath(home);
+    if (!(await privateDirectory(root, false))) return;
+    for (const key of await readdir(root)) {
+      if (/^[a-f0-9]{64}$/.test(key)) yield new CheckpointStore(home, { key });
+    }
   }
 
   async open(create: boolean): Promise<boolean> {

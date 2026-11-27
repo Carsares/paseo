@@ -62,51 +62,66 @@ export async function runRewindDirectoryWriter<T>(
   }
 }
 
-export async function getAgentRewindScope(
+type AgentRewindScopeResult =
+  | { kind: "eligible"; scope: CheckpointScope }
+  | { kind: "not_applicable"; reason: string };
+
+const WORKTREE_REQUIRED = "File rewind requires a trusted, exclusive Paseo worktree";
+
+export async function resolveAgentRewindScope(
   directories: AgentRewindDirectories,
   agent: AgentRewindSubject,
-): Promise<CheckpointScope> {
+): Promise<AgentRewindScopeResult> {
   const { workspaceId, cwd } = agent;
   if (!workspaceId || agent.internal || isMainControlAgentLabels(agent.labels)) {
-    throw new Error("This agent cannot restore files");
+    return { kind: "not_applicable", reason: "This agent cannot restore files" };
   }
 
   const workspace = await directories.workspaces.get(workspaceId);
-  if (
-    !workspace ||
-    workspace.archivedAt ||
-    directories.isWorkspaceArchiving?.(workspaceId) ||
-    workspace.kind !== "worktree" ||
-    !workspace.isPaseoOwnedWorktree ||
-    workspace.untrustedSource ||
-    workspace.cwd !== cwd ||
-    workspace.worktreeRoot !== cwd
-  ) {
-    throw new Error("File rewind requires a trusted, exclusive Paseo worktree");
+  if (!workspace || workspace.archivedAt || directories.isWorkspaceArchiving?.(workspaceId)) {
+    throw new Error(WORKTREE_REQUIRED);
   }
-  const [project, activeWorkspaces] = await Promise.all([
-    directories.projects.get(workspace.projectId),
-    directories.workspaces.listActive(),
-  ]);
+  if (workspace.kind !== "worktree") {
+    return { kind: "not_applicable", reason: WORKTREE_REQUIRED };
+  }
+  if (workspace.cwd !== cwd || workspace.worktreeRoot !== cwd) {
+    throw new Error(WORKTREE_REQUIRED);
+  }
+  if (!workspace.isPaseoOwnedWorktree || workspace.untrustedSource) {
+    return { kind: "not_applicable", reason: WORKTREE_REQUIRED };
+  }
+  const project = await directories.projects.get(workspace.projectId);
+  if (!project || project.archivedAt) throw new Error(WORKTREE_REQUIRED);
+  if (project.kind !== "git") return { kind: "not_applicable", reason: WORKTREE_REQUIRED };
+
   if (
-    !project ||
-    project.archivedAt ||
-    project.kind !== "git" ||
-    activeWorkspaces.some(
+    (await directories.workspaces.listActive()).some(
       (candidate) =>
         candidate.workspaceId !== workspaceId &&
         rewindDirectoriesOverlap(cwd, candidate.worktreeRoot ?? candidate.cwd),
     )
   ) {
-    throw new Error("File rewind requires a trusted, exclusive Paseo worktree");
+    throw new Error(WORKTREE_REQUIRED);
   }
   return {
-    workspaceId,
-    agentId: agent.id,
-    cwd,
-    worktreeRoot: workspace.worktreeRoot,
-    projectRoot: workspace.mainRepoRoot ?? project.rootPath,
-    exclusive: true,
-    isController: false,
+    kind: "eligible",
+    scope: {
+      workspaceId,
+      agentId: agent.id,
+      cwd,
+      worktreeRoot: workspace.worktreeRoot,
+      projectRoot: workspace.mainRepoRoot ?? project.rootPath,
+      exclusive: true,
+      isController: false,
+    },
   };
+}
+
+export async function getAgentRewindScope(
+  directories: AgentRewindDirectories,
+  agent: AgentRewindSubject,
+): Promise<CheckpointScope> {
+  const result = await resolveAgentRewindScope(directories, agent);
+  if (result.kind === "not_applicable") throw new Error(result.reason);
+  return result.scope;
 }

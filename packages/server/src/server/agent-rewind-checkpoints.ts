@@ -155,8 +155,8 @@ export class AgentRewindCheckpoints {
     const { scope } = input;
     const operationId = z.uuid().parse(input.operationId);
     if (!(await this.store(scope).open(false))) throw new Error("Restore operation is unavailable");
-    const journal = await this.readJournal(scope, operationId);
-    if (!journal) throw new Error("Restore operation is unavailable");
+    const journal = await this.readJournal(this.store(scope), operationId);
+    if (journal?.agentId !== scope.agentId) throw new Error("Restore operation is unavailable");
     const worktree = await this.requireWorktree(scope);
     this.assertJournalWorktree(journal, worktree);
     const confirmed = this.withConfirmation(scope, journal, worktree, input.confirmations);
@@ -169,7 +169,8 @@ export class AgentRewindCheckpoints {
   async getFileRecovery(scope: CheckpointScope, confirmations: readonly ConfirmedRewind[]) {
     const pendingFiles: Array<{ operationId: string; conversationRewound: boolean }> = [];
     const unconfirmedFileRewinds: Array<{ operationId: string }> = [];
-    if (!(await this.store(scope).open(false))) return { pendingFiles, unconfirmedFileRewinds };
+    const store = this.store(scope);
+    if (!(await store.open(false))) return { pendingFiles, unconfirmedFileRewinds };
     const worktree = await this.requireWorktree(scope);
     const operations = await this.service.listRestoreOperations(scope);
     const applied = new Set(
@@ -177,11 +178,10 @@ export class AgentRewindCheckpoints {
     );
     // The journal precedes file writes, so it also covers interruption before
     // CheckpointService could record an operation.
-    for (const name of await readdir(this.journalDirectory(scope))) {
-      const id = z.uuid().safeParse(/^rewind-(.+)\.json$/.exec(name)?.[1]);
-      if (!id.success || applied.has(id.data)) continue;
-      const saved = await this.readJournal(scope, id.data);
-      if (!saved) continue;
+    for (const id of await this.listJournalIds(store)) {
+      if (applied.has(id)) continue;
+      const saved = await this.readJournal(store, id);
+      if (saved?.agentId !== scope.agentId) continue;
       this.assertJournalWorktree(saved, worktree);
       const journal = this.withConfirmation(scope, saved, worktree, confirmations);
       if (journal.state === "awaiting_conversation") {
@@ -194,6 +194,31 @@ export class AgentRewindCheckpoints {
       }
     }
     return { pendingFiles, unconfirmedFileRewinds };
+  }
+
+  async hasFileRecovery(agentId: string): Promise<boolean> {
+    // Agents can move between workspaces. Inspect the saved records without
+    // treating the agent's current workspace as proof of its old worktree identity.
+    for await (const store of CheckpointStore.existing(this.directories.paseoHome)) {
+      const state = await store.load();
+      const operations = state?.operations.filter((operation) => operation.agentId === agentId);
+      if (operations?.some((operation) => operation.status !== "applied")) return true;
+      const applied = new Set(operations?.map((operation) => operation.operationId));
+      for (const id of await this.listJournalIds(store)) {
+        if (applied.has(id)) continue;
+        if ((await this.readJournal(store, id))?.agentId === agentId) return true;
+      }
+    }
+    return false;
+  }
+
+  private async listJournalIds(store: CheckpointStore): Promise<string[]> {
+    const ids: string[] = [];
+    for (const name of await readdir(store.workspaceDirectory)) {
+      const id = z.uuid().safeParse(/^rewind-(.+)\.json$/.exec(name)?.[1]);
+      if (id.success) ids.push(id.data);
+    }
+    return ids;
   }
 
   private withConfirmation(
@@ -232,9 +257,9 @@ export class AgentRewindCheckpoints {
     }
   }
 
-  private async readJournal(scope: CheckpointScope, operationId: string) {
+  private async readJournal(store: CheckpointStore, operationId: string): Promise<Journal | null> {
     const file = await open(
-      this.journalPath(scope, operationId),
+      this.journalPath(store, operationId),
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     ).catch((error) => {
       if (isMissing(error)) return null;
@@ -258,9 +283,8 @@ export class AgentRewindCheckpoints {
       }
     })();
     const journal = journalSchema.parse(JSON.parse(raw));
-    return journal.agentId === scope.agentId && journal.operationId === operationId
-      ? journal
-      : null;
+    if (journal.operationId !== operationId) throw new Error("Restore operation is unavailable");
+    return journal;
   }
 
   private async restoreFiles(
@@ -308,16 +332,12 @@ export class AgentRewindCheckpoints {
     return new CheckpointStore(this.directories.paseoHome, scope.workspaceId);
   }
 
-  private journalDirectory(scope: CheckpointScope): string {
-    return join(this.directories.paseoHome, "file-checkpoints", stableKey(scope.workspaceId));
-  }
-
-  private journalPath(scope: CheckpointScope, operationId: string): string {
-    return join(this.journalDirectory(scope), `rewind-${operationId}.json`);
+  private journalPath(store: CheckpointStore, operationId: string): string {
+    return join(store.workspaceDirectory, `rewind-${operationId}.json`);
   }
 
   private async save(scope: CheckpointScope, journal: Journal): Promise<void> {
-    const target = this.journalPath(scope, journal.operationId);
+    const target = this.journalPath(this.store(scope), journal.operationId);
     const temporary = `${target}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(journal), { mode: 0o600, flag: "wx" });

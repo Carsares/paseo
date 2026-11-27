@@ -137,6 +137,7 @@ async function checkpointFixture(
     emptyAddition?: "valid" | "existing" | "mismatched path" | "external edit";
     earlierTurn?: boolean;
     provider?: "claude" | "codex";
+    child?: boolean;
     stageOnly?: boolean;
     durableTimelineStore?: AgentTimelineStore;
   } = {},
@@ -400,7 +401,17 @@ async function checkpointFixture(
   const create = (manager: AgentManager, id?: string) =>
     manager.createAgent({ provider, cwd }, id, { workspaceId: workspace.workspaceId });
   const manager = makeManager(storage);
-  const agent = await create(manager);
+  const parent = optionsForFixture.child
+    ? await manager.createAgent({ provider, cwd }, undefined, {
+        workspaceId: workspace.workspaceId,
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      })
+    : undefined;
+  const agent = parent
+    ? await manager.createAgent({ provider, cwd }, undefined, {
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      })
+    : await create(manager);
   if (optionsForFixture.earlierTurn) await manager.runAgent(agent.id, "keep this turn");
   const messageId = "submitted";
   await manager.runAgent(agent.id, "make edits", { clientMessageId: messageId });
@@ -408,6 +419,7 @@ async function checkpointFixture(
   const result = await manager.getRewindCheckpoint(target);
   return {
     manager,
+    parent,
     session,
     target,
     workspaces,
@@ -440,6 +452,48 @@ async function checkpointFixture(
 
 const afterCheckpointEdit = { worktree: "after worktree\n", index: "after staged\n" };
 const beforeCheckpointEdit = { worktree: "before worktree\n", index: "before staged\n" };
+
+test("checkpoint recovery returns empty for Main Control and an eligible Codex child without restore records", async () => {
+  const { manager, parent, target } = await checkpointFixture({ child: true });
+  const empty = { pendingFiles: [], unconfirmedFileRewinds: [] };
+  await expect(manager.getAgentRewindFileRecovery(parent!.id)).resolves.toEqual(empty);
+  await expect(manager.getAgentRewindFileRecovery(target.agentId)).resolves.toEqual(empty);
+  await expect(manager.getRewindCheckpoint(target)).resolves.toMatchObject({
+    canRewindFiles: true,
+  });
+});
+
+test.each(["directory", "local_checkout"] as const)(
+  "checkpoint recovery returns empty for a Codex child in a %s and refuses message lookup and restore",
+  async (kind) => {
+    const { manager, target, checkpointId, workspace, state } = await checkpointFixture({
+      child: true,
+    });
+    workspace.kind = kind;
+    await expect(manager.getAgentRewindFileRecovery(target.agentId)).resolves.toEqual({
+      pendingFiles: [],
+      unconfirmedFileRewinds: [],
+    });
+    await expect(manager.getRewindCheckpoint(target)).rejects.toThrow("exclusive Paseo worktree");
+    await expect(
+      manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "files" }),
+    ).rejects.toThrow("exclusive Paseo worktree");
+    expect(state()).toEqual(afterCheckpointEdit);
+  },
+);
+
+test("checkpoint recovery does not hide corrupt storage for an ineligible workspace", async () => {
+  const { manager, target, workspace, paseoHome } = await checkpointFixture();
+  workspace.kind = "directory";
+  const journal = join(
+    paseoHome,
+    "file-checkpoints",
+    stableKey(workspace.workspaceId),
+    `rewind-${randomUUID()}.json`,
+  );
+  writeFileSync(journal, "{}", { mode: 0o600 });
+  await expect(manager.getAgentRewindFileRecovery(target.agentId)).rejects.toThrow("operationId");
+});
 
 test.each(["valid", "existing", "mismatched path", "external edit"] as const)(
   "checkpoint rewind validates mapped Codex empty additions (%s)",
@@ -642,6 +696,11 @@ test("checkpoint rewind discovers and retries files after recreating the manager
     pendingFiles: [recovered],
     unconfirmedFileRewinds: [],
   });
+  workspace.kind = "local_checkout";
+  await expect(restarted.getAgentRewindFileRecovery(target.agentId)).rejects.toThrow(
+    "exclusive Paseo worktree",
+  );
+  workspace.kind = "worktree";
   const originalCwd = workspace.cwd;
   workspace.cwd = join(originalCwd, "not-the-original-directory");
   await expect(restarted.getPendingRewindFiles(target.agentId)).rejects.toThrow(
@@ -720,6 +779,11 @@ test("checkpoint rewind cannot resume files when the verified session write fail
   await expect(
     restarted.retryRewindFiles({ agentId: target.agentId, operationId: operationId! }),
   ).rejects.toThrow("Conversation rewind is unconfirmed");
+  const stored = await storage.get(target.agentId);
+  await storage.upsert({ ...stored!, workspaceId: undefined });
+  await expect(makeManager().getAgentRewindFileRecovery(target.agentId)).rejects.toThrow(
+    "This agent cannot restore files",
+  );
   expect(state()).toEqual(afterCheckpointEdit);
   expect(session.rewinds).toEqual(["provider-submitted"]);
 });

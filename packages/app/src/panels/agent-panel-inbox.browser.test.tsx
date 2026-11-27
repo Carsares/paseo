@@ -1,11 +1,12 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
+  PARENT_AGENT_ID_LABEL,
   SIDE_CHAT_LABEL,
   SIDE_OF_AGENT_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import type { PendingSubagentInbox } from "@getpaseo/protocol/messages";
+import type { PendingSubagentInbox, ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, within } from "@testing-library/dom";
 import { act, type ReactNode } from "react";
@@ -53,7 +54,7 @@ import {
   buildTopicReplyDraftKey,
   useTopicStreamViewStore,
 } from "@/stores/topic-stream-view-store";
-import { useSessionStore } from "@/stores/session-store";
+import { useSessionStore, type Agent, type WorkspaceDescriptor } from "@/stores/session-store";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { DEFAULT_CONTENT_MAX_WIDTH } from "@/styles/theme";
 import {
@@ -250,6 +251,46 @@ function ConversationPane({
   );
 }
 
+function seedRewindWorkspace(
+  conversation?: "subagent" | "main",
+  workspaceKind?: WorkspaceDescriptor["workspaceKind"],
+) {
+  if (conversation === "subagent") {
+    store.setAgents(serverId, (agents) => {
+      const agent = agents.get(agentId)!;
+      const parentId = "rewind-parent";
+      return new Map<string, Agent>([
+        [
+          parentId,
+          { ...agent, id: parentId, labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } },
+        ],
+        [agentId, { ...agent, labels: { [PARENT_AGENT_ID_LABEL]: parentId } }],
+      ]);
+    });
+  }
+  if (workspaceKind) {
+    store.mergeWorkspaces(serverId, [
+      {
+        id: pane.workspaceId,
+        projectId: "project",
+        projectDisplayName: "Repo",
+        projectRootPath: "/repo",
+        workspaceDirectory: "/repo",
+        projectKind: workspaceKind === "directory" ? "directory" : "git",
+        workspaceKind: workspaceKind,
+        name: "Workspace",
+        createdAt: null,
+        lastUserMessageAt: null,
+        status: "done",
+        statusEnteredAt: null,
+        archivingAt: null,
+        diffStat: null,
+        scripts: [],
+      },
+    ]);
+  }
+}
+
 async function mountTopicConversation(
   client: DaemonClient,
   hasTopics: boolean,
@@ -260,7 +301,8 @@ async function mountTopicConversation(
   options?: {
     paneHost?: PaneContextValue["host"];
     sideChatSourceId?: string;
-    rewindRecovery?: "ordinary" | "main";
+    rewindRecovery?: "subagent" | "main";
+    workspaceKind?: WorkspaceDescriptor["workspaceKind"];
     headerWorkspaceId?: string;
     paneFallback?: { agentId: string; tabId: string };
     chatOutline?: boolean;
@@ -303,12 +345,13 @@ async function mountTopicConversation(
     },
   });
   publishAgent(
-    options?.rewindRecovery !== "ordinary",
+    options?.rewindRecovery !== "subagent",
     undefined,
     false,
     pane.workspaceId,
     queueWhenRunning ? "running" : "idle",
   );
+  seedRewindWorkspace(options?.rewindRecovery, options?.workspaceKind);
   if (options?.sideChatSourceId) {
     const main = useSessionStore.getState().sessions[serverId]!.agents.get(agentId)!;
     store.setAgents(
@@ -402,7 +445,7 @@ async function mountTopicConversation(
   await vi.waitFor(() => {
     expect(
       view.getByTestId(
-        options?.sideChatSourceId || options?.rewindRecovery === "ordinary"
+        options?.sideChatSourceId || options?.rewindRecovery === "subagent"
           ? "assistant-message"
           : "topic-stream-list",
       ),
@@ -410,14 +453,29 @@ async function mountTopicConversation(
   });
 }
 
-it.each(["main", "ordinary"] as const)(
-  "loads pending file recovery only for ordinary conversations (%s)",
-  async (kind) => {
+it.each([
+  { conversation: "main", workspaceKind: "worktree", canWrite: true, queries: false },
+  { conversation: "subagent", workspaceKind: "directory", canWrite: true, queries: false },
+  { conversation: "subagent", workspaceKind: "local_checkout", canWrite: true, queries: false },
+  { conversation: "subagent", workspaceKind: "worktree", canWrite: false, queries: false },
+  { conversation: "subagent", workspaceKind: "worktree", canWrite: true, queries: true },
+  { conversation: "subagent", workspaceKind: undefined, canWrite: undefined, queries: true },
+] as const)(
+  "queries pending files for $conversation with workspace $workspaceKind and write access $canWrite: $queries",
+  async ({ conversation, workspaceKind, canWrite, queries }) => {
     const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
-    const recovery = vi.spyOn(client, "getAgentRewindFileRecovery").mockResolvedValue({
-      pendingFiles: [],
-      unconfirmedFileRewinds: [],
+    let permissions: ServerInfoStatusPayload["permissions"];
+    if (canWrite !== undefined) permissions = [canWrite ? "workspace.write" : "workspace.read"];
+    vi.spyOn(client, "getLastServerInfoMessage").mockReturnValue({
+      status: "server_info",
+      serverId,
+      hostname: null,
+      version: null,
+      permissions,
     });
+    const recovery = vi.spyOn(client, "getAgentRewindFileRecovery");
+    if (queries) recovery.mockResolvedValue({ pendingFiles: [], unconfirmedFileRewinds: [] });
+    else recovery.mockRejectedValue(new Error("Unexpected pending file recovery request"));
     await mountTopicConversation(
       client,
       true,
@@ -433,12 +491,13 @@ it.each(["main", "ordinary"] as const)(
         },
       ],
       false,
-      { rewindRecovery: kind },
+      { rewindRecovery: conversation, workspaceKind },
     );
-    if (kind === "ordinary") {
+    if (queries) {
       await vi.waitFor(() => expect(recovery).toHaveBeenCalledExactlyOnceWith(agentId));
     } else {
       expect(recovery).not.toHaveBeenCalled();
+      expect(view.queryByTestId("agent-pending-rewind-files")).toBeNull();
     }
   },
 );

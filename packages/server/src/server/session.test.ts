@@ -2254,7 +2254,7 @@ describe("session authorization permissions", () => {
       attribution: "unknown",
     };
     const getRewindCheckpointDiff = vi.fn().mockResolvedValue(result);
-    const getPendingRewindFiles = vi.fn();
+    const getAgentRewindFileRecovery = vi.fn();
     const restoreRewindCheckpoint = vi.fn();
     const retryRewindFiles = vi.fn();
     const session = createSessionForTest({
@@ -2262,7 +2262,7 @@ describe("session authorization permissions", () => {
       messages,
       agentManager: {
         getRewindCheckpointDiff,
-        getPendingRewindFiles,
+        getAgentRewindFileRecovery,
         restoreRewindCheckpoint,
         retryRewindFiles,
       },
@@ -2293,7 +2293,7 @@ describe("session authorization permissions", () => {
       })),
     );
     expect(restoreRewindCheckpoint).not.toHaveBeenCalled();
-    expect(getPendingRewindFiles).not.toHaveBeenCalled();
+    expect(getAgentRewindFileRecovery).not.toHaveBeenCalled();
     expect(retryRewindFiles).not.toHaveBeenCalled();
 
     await session.handleMessage({
@@ -2315,41 +2315,44 @@ describe("session authorization permissions", () => {
       payload: { requestId: "allowed", ok: true, result },
     });
   });
-  test("finds pending checkpoint files for a writable agent without looking up a message", async () => {
-    const messages: SessionOutboundMessage[] = [];
-    const pendingFiles = [{ operationId: "operation", conversationRewound: true }];
-    const unconfirmedFileRewinds = [{ operationId: "unconfirmed" }];
-    const getAgentRewindFileRecovery = vi.fn().mockResolvedValue({
-      pendingFiles,
-      unconfirmedFileRewinds,
-    });
-    const getRewindCheckpoint = vi.fn();
-    const session = createSessionForTest({
-      permissions: ["workspace.write"],
-      messages,
-      agentManager: { getAgentRewindFileRecovery, getRewindCheckpoint },
-    });
-    await session.handleMessage({
-      type: "agent.rewind.checkpoint.get.request",
-      requestId: "lookup",
-      agentId: "agent",
-      messageId: "",
-      pendingFiles: true,
-    });
-    expect(getAgentRewindFileRecovery).toHaveBeenCalledExactlyOnceWith("agent");
-    expect(getRewindCheckpoint).not.toHaveBeenCalled();
-    expect(messages).toContainEqual({
-      type: "agent.rewind.checkpoint.get.response",
-      payload: {
+  test.each([
+    {
+      pendingFiles: [{ operationId: "operation", conversationRewound: true }],
+      unconfirmedFileRewinds: [{ operationId: "unconfirmed" }],
+    },
+    { pendingFiles: [], unconfirmedFileRewinds: [] },
+  ])(
+    "returns checkpoint file recovery results without looking up a message (%j)",
+    async (recovery) => {
+      const messages: SessionOutboundMessage[] = [];
+      const getAgentRewindFileRecovery = vi.fn().mockResolvedValue(recovery);
+      const getRewindCheckpoint = vi.fn();
+      const session = createSessionForTest({
+        permissions: ["workspace.write"],
+        messages,
+        agentManager: { getAgentRewindFileRecovery, getRewindCheckpoint },
+      });
+      await session.handleMessage({
+        type: "agent.rewind.checkpoint.get.request",
         requestId: "lookup",
         agentId: "agent",
-        ok: true,
-        error: null,
-        pendingFiles,
-        unconfirmedFileRewinds,
-      },
-    });
-  });
+        messageId: "",
+        pendingFiles: true,
+      });
+      expect(getAgentRewindFileRecovery).toHaveBeenCalledExactlyOnceWith("agent");
+      expect(getRewindCheckpoint).not.toHaveBeenCalled();
+      expect(messages).toContainEqual({
+        type: "agent.rewind.checkpoint.get.response",
+        payload: {
+          requestId: "lookup",
+          agentId: "agent",
+          ok: true,
+          error: null,
+          ...recovery,
+        },
+      });
+    },
+  );
   test("routes named-agent validation through the session source", async () => {
     const messages: SessionOutboundMessage[] = [];
     const providers = createProviderSnapshotManagerStub();

@@ -170,6 +170,7 @@ import type { StreamItem } from "@/types/stream";
 import type { ViewedTimelineStatus, ViewedTimelineUiBridge } from "@/timeline/viewed-timeline-sync";
 import { getInitDeferred, getInitKey } from "@/utils/agent-initialization";
 import { derivePendingPermissionKey, normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-identity";
 import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-workspaces";
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
@@ -1557,6 +1558,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       {streamContent}
       <AgentPendingRewindFiles
         serverId={serverId}
+        workspaceId={workspaceId}
         agent={effectiveAgent}
         draft={draft}
         isArchiving={isArchivingCurrentAgent}
@@ -1641,9 +1643,11 @@ function AgentPendingRewindFiles({
   draft,
   isArchiving,
   toastApi,
+  workspaceId,
   ...scope
 }: {
   serverId: string;
+  workspaceId: string;
   agent: AgentScreenAgent | null;
   draft: DraftConversation | null;
   isArchiving: boolean;
@@ -1652,7 +1656,17 @@ function AgentPendingRewindFiles({
 }) {
   const canRecoverFiles = useSessionStore((state) => {
     const subject = resolveChatAgentFromSession(state, scope.serverId, agent?.id);
-    return subject !== null && !isMainControlAgent(subject);
+    if (!subject || isMainControlAgent(subject)) return false;
+    const session = state.sessions[scope.serverId];
+    const workspaces = session?.workspaces;
+    const key = resolveWorkspaceMapKeyByIdentity({
+      workspaces,
+      workspaceId: subject.workspaceId ?? workspaceId,
+    });
+    const kind = key ? workspaces?.get(key)?.workspaceKind : undefined;
+    if (kind !== undefined && kind !== "worktree") return false;
+    const permissions = session?.client?.getLastServerInfoMessage?.()?.permissions;
+    return permissions?.includes("workspace.write") ?? true;
   });
   if (!agent || draft || isArchiving || !canRecoverFiles) return null;
   return (

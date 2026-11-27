@@ -218,6 +218,7 @@ import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import {
   assertNoFileRewind,
   getAgentRewindScope,
+  resolveAgentRewindScope,
   rewindDirectoryActivity,
   rewindDirectoriesOverlap,
   type AgentRewindDirectories,
@@ -11640,8 +11641,12 @@ export class AgentManager {
   async getAgentRewindFileRecovery(agentId: string) {
     const { directories, checkpoints } = this.requireRewindCheckpointService();
     const agent = await this.getRewindSubject(agentId);
-    const scope = await getAgentRewindScope(directories, agent);
-    return checkpoints.getFileRecovery(scope, await this.getConfirmedRewinds(agentId));
+    const result = await resolveAgentRewindScope(directories, agent);
+    if (result.kind === "not_applicable") {
+      if (await checkpoints.hasFileRecovery(agent.id)) throw new Error(result.reason);
+      return { pendingFiles: [], unconfirmedFileRewinds: [] };
+    }
+    return checkpoints.getFileRecovery(result.scope, await this.getConfirmedRewinds(agentId));
   }
 
   private async getConfirmedRewinds(agentId: string): Promise<ConfirmedRewind[]> {
