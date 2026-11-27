@@ -15,6 +15,7 @@ import type { StreamItem } from "@/types/stream";
 import type { StreamViewportHandle } from "../strategy";
 import {
   createActivePromptPublisher,
+  createChatOutlinePreviewResolver,
   resolveActivePromptReadingState,
   shouldAcceptPromptIndexEpoch,
   type ActivePromptSource,
@@ -126,7 +127,14 @@ export function useChatOutline({
   const loadedTail = enabled ? tail : NO_STREAM_ITEMS;
   const loadedHead = enabled ? (head ?? NO_STREAM_ITEMS) : NO_STREAM_ITEMS;
   const index = enabled && indexedTimeline?.timeline === timeline ? indexedTimeline.index : null;
-  const prompts = index?.prompts ?? NO_PROMPTS;
+  const resolvePreviews = useMemo(
+    () => (index ? createChatOutlinePreviewResolver(index) : null),
+    [index],
+  );
+  const prompts = useMemo(
+    () => (resolvePreviews ? resolvePreviews(loadedTail, loadedHead) : NO_PROMPTS),
+    [loadedHead, loadedTail, resolvePreviews],
+  );
 
   // The viewed timeline already owns live delivery and reconnect catch-up. Its complete
   // loaded items (including rows outside the mounted window) invalidate the prompt index.

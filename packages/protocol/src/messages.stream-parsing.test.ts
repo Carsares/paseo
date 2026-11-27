@@ -8,34 +8,35 @@ import {
   SessionOutboundMessageSchema,
   WSOutboundMessageSchema,
 } from "./messages.js";
+import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
 
 describe("shared messages stream parsing", () => {
-  it("parses a full timeline prompt index response", () => {
-    const parsed = AgentTimelineListPromptsResponseMessageSchema.parse({
-      type: "agent.timeline.list_prompts.response",
-      payload: {
-        requestId: "req-prompts-1",
-        agentId: "agent_live",
-        epoch: "epoch-1",
-        prompts: [
-          {
-            seq: 42,
-            timestamp: "2026-02-08T20:10:00.000Z",
-            preview: "Review the pagination behavior",
-          },
-        ],
-        error: null,
-      },
-    });
+  it.each([{}, { previewsAreDisplayText: true }])(
+    "parses a timeline prompt index with %j",
+    (flags) => {
+      const response = {
+        type: "agent.timeline.list_prompts.response",
+        payload: {
+          requestId: "req-prompts-1",
+          agentId: "agent_live",
+          epoch: "epoch-1",
+          ...flags,
+          prompts: [
+            {
+              seq: 42,
+              timestamp: "2026-02-08T20:10:00.000Z",
+              preview: "Review the pagination behavior",
+            },
+          ],
+          error: null,
+        },
+      };
+      const wire = { type: "session", message: response };
 
-    expect(parsed.payload.prompts).toEqual([
-      {
-        seq: 42,
-        timestamp: "2026-02-08T20:10:00.000Z",
-        preview: "Review the pagination behavior",
-      },
-    ]);
-  });
+      expect(AgentTimelineListPromptsResponseMessageSchema.parse(response)).toEqual(response);
+      expect(validateWSOutboundMessage(wire)).toEqual({ success: true, data: wire });
+    },
+  );
 
   it("parses representative fetch_agent_timeline_response payload", () => {
     const parsed = FetchAgentTimelineResponseMessageSchema.parse({

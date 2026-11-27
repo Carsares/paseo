@@ -289,6 +289,7 @@ interface MutableTopicUnit {
   leadTitle?: string;
   processSteps: TopicProcessStep[];
   replies: TopicReplyItem[];
+  mirroredReplySlots?: ProjectedMirroredReply[];
   pendingInboxItems: PendingSubagentInboxItem[];
   linkedTodos: WorkspaceTodoItem[];
   linkedDurableItems: WorkspaceDurableItem[];
@@ -304,6 +305,11 @@ interface AnchorAttributionRecord {
   attribution: TopicMessageAttribution;
 }
 
+interface ProjectedMirroredReply {
+  beforeIndex: number;
+  reply: TopicMainReply;
+}
+
 interface TopicBuilderState {
   topics: MutableTopicUnit[];
   byTaskId: Map<string, MutableTopicUnit>;
@@ -316,12 +322,13 @@ interface TopicBuilderState {
   tasksByRootMessageId: Map<string, WorkspaceTaskSummary[]>;
   userFollowupBySourceMessageId: Map<string, TopicThreadEntry>;
   mirroredReplyBySourceMessageId: Map<string, TopicThreadEntry>;
-  projectedMirroredReplies: Map<string, TopicMainReply>;
+  projectedMirroredReplies: Map<string, ProjectedMirroredReply>;
   projectedAgentMessageIds: Set<string>;
   unmatchedUserFollowups: TopicThreadEntry[];
   unmatchedAgentReplies: TopicThreadEntry[];
   consumedFollowupEntryIds: Set<string>;
   followupImages: Map<string, readonly UserMessageImageAttachment[]>;
+  sameTimeFollowupByReply: Map<TopicReplyItem, string>;
   pendingDispatches: Map<MutableTopicUnit, Map<string, ObservedDelegation>>;
   settledDispatches: Set<string>;
   consumedReplyEntryIds: Set<string>;
@@ -921,6 +928,7 @@ function ingestMirroredPrompt(
   state.activeMainFollowup = undefined;
   if (!followup) return false;
   if (followup.routedAgentId === followup.mainAgentId) state.activeMainFollowup = followup;
+  turn.mainFollowup = state.activeMainFollowup;
   if (item.images?.length) state.followupImages.set(followup.entryId, item.images);
   const topic = findMatchingTopic(state, followup);
   if (topic) {
@@ -1320,6 +1328,7 @@ function ingestAttributedPrompt(
     if (mirroredFollowup.routedAgentId === mirroredFollowup.mainAgentId) {
       state.activeMainFollowup = mirroredFollowup;
     }
+    turn.mainFollowup = state.activeMainFollowup;
     if (item.images?.length) {
       state.followupImages.set(mirroredFollowup.entryId, item.images);
     }
@@ -1352,6 +1361,7 @@ function ingestAttributedPrompt(
 }
 
 function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem, turn: TopicTurn): void {
+  turn.mainFollowup = undefined;
   if (ingestAttributedPrompt(state, item, turn)) return;
   if (ingestMirroredPrompt(state, item, turn)) return;
 
@@ -1616,6 +1626,7 @@ interface TopicTurn {
   hasAuthoritativeStamp: boolean;
   stampedTopics: Set<MutableTopicUnit>;
   humanTriggerTopic?: MutableTopicUnit;
+  mainFollowup?: TopicThreadEntry;
   initialPromptUnits: Set<MutableTopicUnit>;
   hasConclusion: boolean;
   hasDelegation: boolean;
@@ -1692,6 +1703,26 @@ function isDispatchTool(item: ToolCallItem): boolean {
   return leaf === "create_agent" || leaf === "send_agent_prompt";
 }
 
+function placeMirroredReply(
+  state: TopicBuilderState,
+  { entryId, unit, reply }: { entryId: string; unit: MutableTopicUnit; reply: TopicMainReply },
+): void {
+  const previous = state.projectedMirroredReplies.get(entryId);
+  if (previous) {
+    // Replayed source rows can advance the payload and cursor without changing the displayed turn.
+    const followupId = state.sameTimeFollowupByReply.get(previous.reply);
+    if (followupId && previous.reply.timestampMs === reply.timestampMs) {
+      state.sameTimeFollowupByReply.set(reply, followupId);
+    }
+    state.sameTimeFollowupByReply.delete(previous.reply);
+    previous.reply = reply;
+    return;
+  }
+  const slot = { beforeIndex: unit.replies.length, reply };
+  state.projectedMirroredReplies.set(entryId, slot);
+  (unit.mirroredReplySlots ??= []).push(slot);
+}
+
 function ingestMainReply(
   state: TopicBuilderState,
   target: MutableTopicUnit,
@@ -1735,16 +1766,24 @@ function ingestMainReply(
     turn.hasConclusion = true;
   }
   const mirror = findMirroredReply(state, item, target);
-  if (mirror) {
-    if (entryBelongsToUnit(mirror, target)) {
-      state.projectedMirroredReplies.set(mirror.entryId, {
-        ...reply,
-        id: `thread:${mirror.entryId}`,
-      });
-    }
-    return;
+  if (mirror && !entryBelongsToUnit(mirror, target)) return;
+  let projectedReply = reply;
+  if (mirror) projectedReply = { ...reply, id: `thread:${mirror.entryId}` };
+
+  const followup = turn.mainFollowup;
+  if (
+    followup &&
+    turn.humanTriggerTopic === target &&
+    parseIsoMs(followup.createdAt, NaN) === timestampMs
+  ) {
+    state.sameTimeFollowupByReply.set(projectedReply, followup.entryId);
   }
-  target.replies.push(reply);
+
+  if (mirror) {
+    placeMirroredReply(state, { entryId: mirror.entryId, unit: target, reply: projectedReply });
+  } else {
+    target.replies.push(projectedReply);
+  }
 }
 
 function resolveSingleTurnStampedTopic(turn: TopicTurn): MutableTopicUnit | undefined {
@@ -1881,9 +1920,9 @@ function attachThreadEntries(state: TopicBuilderState, entries: readonly TopicTh
       target.leadTitle =
         state.agentTitleById?.get(entry.authorAgentId) ?? entry.authorTitle?.trim();
     }
-    const mirroredReply = state.projectedMirroredReplies.get(entry.entryId);
-    if (mirroredReply) {
-      target.replies.push(mirroredReply);
+    const mirror = state.projectedMirroredReplies.get(entry.entryId);
+    if (mirror) {
+      target.replies.push(mirror.reply);
       continue;
     }
     target.replies.push({
@@ -2257,6 +2296,18 @@ function isTopicInterrupted(
   return false;
 }
 
+function findLatestReplyByActivity(
+  replies: readonly TopicReplyItem[],
+  matches: (reply: TopicReplyItem) => boolean,
+): TopicReplyItem | undefined {
+  let latest: TopicReplyItem | undefined;
+  for (const reply of replies) {
+    if (!matches(reply)) continue;
+    if (!latest || reply.timestampMs >= latest.timestampMs) latest = reply;
+  }
+  return latest;
+}
+
 function resolveTopicLifecycleStatus(input: {
   unit: MutableTopicUnit;
   delegations: readonly ObservedDelegation[];
@@ -2276,7 +2327,7 @@ function resolveTopicLifecycleStatus(input: {
       (reply): reply is Extract<TopicReplyItem, { kind: "subagent_report" }> =>
         reply.kind === "subagent_report",
     );
-  const latestOutcome = replies.toReversed().find(isOutcomeReply);
+  const latestOutcome = findLatestReplyByActivity(unit.replies, isOutcomeReply);
 
   if (isTopicBlocked(unit, latestReport, latestOutcome, activeBlockingPrompt)) return "blocked";
   if (
@@ -2348,7 +2399,8 @@ function resolveRetryCandidate(
   lifecycleStatus: TopicLifecycleStatus | null,
 ): TopicRetryCandidate | null {
   if (lifecycleStatus !== "error" && lifecycleStatus !== "interrupted") return null;
-  const latestFollowup = replies.findLast(
+  const latestFollowup = findLatestReplyByActivity(
+    replies,
     (reply) => reply.kind === "thread_entry" && reply.entry.role === "user_followup",
   );
   if (latestFollowup?.kind !== "thread_entry" || latestFollowup.entry.retryable !== true) {
@@ -2362,14 +2414,56 @@ function maxSeqValue(current: number | null, candidate: number | null): number |
   return current === null ? candidate : Math.max(current, candidate);
 }
 
-function sortRepliesChronologically(replies: readonly TopicReplyItem[]): TopicReplyItem[] {
+function repliesInTimelineOrder(unit: MutableTopicUnit): readonly TopicReplyItem[] {
+  if (!unit.mirroredReplySlots) return unit.replies;
+
+  // Only restore positions for replies that resolved to this topic after all bindings were known.
+  const attachedReplies = new Set(unit.replies);
+  const slots = unit.mirroredReplySlots.filter(({ reply }) => attachedReplies.has(reply));
+  if (slots.length === 0) return unit.replies;
+
+  // Preserve the original attachment order in unit.replies for lifecycle and retry calculations.
+  const movedReplies = new Set<TopicReplyItem>(slots.map(({ reply }) => reply));
+  const remaining = unit.replies.filter((reply) => !movedReplies.has(reply));
+  const ordered: TopicReplyItem[] = [];
+  let index = 0;
+  for (const { beforeIndex, reply } of slots) {
+    for (; index < beforeIndex; index += 1) ordered.push(remaining[index]!);
+    ordered.push(reply);
+  }
+  for (; index < remaining.length; index += 1) ordered.push(remaining[index]!);
+  return ordered;
+}
+
+function sortRepliesChronologically(
+  replies: readonly TopicReplyItem[],
+  sameTimeFollowupByReply: ReadonlyMap<TopicReplyItem, string>,
+): TopicReplyItem[] {
+  const firstAnswerIndexByFollowup = new Map<string, number>();
+  for (const [index, reply] of replies.entries()) {
+    const followupId = sameTimeFollowupByReply.get(reply);
+    if (followupId && !firstAnswerIndexByFollowup.has(followupId)) {
+      firstAnswerIndexByFollowup.set(followupId, index);
+    }
+  }
+
   return replies
-    .map((reply, index) => ({ reply, index }))
-    .sort((left, right) => {
-      if (left.reply.timestampMs !== right.reply.timestampMs) {
-        return left.reply.timestampMs - right.reply.timestampMs;
+    .map((reply, index) => {
+      let orderTimestampMs = reply.timestampMs;
+      let orderIndex = index;
+      // A follow-up's status updates count as activity but must not move the prompt in the conversation.
+      if (reply.kind === "thread_entry" && reply.entry.role === "user_followup") {
+        orderTimestampMs = parseIsoMs(reply.entry.createdAt, reply.timestampMs);
+        const firstAnswerIndex = firstAnswerIndexByFollowup.get(reply.entry.entryId);
+        if (firstAnswerIndex !== undefined && firstAnswerIndex < index) {
+          // Make room before the first answer while keeping all other tie positions fixed.
+          orderIndex = firstAnswerIndex - 0.5;
+        }
       }
-      return left.index - right.index;
+      return { reply, orderIndex, orderTimestampMs };
+    })
+    .sort((left, right) => {
+      return left.orderTimestampMs - right.orderTimestampMs || left.orderIndex - right.orderIndex;
     })
     .map((entry) => entry.reply);
 }
@@ -2405,6 +2499,7 @@ function finalizeTopicUnit(input: {
   isLatestTopic: boolean;
   projectionInput: ProjectTopicUnitsInput;
   watermark: TopicWatermarkSnapshot;
+  sameTimeFollowupByReply: ReadonlyMap<TopicReplyItem, string>;
 }): TopicUnit {
   const { unit, delegations, lastTurn, isLatestTopic, projectionInput, watermark } = input;
 
@@ -2460,7 +2555,10 @@ function finalizeTopicUnit(input: {
   let latestTimestampMs = unit.rootPrompt.timestampMs;
   let latestEpoch: string | null = unit.rootPrompt.epoch;
 
-  const orderedReplies = sortRepliesChronologically(unit.replies);
+  const orderedReplies = sortRepliesChronologically(
+    repliesInTimelineOrder(unit),
+    input.sameTimeFollowupByReply,
+  );
 
   const replies: TopicReplyItem[] = [];
   for (let replyIndex = 0; replyIndex < orderedReplies.length; replyIndex += 1) {
@@ -2517,7 +2615,7 @@ function finalizeTopicUnit(input: {
     isLatestTopic,
     isTurnActive: Boolean(projectionInput.isTurnActive),
   });
-  const retryCandidate = resolveRetryCandidate(replies, lifecycleStatus);
+  const retryCandidate = resolveRetryCandidate(unit.replies, lifecycleStatus);
   return {
     ...unit,
     ...getDelegationLead(unit, delegations, projectionInput.localServerId),
@@ -2643,6 +2741,7 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     projectedAgentMessageIds: new Set(),
     consumedFollowupEntryIds: new Set(),
     followupImages: new Map(),
+    sameTimeFollowupByReply: new Map(),
     projectedMirroredReplies: new Map(),
     pendingDispatches: new Map(),
     settledDispatches: new Set(),
@@ -2700,6 +2799,7 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
       isLatestTopic: index === lastRealTopicIndex,
       projectionInput: input,
       watermark,
+      sameTimeFollowupByReply: state.sameTimeFollowupByReply,
     });
     if (finalized.hasUnread) {
       totalUnreadTopics += 1;

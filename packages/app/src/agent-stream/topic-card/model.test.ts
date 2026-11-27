@@ -900,7 +900,7 @@ describe("projectTopicUnits", () => {
     ).toEqual([false, false, true]);
   });
 
-  it("merges fallback-to-main follow-ups into the originating topic without creating duplicate root cards or replies", () => {
+  it("keeps a follow-up image and its main answer in order as the turn completes and reloads", () => {
     const items: StreamItem[] = [
       makeHumanPrompt({ id: "u-1", messageId: "m-1", text: "Root question", seq: 1, ts: 1_000 }),
       makeAssistantConclusion({ id: "a-1", text: "Initial answer", seq: 2, ts: 2_000 }),
@@ -908,17 +908,22 @@ describe("projectTopicUnits", () => {
       makeHumanPrompt({
         id: "u-followup",
         messageId: "srv-followup-1",
+        turnId: "turn-followup",
         text: "@主控 please re-check",
         seq: 3,
         ts: 3_000,
       }),
-      makeAssistantConclusion({
-        id: "srv-reply-1",
+      {
+        kind: "assistant_message",
+        id: "agent_message_chunk:4",
+        turnId: "turn-followup",
+        topicKey: "msg:m-1",
         text: "Re-checked on main",
-        seq: 4,
-        ts: 4_000,
-      }),
+        timelineCursor: { epoch: "ep-1", seq: 4 },
+        timestamp: new Date(4_000),
+      },
     ];
+    const image = { id: "image-1", fileName: "sample.png", mimeType: "image/png", size: 32 };
     const threadEntries: TopicThreadEntry[] = [
       {
         entryId: "te-u",
@@ -930,10 +935,11 @@ describe("projectTopicUnits", () => {
         routedAgentId: "mc-1",
         sourceMessageId: "srv-followup-1",
         text: "@主控 please re-check",
+        imageAttachments: [image],
         status: "completed",
         seq: 1,
         createdAt: new Date(3_000).toISOString(),
-        updatedAt: new Date(3_000).toISOString(),
+        updatedAt: new Date(5_000).toISOString(),
       },
       {
         entryId: "te-a",
@@ -945,24 +951,198 @@ describe("projectTopicUnits", () => {
         authorAgentId: "mc-1",
         authorTitle: "Main",
         routedAgentId: "mc-1",
-        sourceMessageId: "srv-reply-1",
+        sourceMessageId: "agent_message_chunk:4",
         text: "Re-checked on main",
         status: "completed",
         seq: 2,
-        createdAt: new Date(4_000).toISOString(),
-        updatedAt: new Date(4_000).toISOString(),
+        createdAt: new Date(5_000).toISOString(),
+        updatedAt: new Date(5_000).toISOString(),
       },
     ];
 
-    const result = projectTopicUnits({ items, threadEntries });
-    expect(result.topics).toHaveLength(1);
-    expect(result.topics[0]!.topicKey).toBe("msg:m-1");
-    // Replies: a-1 (initial conclusion), te-u (followup), te-a (deduplicated mirrored reply) — no duplicate srv-reply-1!
-    expect(result.topics[0]!.replies.map((reply) => reply.id)).toEqual([
+    const running = {
+      ...threadEntries[0]!,
+      status: "running" as const,
+      updatedAt: new Date(3_500).toISOString(),
+    };
+    const sameTimeItems = items.map((item): StreamItem => {
+      if (item.id === "agent_message_chunk:4") return { ...item, timestamp: new Date(3_000) };
+      return item;
+    });
+    const runningAtCreation = { ...running, updatedAt: running.createdAt };
+    const stages = [
+      {
+        label: "first live answer chunk in the same millisecond as its prompt",
+        items: sameTimeItems,
+        entries: [runningAtCreation],
+        answerId: "agent_message_chunk:4",
+        seq: 4,
+        latestActivity: 3_000,
+        status: "dispatching",
+      },
+      {
+        label: "streaming",
+        items,
+        entries: [running],
+        answerId: "agent_message_chunk:4",
+        seq: 4,
+        latestActivity: 4_000,
+        status: "replied",
+      },
+      {
+        label: "running status updated after the first answer chunk",
+        items,
+        entries: [{ ...running, updatedAt: threadEntries[0]!.updatedAt }],
+        answerId: "agent_message_chunk:4",
+        seq: 4,
+        latestActivity: 5_000,
+        status: "dispatching",
+      },
+      {
+        label: "completion before the reply entry arrives",
+        items,
+        entries: threadEntries.slice(0, 1),
+        answerId: "agent_message_chunk:4",
+        seq: 4,
+        latestActivity: 5_000,
+        status: "replied",
+      },
+      {
+        label: "both copies available on a timeline without topic attribution or turn IDs",
+        items: sameTimeItems.map((item) => ({ ...item, topicKey: undefined, turnId: undefined })),
+        entries: threadEntries,
+        answerId: "thread:te-a",
+        seq: 4,
+        latestActivity: 5_000,
+        status: "replied",
+      },
+      {
+        label: "timeline follow-up missing",
+        items: items.filter(({ id }) => id !== "u-followup"),
+        entries: threadEntries,
+        answerId: "thread:te-a",
+        seq: 4,
+        latestActivity: 5_000,
+        status: "replied",
+      },
+      {
+        label: "only the thread copies are available after refresh",
+        items: items.slice(0, 2),
+        entries: threadEntries,
+        answerId: "thread:te-a",
+        seq: 2,
+        latestActivity: 5_000,
+        status: "replied",
+      },
+    ];
+
+    for (const stage of stages) {
+      const result = projectTopicUnits({ items: stage.items, threadEntries: stage.entries });
+      expect(
+        result.topics.map(({ topicKey }) => topicKey),
+        stage.label,
+      ).toEqual(["msg:m-1"]);
+      const topic = result.topics[0]!;
+      expect(topicReplyIds(topic), stage.label).toEqual(["a-1", "thread:te-u", stage.answerId]);
+      expect(topic.lifecycleStatus, stage.label).toBe(stage.status);
+      expect(topic.replies[1], stage.label).toMatchObject({
+        kind: "thread_entry",
+        entry: { imageAttachments: [image] },
+        threadSeq: 1,
+        seq: null,
+      });
+      expect(result.watermark, stage.label).toMatchObject({
+        maxSeq: stage.seq,
+        maxTimestampMs: stage.latestActivity,
+      });
+    }
+
+    const earlierAnswer = makeAssistantConclusion({
+      id: "a-1",
+      text: "Initial answer",
+      seq: 2,
+      ts: 3_000,
+    });
+    const otherTurnAnswer = {
+      ...makeAssistantConclusion({
+        id: "other-answer",
+        turnId: "turn-other",
+        text: "Answer from a separate turn",
+        seq: 5,
+        ts: 3_000,
+      }),
+      topicKey: "msg:m-1",
+    };
+    const itemsWithOtherAnswer = [
+      items[0]!,
+      earlierAnswer,
+      ...sameTimeItems.slice(2),
+      otherTurnAnswer,
+    ];
+    const withOtherAnswerStages = [
+      { entries: [runningAtCreation], answerId: "agent_message_chunk:4" },
+      { entries: threadEntries, answerId: "thread:te-a" },
+    ];
+    for (const { entries, answerId } of withOtherAnswerStages) {
+      const withOtherAnswer = projectTopicUnits({
+        items: itemsWithOtherAnswer,
+        threadEntries: entries,
+      });
+      expect(topicReplyIds(withOtherAnswer.topics[0]!), answerId).toEqual([
+        "a-1",
+        "thread:te-u",
+        answerId,
+        "other-answer",
+      ]);
+    }
+    const withoutMatchingAnswer = projectTopicUnits({
+      items: [items[0]!, earlierAnswer, items[2]!, otherTurnAnswer],
+      threadEntries: [runningAtCreation],
+    });
+    expect(topicReplyIds(withoutMatchingAnswer.topics[0]!)).toEqual([
+      "a-1",
+      "other-answer",
+      "thread:te-u",
+    ]);
+
+    const failedFollowup: TopicThreadEntry = {
+      ...threadEntries[0]!,
+      entryId: "old-failed",
+      sourceMessageId: "old-failed-message",
+      text: "An earlier failed attempt",
+      status: "error",
+      seq: 0,
+      createdAt: new Date(2_000).toISOString(),
+      updatedAt: new Date(3_000).toISOString(),
+    };
+    const afterFailure = projectTopicUnits({
+      items: itemsWithOtherAnswer,
+      threadEntries: [failedFollowup, ...threadEntries],
+    });
+    expect.soft(afterFailure.topics[0]!.lifecycleStatus).toBe("replied");
+
+    const replayedAnswer = {
+      ...otherTurnAnswer,
+      id: "replayed-answer",
+      messageId: "agent_message_chunk:4",
+      timelineCursor: { epoch: "ep-1", seq: 6 },
+      text: "Re-checked on main, final replay",
+    };
+    const afterReplay = projectTopicUnits({
+      items: [...itemsWithOtherAnswer, replayedAnswer],
+      threadEntries,
+    });
+    expect(topicReplyIds(afterReplay.topics[0]!)).toEqual([
       "a-1",
       "thread:te-u",
       "thread:te-a",
+      "other-answer",
     ]);
+    expect(afterReplay.topics[0]!.replies[2]).toMatchObject({
+      kind: "main_conclusion",
+      seq: 6,
+      text: replayedAnswer.text,
+    });
   });
 
   it("never cross-attaches explicit unmatched refs onto an unrelated latest topic card", () => {

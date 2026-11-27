@@ -7008,6 +7008,8 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
     requestId: z.string(),
     agentId: z.string(),
     epoch: z.string(),
+    // The host already applied the display rules, including retaining literal markup.
+    previewsAreDisplayText: z.literal(true).optional(),
     prompts: z.array(
       z.object({
         seq: z.number().int().nonnegative(),

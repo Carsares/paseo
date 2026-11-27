@@ -9,6 +9,7 @@ import { createNativeReadingPositionTracker } from "../native-reading-position";
 import type { StreamViewportHandle } from "../strategy";
 import { ActivePromptBar } from "./active-prompt-bar";
 import type { ChatOutlinePrompt } from "./model";
+import { ChatOutlineRail } from "./rail.web";
 import { shouldTrackChatOutline, useChatOutline, type ChatOutline } from "./use-chat-outline";
 
 const runtime = vi.hoisted(() => ({
@@ -90,6 +91,129 @@ describe("useChatOutline", () => {
   });
 
   afterEach(cleanup);
+
+  it("keeps literal envelope-shaped previews from a new host even when their rows are unloaded", async () => {
+    const preview =
+      '<paseo-topic-context root-message-id="root"> </paseo-topic-context> Explain this tag';
+    const prompt = { seq: 1, timestamp: new Date(1).toISOString(), preview };
+    runtime.listAgentTimelinePrompts.mockResolvedValue({
+      epoch: "epoch",
+      previewsAreDisplayText: true,
+      prompts: [prompt],
+    });
+    const viewportRef = createRef<StreamViewportHandle>();
+    const { result } = renderHook(() =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch",
+        tail: [],
+        head: undefined,
+        enabled: true,
+        viewportRef,
+        onJumpError: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => expect(result.current.prompts).toEqual([prompt]));
+    expect(runtime.fetchAgentTimeline).not.toHaveBeenCalled();
+  });
+
+  it("shows old host previews in both outline surfaces without exposing topic envelopes", async () => {
+    const opening = '<paseo-topic-context root-message-id="root">';
+    const longOpening = `<paseo-topic-context task-id="${"task".repeat(23)}" root-message-id="root">`;
+    const longNote =
+      "The previous lead is unavailable. Answer in this topic or assign a new lead to the same task.";
+    const text = `${opening}\n${longNote}\n</paseo-topic-context>\n\nRecovered question`;
+    const preview = `${text.replace(/\s+/g, " ").slice(0, 119)}…`;
+    const timestamp = new Date(1).toISOString();
+    const tail: StreamItem[] = [
+      {
+        id: "loaded",
+        kind: "user_message",
+        timestamp: new Date(1),
+        text,
+        rootMessageId: "root",
+        timelineCursor: { epoch: "epoch", seq: 3 },
+      },
+      {
+        id: "root",
+        kind: "user_message",
+        timestamp: new Date(1),
+        text: `${opening}\n</paseo-topic-context>\n\nLiteral example`,
+        rootMessageId: "root",
+        messageId: "provider-root",
+        clientMessageId: "root",
+        timelineCursor: { epoch: "epoch", seq: 1 },
+      },
+    ];
+    runtime.listAgentTimelinePrompts.mockResolvedValue({
+      epoch: "epoch",
+      prompts: [
+        { seq: 1, timestamp, preview: `${opening} </paseo-topic-context> Literal example` },
+        { seq: 2, timestamp, preview: `${opening} </paseo-topic-context> Unloaded question` },
+        { seq: 3, timestamp, preview },
+        { seq: 4, timestamp, preview: `${longOpening.slice(0, 119)}…` },
+        { seq: 5, timestamp, preview: `${opening} Explain this tag` },
+      ],
+    });
+    const viewportRef = createRef<StreamViewportHandle>();
+    function Outline() {
+      const outline = useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch",
+        tail,
+        head: undefined,
+        enabled: true,
+        viewportRef,
+        onJumpError: vi.fn(),
+      });
+      useReportStationaryNativeReading(outline.reportReadingPosition, "epoch", 3);
+      return (
+        <>
+          <ActivePromptBar
+            prompts={outline.prompts}
+            activePrompt={outline.activePrompt}
+            contentMaxWidth={720}
+            onJumpToPrompt={outline.jumpToPrompt}
+          />
+          <ChatOutlineRail
+            prompts={outline.prompts}
+            activePrompt={outline.activePrompt}
+            onJumpToPrompt={outline.jumpToPrompt}
+          />
+        </>
+      );
+    }
+    const { findByRole, getByRole, getByTestId } = render(<Outline />);
+
+    const prompt = await findByRole("button", { name: "Prompt 3/5: Recovered question" });
+    expect(prompt.textContent).toBe("Prompt 3/5Recovered question");
+    const unloaded = getByRole("tab", { name: "2 of 5: Unloaded question" });
+    fireEvent.focus(unloaded);
+    expect(getByTestId("chat-outline-preview").textContent).toBe("Unloaded question");
+    const truncated = getByRole("tab", { name: "4 of 5: …" });
+    expect(truncated).toBe(getByTestId("chat-outline-tick-4"));
+    fireEvent.focus(truncated);
+    expect(getByTestId("chat-outline-preview").textContent).toBe("…");
+    expect(
+      getByRole("tab", { name: `1 of 5: ${opening} </paseo-topic-context> Literal example` }),
+    ).toBe(getByTestId("chat-outline-tick-1"));
+    expect(getByRole("tab", { name: `5 of 5: ${opening} Explain this tag` })).toBe(
+      getByTestId("chat-outline-tick-5"),
+    );
+    expect(runtime.fetchAgentTimeline).not.toHaveBeenCalled();
+    runtime.fetchAgentTimeline.mockResolvedValue(undefined);
+    fireEvent.click(truncated);
+    await waitFor(() =>
+      expect(runtime.fetchAgentTimeline).toHaveBeenCalledExactlyOnceWith(
+        "server-1",
+        "agent-1",
+        expect.objectContaining({ cursor: { epoch: "epoch", seq: 25 } }),
+      ),
+    );
+  });
 
   it("requests the native prompt index only after the host advertises it", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({ epoch: "epoch", prompts: [] });

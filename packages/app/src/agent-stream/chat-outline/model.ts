@@ -1,6 +1,59 @@
 import type { AgentTimelinePromptIndexPayload } from "@getpaseo/client/internal/daemon-client";
+import {
+  getLegacyTopicPromptPreview,
+  getUserMessageDisplayText,
+  PROMPT_PREVIEW_MAX_LENGTH,
+} from "@/components/user-message/display-text";
+import type { StreamItem, UserMessageItem } from "@/types/stream";
 
 export type ChatOutlinePrompt = AgentTimelinePromptIndexPayload["prompts"][number];
+
+function promptPreview(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= PROMPT_PREVIEW_MAX_LENGTH) return collapsed;
+  return `${collapsed.slice(0, PROMPT_PREVIEW_MAX_LENGTH - 1)}…`;
+}
+
+export function createChatOutlinePreviewResolver(index: AgentTimelinePromptIndexPayload) {
+  if (index.previewsAreDisplayText === true) return () => index.prompts;
+
+  const legacyPreviews = new Map<number, string>();
+  for (const { seq, preview } of index.prompts) {
+    const legacy = getLegacyTopicPromptPreview(preview);
+    if (legacy !== null) legacyPreviews.set(seq, legacy);
+  }
+  if (legacyPreviews.size === 0) return () => index.prompts;
+
+  return function resolve(tail: readonly StreamItem[], head: readonly StreamItem[]) {
+    const loaded = new Map<number, UserMessageItem>();
+    for (const items of [tail, head]) {
+      for (const item of items) {
+        if (item.kind !== "user_message" || item.timelineCursor?.epoch !== index.epoch) continue;
+        const { seq } = item.timelineCursor;
+        if (legacyPreviews.has(seq)) loaded.set(seq, item);
+      }
+    }
+
+    return index.prompts.map((prompt) => {
+      const legacy = legacyPreviews.get(prompt.seq);
+      if (legacy === undefined) return prompt;
+      const source = loaded.get(prompt.seq);
+      if (!source) return { ...prompt, preview: legacy };
+
+      const displayText = getUserMessageDisplayText(
+        source.text,
+        source,
+        source.messageId ?? source.id,
+      );
+      const displayPreview = promptPreview(displayText);
+      if (prompt.preview === displayPreview) return prompt;
+      if (prompt.preview === promptPreview(source.text)) {
+        return { ...prompt, preview: displayPreview };
+      }
+      return { ...prompt, preview: legacy };
+    });
+  };
+}
 
 export function shouldAcceptPromptIndexEpoch(timelineEpoch: string, indexEpoch: string): boolean {
   return timelineEpoch === indexEpoch;
