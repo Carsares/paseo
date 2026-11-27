@@ -18,7 +18,6 @@ import type { PendingPermission } from "@/types/shared";
 import type { TurnLiveness } from "@/timeline/turn-liveness";
 import { isTopicInboxItemRead, type TopicInboxReadScope } from "@/stores/topic-inbox-read-store";
 import {
-  getStreamItemMessageId,
   type AssistantMessageItem,
   type StreamItem,
   type ThoughtItem,
@@ -318,7 +317,7 @@ interface TopicBuilderState {
   userFollowupBySourceMessageId: Map<string, TopicThreadEntry>;
   mirroredReplyBySourceMessageId: Map<string, TopicThreadEntry>;
   projectedMirroredReplies: Map<string, TopicMainReply>;
-  loadedAgentMessageIds: Set<string>;
+  projectedAgentMessageIds: Set<string>;
   unmatchedUserFollowups: TopicThreadEntry[];
   unmatchedAgentReplies: TopicThreadEntry[];
   consumedFollowupEntryIds: Set<string>;
@@ -642,36 +641,6 @@ function readItemTopicStamp(
   };
 }
 
-function ensureFallbackTopic(state: TopicBuilderState, item: StreamItem): MutableTopicUnit {
-  const existing = state.topics.findLast((unit) => !unit.redirectedTargetUnit);
-  if (existing) return existing;
-  const messageId = getStreamItemMessageId(item);
-  const synthetic: MutableTopicUnit = {
-    topicKey: `msg:${messageId}`,
-    rootItemId: item.id,
-    rootMessageId: messageId,
-    rootPrompt: {
-      id: item.id,
-      messageId,
-      text: "",
-      timestampMs: item.timestamp.getTime(),
-      seq: item.timelineCursor?.seq ?? null,
-      epoch: item.timelineCursor?.epoch ?? null,
-      item: null,
-    },
-    task: null,
-    processSteps: [],
-    replies: [],
-    pendingInboxItems: [],
-    linkedTodos: [],
-    linkedDurableItems: [],
-    linkedPermissions: [],
-    latestCanceledTurnTimestampMs: null,
-  };
-  registerTopic(state, synthetic);
-  return synthetic;
-}
-
 function recordUnmatchedRef(
   state: TopicBuilderState,
   { topicKey, taskId, rootMessageId }: TopicUnmatchedRef,
@@ -720,7 +689,6 @@ function findMatchingTopic(
   state: TopicBuilderState,
   hint: { taskId?: string; rootMessageId?: string; topicKey?: string },
 ): MutableTopicUnit | undefined {
-  const hasExplicitRef = Boolean(hint.topicKey || hint.taskId || hint.rootMessageId);
   const explicitTaskId = extractHintTaskId(hint);
   const explicitRootId = extractHintRootId(hint);
 
@@ -736,14 +704,10 @@ function findMatchingTopic(
     const exact = state.byTopicKey.get(hint.topicKey) ?? state.redirectedToUnit.get(hint.topicKey);
     if (exact) return exact;
   }
-  const byRoot =
+  return (
     findUnitByRootFallback(state, explicitRootId) ??
-    (explicitRootId ? state.redirectedToUnit.get(explicitRootId) : undefined);
-  if (byRoot) return byRoot;
-  if (hasExplicitRef) {
-    return undefined;
-  }
-  return state.activeTopic ?? state.topics.findLast((unit) => !unit.redirectedTargetUnit);
+    (explicitRootId ? state.redirectedToUnit.get(explicitRootId) : undefined)
+  );
 }
 
 function entryBelongsToUnit(entry: TopicThreadEntry, unit: MutableTopicUnit): boolean {
@@ -1455,108 +1419,107 @@ function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem, turn
 function updateTopicReportSender(
   state: TopicBuilderState,
   target: MutableTopicUnit,
-  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
+  report: TopicReport,
 ): string {
-  if (agentMessage.taskId) {
-    bindTaskToTopic(state, target, agentMessage.taskId);
+  if (report.hint.taskId) {
+    bindTaskToTopic(state, target, report.hint.taskId);
   }
-  if (!target.leadAgentId && agentMessage.sender.id) {
-    target.leadAgentId = agentMessage.sender.id;
-    target.leadServerId = agentMessage.sender.serverId;
+  const { sender } = report;
+  if (!target.leadAgentId && sender) {
+    target.leadAgentId = sender.id;
+    target.leadServerId = sender.serverId;
   }
 
-  const senderTitle =
-    state
-      .readAgentRuntime?.(
-        agentMessage.sender.serverId ?? state.localServerId ?? "",
-        agentMessage.sender.id,
-      )
-      ?.title?.trim() ??
-    (agentMessage.sender.serverId === undefined ||
-    agentMessage.sender.serverId === state.localServerId
-      ? state.agentTitleById?.get(agentMessage.sender.id)
-      : undefined) ??
-    agentMessage.sender.title?.trim() ??
-    state.fallbackSenderTitle;
-  if (!target.leadTitle && target.leadAgentId === agentMessage.sender.id) {
+  const senderTitle = sender
+    ? (state
+        .readAgentRuntime?.(sender.serverId ?? state.localServerId ?? "", sender.id)
+        ?.title?.trim() ??
+      (sender.serverId === undefined || sender.serverId === state.localServerId
+        ? state.agentTitleById?.get(sender.id)
+        : undefined) ??
+      sender.title?.trim() ??
+      state.fallbackSenderTitle)
+    : state.fallbackSenderTitle;
+  if (sender && !target.leadTitle && target.leadAgentId === sender.id) {
     target.leadTitle = senderTitle;
   }
 
   return senderTitle;
 }
 
-function buildReportTopicHint(
-  item: StreamItem,
-  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
-): { hint: TopicUnmatchedRef; hasExplicitRef: boolean } {
-  const itemStamp = readItemTopicStamp(item);
-  const topicKey = itemStamp?.topicKey;
-  const taskId = agentMessage.taskId ?? itemStamp?.taskId;
-  const rootMessageId = agentMessage.rootMessageId ?? itemStamp?.rootMessageId;
-  return {
-    hint: {
-      ...(topicKey ? { topicKey } : {}),
-      ...(taskId ? { taskId } : {}),
-      ...(rootMessageId ? { rootMessageId } : {}),
-    },
-    hasExplicitRef: Boolean(topicKey || taskId || rootMessageId),
-  };
+interface TopicReport {
+  sender?: NonNullable<ReturnType<typeof getAgentMessage>>["sender"];
+  text: string;
+  status: AgentSourceStatus;
+  hint: TopicUnmatchedRef;
+  messageId?: string;
 }
 
-function matchTopicReport(
-  state: TopicBuilderState,
-  item: StreamItem,
-  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
-  recordUnmatched = true,
-  allowUnstampedFallback = false,
-) {
-  const reportMessageId = localReportId(
-    projectedAgentMessageId(item),
-    agentMessage.sender.serverId ?? state.localServerId,
-    agentMessage.sender.id,
-  );
-  const senderDelegations = state.delegations.filter((delegation) =>
-    sameChild(
-      delegation,
-      agentMessage.sender.id,
-      agentMessage.sender.serverId,
-      state.localServerId,
-    ),
-  );
-  const linkedDelegations = senderDelegations.filter(
-    (delegation) => reportMessageId && delegation.explicitReportIds.has(reportMessageId),
-  );
-  const { hint: explicitHint, hasExplicitRef } = buildReportTopicHint(item, agentMessage);
-  if (
-    linkedDelegations.length > 0 &&
-    !linkedDelegations.some(
-      (delegation) =>
-        (!explicitHint.rootMessageId || explicitHint.rootMessageId === delegation.rootMessageId) &&
-        (!explicitHint.taskId || explicitHint.taskId === delegation.taskId),
-    )
-  )
-    return;
-  if (linkedDelegations.length > 1) return;
-  if (linkedDelegations.length === 1) {
-    const matched = findDelegationTopic(state, linkedDelegations[0]!);
-    return matched ? { matched, reportMessageId, scoped: true, exactDispatch: true } : undefined;
-  }
-  if (hasExplicitRef) {
-    const matched = findMatchingTopic(state, explicitHint);
-    if (!matched) {
-      if (recordUnmatched) recordUnmatchedRef(state, explicitHint);
-      return;
-    }
-    return { matched, reportMessageId, scoped: true, exactDispatch: false };
-  }
-  if (allowUnstampedFallback) {
+function readTopicReport(item: StreamItem): TopicReport | undefined {
+  const message = getAgentMessage(item);
+  if (message) {
     return {
-      matched: findMatchingTopic(state, {}),
-      reportMessageId,
-      scoped: false,
-      exactDispatch: false,
+      sender: message.sender,
+      text: message.text,
+      status: resolveAgentSourceStatus(message),
+      hint: {
+        topicKey: item.topicKey,
+        taskId: message.taskId ?? item.taskId,
+        rootMessageId: message.rootMessageId ?? item.rootMessageId,
+      },
+      messageId: projectedAgentMessageId(item),
     };
   }
+  if (item.kind === "user_message" && !isRealHumanPrompt(item)) {
+    const source = getAgentSourcePresentation(item)?.group.sources[0];
+    return {
+      sender: item.sender ?? source?.sender,
+      text: item.text,
+      status: source?.status ?? "completed",
+      hint: {
+        topicKey: item.topicKey,
+        taskId: item.taskId ?? source?.taskId,
+        rootMessageId: item.rootMessageId ?? source?.rootMessageId,
+      },
+      messageId: item.messageId ?? item.id,
+    };
+  }
+}
+
+function matchTopicReport(state: TopicBuilderState, report: TopicReport, recordUnmatched = true) {
+  const { sender, hint } = report;
+  const reportMessageId = localReportId(
+    report.messageId,
+    sender?.serverId ?? state.localServerId,
+    sender?.id,
+  );
+  const linkedDelegations =
+    sender && reportMessageId
+      ? state.delegations.filter(
+          (delegation) =>
+            delegation.explicitReportIds.has(reportMessageId) &&
+            sameChild(delegation, sender.id, sender.serverId, state.localServerId),
+        )
+      : [];
+  if (linkedDelegations.length > 1) return;
+  const dispatch = linkedDelegations[0];
+  if (dispatch) {
+    const matched = findDelegationTopic(state, dispatch);
+    if (
+      !matched ||
+      (hint.rootMessageId && hint.rootMessageId !== dispatch.rootMessageId) ||
+      (hint.taskId && hint.taskId !== dispatch.taskId) ||
+      (hint.topicKey && findMatchingTopic(state, hint) !== matched)
+    )
+      return;
+    return { matched, reportMessageId, exactDispatch: true };
+  }
+  const matched = findMatchingTopic(state, hint);
+  if (!matched) {
+    if (recordUnmatched) recordUnmatchedRef(state, hint);
+    return;
+  }
+  return { matched, reportMessageId, exactDispatch: false };
 }
 
 function dispatchKey(delegation: TopicDelegation): string {
@@ -1579,136 +1542,77 @@ function rememberDispatch(state: TopicBuilderState, item: ToolCallItem, current:
 function acceptFormalReport(
   state: TopicBuilderState,
   target: MutableTopicUnit,
-  agentMessage: NonNullable<ReturnType<typeof getAgentMessage>>,
+  report: TopicReport,
   reportMessageId: string | undefined,
-  scoped: boolean,
 ) {
-  if (resolveAgentSourceStatus(agentMessage) !== "completed") return;
+  const { sender } = report;
+  if (!sender || report.status !== "completed") return;
   const pending = state.pendingDispatches.get(target);
   if (!pending?.size) return;
   const candidates = [...pending].filter(([, delegation]) =>
-    sameChild(
-      delegation,
-      agentMessage.sender.id,
-      agentMessage.sender.serverId,
-      state.localServerId,
-    ),
+    sameChild(delegation, sender.id, sender.serverId, state.localServerId),
   );
   const exact = reportMessageId
     ? candidates.filter(([, delegation]) => delegation.explicitReportIds.has(reportMessageId))
     : [];
   const only = candidates.length === 1 ? candidates[0] : undefined;
   let matched = exact.length === 1 ? exact[0] : undefined;
-  if (exact.length === 0 && scoped && only?.[1].explicitReportIds.size === 0) matched = only;
+  if (exact.length === 0 && only?.[1].explicitReportIds.size === 0) matched = only;
   if (matched) {
     pending.delete(matched[0]);
     state.settledDispatches.add(matched[0]);
   }
 }
 
-function ingestAgentMessageItem(
+function ingestTopicReport(
   state: TopicBuilderState,
   item: StreamItem,
+  report: TopicReport,
   turn: TopicTurn,
-): boolean {
-  const agentMessage = getAgentMessage(item);
-  if (!agentMessage) return false;
-  if (findExactMirroredReply(state, item)) return true;
-  const match = matchTopicReport(
-    state,
-    item,
-    agentMessage,
-    true,
-    turn.allowUnstampedReportFallback,
-  );
-  if (!match) return true;
-  const { matched, reportMessageId, scoped } = match;
-  const target = matched ?? ensureFallbackTopic(state, item);
-  if (!scoped && turn.reportOnly) turn.reportTopic = target;
+): void {
+  if (findExactMirroredReply(state, item)) return;
+  const match = matchTopicReport(state, report);
+  if (!match) return;
+  const { matched: target, reportMessageId } = match;
   if (readItemTopicStamp(item)) {
     turn.hasAuthoritativeStamp = true;
     turn.stampedTopics.add(target);
   }
 
-  const senderTitle = updateTopicReportSender(state, target, agentMessage);
-  acceptFormalReport(state, target, agentMessage, reportMessageId, scoped);
+  const senderTitle = updateTopicReportSender(state, target, report);
+  if (item.kind !== "user_message" || match.exactDispatch) {
+    acceptFormalReport(state, target, report, reportMessageId);
+  }
 
-  if (state.activeTopic === target || !scoped) markTopicCanceledIfStamped(target, item);
+  if (state.activeTopic === target) markTopicCanceledIfStamped(target, item);
   target.replies.push({
     kind: "subagent_report",
     id: item.id,
-    senderId: agentMessage.sender.id,
-    senderServerId: agentMessage.sender.serverId,
+    senderId: report.sender?.id ?? "subagent",
+    senderServerId: report.sender?.serverId,
     senderTitle,
     reportMessageId,
-    status: resolveAgentSourceStatus(agentMessage),
-    text: agentMessage.text,
-    taskId: agentMessage.taskId,
-    rootMessageId: agentMessage.rootMessageId,
+    status: report.status,
+    text: report.text,
+    taskId: report.hint.taskId,
+    rootMessageId: report.hint.rootMessageId,
     epoch: item.timelineCursor?.epoch ?? null,
     seq: item.timelineCursor?.seq ?? null,
     timestampMs: item.timestamp.getTime(),
     isUnread: false,
   });
-  return true;
-}
-
-function resolveSenderTitle(
-  state: TopicBuilderState,
-  senderId: string,
-  senderTitle?: string,
-): string {
-  return state.agentTitleById?.get(senderId) ?? senderTitle?.trim() ?? state.fallbackSenderTitle;
-}
-
-function ingestLegacySubagentUserMessage(
-  state: TopicBuilderState,
-  item: UserMessageItem,
-  turn: TopicTurn,
-): void {
-  const firstSource = getAgentSourcePresentation(item)?.group.sources[0];
-  const sender = item.sender ?? firstSource?.sender;
-  const authoritativeStamp = readItemTopicStamp(item);
-  let target: MutableTopicUnit | undefined;
-  if (authoritativeStamp) {
-    target = findMatchingTopic(state, authoritativeStamp);
-    if (!target) {
-      recordUnmatchedRef(state, authoritativeStamp);
-      return;
-    }
-    turn.hasAuthoritativeStamp = true;
-    turn.stampedTopics.add(target);
-  } else {
-    target = state.activeTopic ?? ensureFallbackTopic(state, item);
+  state.projectedAgentMessageIds.add(item.id);
+  if (item.kind === "user_message" && item.messageId) {
+    state.projectedAgentMessageIds.add(item.messageId);
   }
-  const senderId = sender?.id ?? "subagent";
-  const senderTitle = resolveSenderTitle(state, senderId, sender?.title);
-  if (!target.leadAgentId && sender?.id) {
-    target.leadAgentId = sender.id;
-    target.leadServerId = sender.serverId;
-    target.leadTitle = senderTitle;
+  if (item.kind === "tool_call" && item.payload.source === "agent") {
+    state.projectedAgentMessageIds.add(item.payload.data.callId);
   }
-  const cursor = item.timelineCursor;
-  target.replies.push({
-    kind: "subagent_report",
-    id: item.id,
-    senderId,
-    senderServerId: sender?.serverId,
-    senderTitle,
-    status: firstSource?.status ?? "completed",
-    text: item.text,
-    epoch: cursor?.epoch ?? null,
-    seq: cursor?.seq ?? null,
-    timestampMs: item.timestamp.getTime(),
-    isUnread: false,
-  });
 }
 
 interface TopicTurn {
-  turnId?: string;
   reportOnly: boolean;
   reportTopic?: MutableTopicUnit;
-  allowUnstampedReportFallback: boolean;
   hasAuthoritativeStamp: boolean;
   stampedTopics: Set<MutableTopicUnit>;
   humanTriggerTopic?: MutableTopicUnit;
@@ -1722,13 +1626,15 @@ interface TopicTurn {
 
 function uniqueReportTopic(
   state: TopicBuilderState,
-  item: StreamItem,
-  report: NonNullable<ReturnType<typeof getAgentMessage>>,
+  report: TopicReport,
 ): MutableTopicUnit | undefined {
-  const match = matchTopicReport(state, item, report, false);
-  if (!match?.matched) return;
-  if (match.exactDispatch || report.taskId || !report.rootMessageId) return match.matched;
-  if (state.unitsByRootMessageId.get(report.rootMessageId)?.length === 1) return match.matched;
+  const match = matchTopicReport(state, report, false);
+  if (!match) return;
+  const { hint } = report;
+  if (match.exactDispatch || extractHintTaskId(hint)) return match.matched;
+  const rootId = extractHintRootId(hint);
+  if (!rootId || (state.unitsByRootMessageId.get(rootId)?.length ?? 0) <= 1) return match.matched;
+  if (hint.topicKey && state.byTopicKey.get(hint.topicKey) === match.matched) return match.matched;
 }
 
 function startTopicTurn(
@@ -1737,45 +1643,38 @@ function startTopicTurn(
   first: number,
   end: number,
 ): TopicTurn {
-  let turnId: string | undefined;
   let startedByReport = false;
   let firstTrigger = true;
   let humanInput = false;
   let reportTopic: MutableTopicUnit | undefined;
-  let reportCount = 0;
   let ambiguous = false;
   let hasAuthoritativeStamp = false;
   const stampedTopics = new Set<MutableTopicUnit>();
 
   for (let index = first; index < end; index += 1) {
     const item = items[index]!;
-    if (!turnId && item.turnId) turnId = item.turnId;
     const stamp = readItemTopicStamp(item);
     if (stamp) {
       hasAuthoritativeStamp = true;
       const stamped = findMatchingTopic(state, stamp);
       if (stamped) stampedTopics.add(stamped);
     }
-    const report = getAgentMessage(item);
-    if (item.kind === "user_message" && isRealHumanPrompt(item)) humanInput = true;
+    const report = readTopicReport(item);
+    if (item.kind === "user_message" && !report) humanInput = true;
     if (firstTrigger && isTurnTrigger(item)) {
       startedByReport = Boolean(report);
       firstTrigger = false;
     }
     if (!report) continue;
-    reportCount += 1;
-    const match = uniqueReportTopic(state, item, report);
+    const match = uniqueReportTopic(state, report);
     if (!match || (reportTopic && reportTopic !== match)) ambiguous = true;
     else reportTopic = match;
   }
 
   const reportOnly = startedByReport && !humanInput;
   return {
-    turnId,
     reportOnly,
     reportTopic: reportOnly && !ambiguous ? reportTopic : undefined,
-    // A single report can use the old order-based placement. An ambiguous batch cannot.
-    allowUnstampedReportFallback: reportCount === 1 && !hasAuthoritativeStamp,
     hasAuthoritativeStamp,
     stampedTopics,
     initialPromptUnits: new Set(),
@@ -1877,33 +1776,25 @@ function resolveStreamItemTarget(
     if (turnStampedTopic && turnStampedTopic !== turn.reportTopic) return undefined;
     return turn.reportTopic;
   }
-  if (turnStampedTopic ?? state.activeTopic) {
-    return turnStampedTopic ?? state.activeTopic;
-  }
-  return state.topics.some((unit) => !unit.redirectedTargetUnit)
-    ? undefined
-    : ensureFallbackTopic(state, item);
+  return turn.humanTriggerTopic;
 }
 
 function ingestStreamItem(state: TopicBuilderState, item: StreamItem, turn: TopicTurn): void {
-  if (item.kind === "user_message") {
-    if (isRealHumanPrompt(item)) {
-      ingestHumanPrompt(state, item, turn);
-    } else {
-      ingestLegacySubagentUserMessage(state, item, turn);
-    }
-    return;
-  }
-  if (ingestAgentMessageItem(state, item, turn)) {
-    const report = getAgentMessage(item);
-    if (turn.reportOnly && report) {
+  const report = readTopicReport(item);
+  if (report) {
+    ingestTopicReport(state, item, report, turn);
+    if (turn.reportOnly && report.sender) {
       const source = JSON.stringify([
         report.sender.serverId ?? state.localServerId,
         report.sender.id,
       ]);
-      if (resolveAgentSourceStatus(report) === "completed") turn.unresolvedReports.delete(source);
+      if (report.status === "completed") turn.unresolvedReports.delete(source);
       else turn.unresolvedReports.add(source);
     }
+    return;
+  }
+  if (item.kind === "user_message") {
+    ingestHumanPrompt(state, item, turn);
     return;
   }
 
@@ -1963,12 +1854,11 @@ function unitHasParticipant(unit: MutableTopicUnit, agentId: string): boolean {
 
 function attachThreadEntries(state: TopicBuilderState, entries: readonly TopicThreadEntry[]): void {
   for (const entry of entries) {
-    // When a subagent report already exists on the main timeline with the same sourceMessageId
-    // (e.g. multi-track merge path), keep the main-timeline item to avoid duplicate rendering.
+    // Only hide the thread copy when its timeline copy was actually assigned to a topic.
     if (
       entry.origin === "subagent_report" &&
       entry.sourceMessageId &&
-      state.loadedAgentMessageIds.has(entry.sourceMessageId)
+      state.projectedAgentMessageIds.has(entry.sourceMessageId)
     ) {
       continue;
     }
@@ -2022,10 +1912,9 @@ function attachPendingInboxItems(
       )
     )
       continue;
-    const target = findMatchingTopic(state, {
-      taskId: inboxItem.taskId,
-      rootMessageId: inboxItem.rootMessageId,
-    });
+    const target = hasExplicitRef
+      ? findMatchingTopic(state, inboxItem)
+      : (state.activeTopic ?? state.topics.findLast((unit) => !unit.redirectedTargetUnit));
     if (target) {
       target.pendingInboxItems.push(inboxItem);
     } else if (hasExplicitRef) {
@@ -2657,19 +2546,6 @@ function loadedAssistantSourceIds(items: readonly StreamItem[]): Set<string> {
   return ids;
 }
 
-function collectLoadedAgentMessageIds(items: readonly StreamItem[]): Set<string> {
-  const ids = new Set<string>();
-  for (const item of items) {
-    if (!getAgentMessage(item)) continue;
-    ids.add(item.id);
-    if ("messageId" in item && item.messageId) ids.add(item.messageId);
-    if (item.kind === "tool_call" && item.payload.source === "agent" && item.payload.data.callId) {
-      ids.add(item.payload.data.callId);
-    }
-  }
-  return ids;
-}
-
 function indexThreadEntries(
   entries: readonly TopicThreadEntry[],
   assistantIds: ReadonlySet<string> | null,
@@ -2751,8 +2627,6 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
 
   const threadEntries = input.threadEntries ?? [];
   const assistantIds = threadEntries.length > 0 ? loadedAssistantSourceIds(input.items) : null;
-  const loadedAgentMessageIds =
-    threadEntries.length > 0 ? collectLoadedAgentMessageIds(input.items) : new Set<string>();
   const indexed = indexThreadEntries(threadEntries, assistantIds);
   const attributedBySourceMessageId = indexAnchorAttributions(input.topicAnchors ?? []);
 
@@ -2766,7 +2640,7 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     taskById,
     tasksByRootMessageId,
     ...indexed,
-    loadedAgentMessageIds,
+    projectedAgentMessageIds: new Set(),
     consumedFollowupEntryIds: new Set(),
     followupImages: new Map(),
     projectedMirroredReplies: new Map(),

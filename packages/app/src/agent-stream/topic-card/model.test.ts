@@ -348,7 +348,7 @@ describe("main replies in topic turns", () => {
     makeAssistantConclusion({ id, turnId, text: id, seq, ts: seq * 1000 });
   const report = (
     id: string,
-    rootMessageId: string,
+    rootMessageId: string | undefined,
     seq: number,
     turnId?: string,
     complete = true,
@@ -382,6 +382,146 @@ describe("main replies in topic turns", () => {
       },
       "human",
     );
+
+  const anchor = (id: string, timestampMs: number): TopicAnchorSummary => ({
+    workspaceId: "workspace",
+    mainAgentId: "main",
+    topicKey: "msg:" + id,
+    rootMessageId: id,
+    rootPromptText: id,
+    createdAt: new Date(timestampMs).toISOString(),
+    updatedAt: new Date(timestampMs).toISOString(),
+  });
+  const replayThought = (turnId?: string): StreamItem => ({
+    kind: "thought",
+    id: "replay-thought",
+    turnId,
+    text: "Reviewing the old report",
+    status: "ready",
+    timestamp: new Date(7000),
+    timelineCursor: { epoch: "ep-1", seq: 7 },
+  });
+  const replayTool = (turnId?: string): StreamItem => ({
+    ...makePaseoToolResult("get_agent_status", "replay-tool", {}, turnId),
+    timestamp: new Date(8000),
+    timelineCursor: { epoch: "ep-1", seq: 8 },
+  });
+
+  it.each(["agent message", "legacy user message", "no report row"])(
+    "leaves a preloaded new topic clean after replaying an unowned turn with %s",
+    (source) => {
+      const turnId = source === "legacy user message" ? undefined : "historical";
+      const unownedReport = makeSubagentReport({
+        id: "paseo-agent-message:unowned",
+        turnId,
+        senderId: "specialist",
+        senderTitle: "Specialist",
+        text: "Historical findings",
+        reportStatus: "completed",
+        seq: 6,
+        ts: 6000,
+      });
+      const legacyReport: StreamItem = {
+        kind: "user_message",
+        id: "legacy-unowned",
+        sender: { id: "specialist" },
+        text: "Historical findings",
+        timestamp: new Date(6000),
+        timelineCursor: { epoch: "ep-1", seq: 6 },
+      };
+      const trigger =
+        source === "no report row"
+          ? []
+          : [source === "agent message" ? unownedReport : legacyReport];
+      const projection = projectTopicUnits({
+        items: [
+          ...trigger,
+          replayThought(turnId),
+          replayTool(turnId),
+          answer("replay-answer", 9, turnId),
+        ],
+        topicAnchors: [anchor("new", 5000)],
+        readSnapshot: {
+          workspaceId: "workspace",
+          mainAgentId: "main",
+          watermarkEpoch: "ep-1",
+          watermarkSeq: 5,
+          watermarkTimestampMs: 5000,
+          topics: [],
+          revision: 1,
+        },
+      });
+
+      expect(projection.topics).toMatchObject([
+        {
+          topicKey: "msg:new",
+          replies: [],
+          processSteps: [],
+          unreadReplyCount: 0,
+          hasUnread: false,
+        },
+      ]);
+      expect(projection.totalUnreadReplies).toBe(0);
+      expect(projection.totalUnreadTopics).toBe(0);
+    },
+  );
+
+  it.each(["ep-1", "ep-2"])("routes stamped and uniquely delegated report turns in %s", (epoch) => {
+    const dispatchAnchor: TopicAnchorSummary = {
+      ...anchor("old", 1000),
+      delegations: [
+        {
+          agentId: "specialist",
+          serverId: "local",
+          messageId: "dispatch",
+          status: "completed",
+          reportIds: ["linked"],
+          updatedAt: new Date(6000).toISOString(),
+        },
+      ],
+    };
+    const linkedReport = makeSubagentReport({
+      id: "paseo-agent-message:linked",
+      turnId: "linked-turn",
+      senderId: "specialist",
+      senderServerId: "local",
+      senderTitle: "Specialist",
+      text: "Delegated findings",
+      reportStatus: "completed",
+      seq: 6,
+      ts: 6000,
+    });
+    const items = [
+      { ...report("stamped", undefined, 4, "stamped-turn"), topicKey: "msg:old" },
+      answer("stamped-answer", 5, "stamped-turn"),
+      linkedReport,
+      replayThought("linked-turn"),
+      replayTool("linked-turn"),
+      answer("linked-answer", 9, "linked-turn"),
+    ];
+    for (const item of items) item.timelineCursor!.epoch = epoch;
+    const { topics } = projectTopicUnits({
+      items,
+      topicAnchors: [dispatchAnchor, anchor("new", 5000)],
+      localServerId: "local",
+    });
+
+    expect(topics.map(topicReplyIds)).toEqual([
+      [
+        "paseo-agent-message:stamped",
+        "stamped-answer",
+        "paseo-agent-message:linked",
+        "linked-answer",
+      ],
+      [],
+    ]);
+    expect(topics[0]!.processSteps.map((step) => step.id)).toEqual([
+      "replay-thought",
+      "replay-tool",
+    ]);
+    expect(topics[1]!.processSteps).toEqual([]);
+    expect(topics[1]!.hasUnread).toBe(false);
+  });
 
   it("preserves dispatch progress after a formal report and restores the conclusion to the older card", () => {
     const result = projectTopicUnits({
@@ -482,7 +622,7 @@ describe("main replies in topic turns", () => {
       items: [
         human("old", 1, "old-human"),
         human("new", 2, "new-human"),
-        report("pre-steer", "old", 3, "steered"),
+        { ...report("pre-steer", "old", 3, "steered"), topicKey: "msg:old" },
         human("steer", 4, "steered"),
         answer("steered-answer", 5, "steered"),
         report("legacy", "new", 6),
@@ -571,13 +711,14 @@ describe("projectTopicUnits", () => {
     expect(result.topics[1]!.replies.map(({ id }) => id)).toEqual(["main-2"]);
   });
 
-  it("smoothly degrades for legacy timeline items without taskId or rootMessageId", () => {
+  it("routes a legacy report and its conclusion using the report's topic stamp", () => {
     const items: StreamItem[] = [
       makeHumanPrompt({ id: "u-old-1", text: "Legacy question 1", seq: 1, ts: 1000 }),
       {
         kind: "user_message",
         id: "legacy-sub-1",
         sender: { id: "worker-a", title: "Worker A" },
+        topicKey: "msg:u-old-1",
         text: "Legacy report text",
         timestamp: new Date(1500),
         timelineCursor: { epoch: "ep-1", seq: 2 },
@@ -603,6 +744,7 @@ describe("projectTopicUnits", () => {
         senderId: "lead-1",
         senderTitle: "Lead 1",
         text: "Initial findings",
+        rootMessageId: "m-1",
         reportStatus: "completed",
         seq: 11,
         ts: 2000,
@@ -1352,7 +1494,7 @@ describe("projectTopicUnits", () => {
     ).toBe(false);
   });
 
-  it("deduplicates subagent_report thread entries when main timeline already contains the same sourceMessageId", () => {
+  it("deduplicates a thread report only when its timeline copy was assigned to a topic", () => {
     const tasks: WorkspaceTaskSummary[] = [
       {
         taskId: "T-dup",
@@ -1378,6 +1520,15 @@ describe("projectTopicUnits", () => {
         reportStatus: "completed",
         seq: 2,
         ts: 2_000,
+      }),
+      makeSubagentReport({
+        id: "msg-silent-only",
+        senderId: "lead-1",
+        senderTitle: "Lead 1",
+        text: "Silent completion report",
+        reportStatus: "completed",
+        seq: 3,
+        ts: 3_000,
       }),
     ];
     const threadEntries: TopicThreadEntry[] = [
