@@ -23,6 +23,7 @@ const WorkspaceDraftTabSetupStorageSchema = z.preprocess(
       parentAgentId: z.string().nullish(),
       initialDraftText: z.string().nullish(),
       forkFrom: AgentForkSourceSchema.optional(),
+      sideChatFromAgentId: z.string().optional(),
       // Configured drafts saved before this flag may have a separate history attachment.
       restoreChatHistory: z.boolean().default(true),
     })
